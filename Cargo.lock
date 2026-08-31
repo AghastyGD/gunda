@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "gunda"
+name = "gunda-core"
 version = "0.1.0"
