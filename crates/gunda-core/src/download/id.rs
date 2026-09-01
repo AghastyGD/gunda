@@ -48,12 +48,7 @@ impl InvalidDownloadId {
 
 impl fmt::Display for InvalidDownloadId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "download ID must be positive, received {}",
-            self.value
-        )
-        
+        write!(f, "download ID must be positive, received {}", self.value)
     }
 }
 
@@ -74,11 +69,9 @@ mod tests {
     #[test]
     fn zero_and_negative_values_are_rejected() {
         for value in [0, -1, i64::MIN] {
-            let error = 
-                DownloadId::new(value).expect_err("non-positive IDs must be rejected");
+            let error = DownloadId::new(value).expect_err("non-positive IDs must be rejected");
 
-                assert_eq!(error.value(), value);
-
+            assert_eq!(error.value(), value);
         }
     }
 }
