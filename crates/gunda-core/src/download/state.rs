@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// Durable execution state of a download job
+/// Durable execution state of a download job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadState {
     /// Persisted and waiting to be inspected or scheduled.
@@ -79,7 +79,7 @@ impl DownloadState {
         }
     }
 
-    /// Returns whether no further execution transition is allowed
+    /// Returns whether no further execution transition is allowed.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
@@ -122,9 +122,9 @@ impl InvalidStateTransition {
 }
 
 impl fmt::Display for InvalidStateTransition {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
-            formatter,
+            f,
             "invalid download state transition: {:?} -> {:?}",
             self.from, self.to
         )
@@ -175,7 +175,7 @@ mod tests {
     ];
 
     #[test]
-    fn transition_match_the_lifecycle_contract() {
+    fn transitions_match_the_lifecycle_contract() {
         for from in ALL_STATES {
             for to in ALL_STATES {
                 let expected = VALID_TRANSITIONS.contains(&(from, to));
@@ -215,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn requested_state_is_not_a_transition() {
+    fn repeated_state_is_not_a_transition() {
         for state in ALL_STATES {
             assert!(
                 !state.can_transition_to(state),
