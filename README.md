@@ -2,7 +2,7 @@
 
 > download manager for the stubborn
 
-Gunda is a Linux-first download manager focused on reliable file downloads, persistent download jobs, and native support for modern web streaming protocols.
+Gunda is a cross-platform download manager developed Linux-first, focused on reliable file downloads and native support for modern web streaming protocols.
 
 ## Project status
 
