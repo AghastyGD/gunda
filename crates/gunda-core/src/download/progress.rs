@@ -1,8 +1,6 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::download::id::InvalidDownloadId;
-
 /// Durable progress checkpoint for a download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DownloadProgress {
@@ -72,7 +70,7 @@ impl DownloadProgress {
     }
 }
 
-/// Error returned when download bytes exceed a known total.
+/// Error returned when downloaded bytes exceed a known total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InvalidDownloadProgress {
     downloaded_bytes: u64,
