@@ -38,7 +38,7 @@ impl RequestHeader {
         &self.name
     }
 
-    /// Returns the original header value
+    /// Returns the original header value.
     ///
     /// Callers must respect `sensitivity()` and must not log sensitive values.
     #[must_use]

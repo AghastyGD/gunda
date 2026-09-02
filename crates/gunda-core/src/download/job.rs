@@ -191,7 +191,7 @@ impl DownloadJob {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::path::{Path, PathBuf};
 
     use time::{Duration, OffsetDateTime};
@@ -273,7 +273,7 @@ mod test {
     }
 
     #[test]
-    fn inspection_metadata_can_be_attached_to_join() {
+    fn inspection_metadata_can_be_attached_to_job() {
         let mut job = sample_job();
         let updated_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
 
