@@ -16,9 +16,10 @@ The next foundation work focuses on persistent storage with SQLite, followed by 
 
 Install a current stable Rust toolchain, then run:
 
+```bash
 cargo build --workspace
 cargo test --workspace
-
+```
 Gunda is not yet runnable as an application. The repository currently contains the core domain and application foundations, while executable clients will be introduced in later milestones.
 
 ## Documentation
