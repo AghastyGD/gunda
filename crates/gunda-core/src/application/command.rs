@@ -39,7 +39,7 @@ impl DownloadCommand {
     pub fn create(download: NewDownload) -> Self {
         Self::Create(Box::new(download))
     }
-    
+
     /// Returns a safe classification of this command.
     #[must_use]
     pub const fn kind(&self) -> DownloadCommandKind {
