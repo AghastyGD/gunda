@@ -3,7 +3,7 @@ use crate::download::{DownloadId, NewDownload};
 /// Intent submitted by an application client.
 #[derive(Clone, PartialEq, Eq)]
 pub enum DownloadCommand {
-    Create(NewDownload),
+    Create(Box<NewDownload>),
 
     Pause(DownloadId),
 
@@ -34,6 +34,11 @@ pub enum DownloadCommandKind {
 }
 
 impl DownloadCommand {
+    /// Creates a command for a download that has not been persisted yet.
+    #[must_use]
+    pub fn create(download: NewDownload) -> Self {
+        Self::Create(Box::new(download))
+    }
     /// Returns a safe classification of this command.
     #[must_use]
     pub const fn kind(&self) -> DownloadCommandKind {
@@ -134,7 +139,7 @@ mod tests {
 
     #[test]
     fn create_command_has_not_target_id() {
-        let command = DownloadCommand::Create(new_download());
+        let command = DownloadCommand::create(new_download());
 
         assert_eq!(command.kind(), DownloadCommandKind::Create);
         assert_eq!(command.target_id(), None)
