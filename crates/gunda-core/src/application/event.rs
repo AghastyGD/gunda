@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_event_preserves_native_path() {
+    fn completed_event_preserves_resolved_destination() {
         let id = download_id();
         let event = DownloadEvent::Completed {
             id,

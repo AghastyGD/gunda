@@ -39,6 +39,7 @@ impl DownloadCommand {
     pub fn create(download: NewDownload) -> Self {
         Self::Create(Box::new(download))
     }
+    
     /// Returns a safe classification of this command.
     #[must_use]
     pub const fn kind(&self) -> DownloadCommandKind {
@@ -138,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn create_command_has_not_target_id() {
+    fn create_command_has_no_target_id() {
         let command = DownloadCommand::create(new_download());
 
         assert_eq!(command.kind(), DownloadCommandKind::Create);
