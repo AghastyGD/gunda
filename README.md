@@ -6,20 +6,20 @@ Gunda is a cross-platform download manager developed Linux-first, focused on rel
 
 ## Project status
 
-Gunda is in early development. The repository currently contains the initial project structure and documentation, but no usable download manager yet.
+Gunda is in early development and is not yet usable as a download manager.
 
-The first implementation milestone is persistent HTTP downloads backed by SQLite. The core application layer is designed to remain independent of the desktop client, with native HLS support planned after the direct HTTP path establishes the engine boundary.
+The repository currently contains the initial core domain and application model, including download lifecycle management, request context, destinations, resource metadata, commands, events, progress tracking, and failure semantics.
+
+The next foundation work focuses on persistent storage with SQLite, followed by the first end-to-end HTTP download path.
 
 ## Build
 
 Install a current stable Rust toolchain, then run:
 
-```sh
-cargo build
-cargo test
-```
+cargo build --workspace
+cargo test --workspace
 
-The current binary can be started with `cargo run`, but download functionality is not implemented yet.
+Gunda is not yet runnable as an application. The repository currently contains the core domain and application foundations, while executable clients will be introduced in later milestones.
 
 ## Documentation
 
