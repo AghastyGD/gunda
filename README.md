@@ -10,7 +10,9 @@ Gunda is in early development and is not yet usable as a download manager.
 
 The repository currently contains the initial core domain and application model, including download lifecycle management, request context, destinations, resource metadata, commands, events, progress tracking, and failure semantics.
 
-The next foundation work focuses on persistent storage with SQLite, followed by the first end-to-end HTTP download path.
+The repository now includes the initial SQLite persistence adapter, capable of creating and reloading queued download jobs across application restarts.
+
+The next foundation work focuses on application orchestration and startup loading, followed by the first end-to-end HTTP download path.
 
 ## Build
 
