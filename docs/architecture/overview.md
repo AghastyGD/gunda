@@ -4,12 +4,19 @@ Status: Accepted target constraints, not an implementation inventory
 
 ## Current state
 
-The repository currently contains a single minimal Rust binary. It has no
-download domain, protocol engine, database, desktop application, browser
-extension, daemon, CLI, or native messaging host.
+The repository contains the initial Rust workspace with:
 
-This document defines boundaries that new implementation must preserve. A
-component described as planned does not exist merely because it appears here.
+- `gunda-core`, providing the download domain model, lifecycle rules,
+  application commands and events, and the persistence boundary;
+- `gunda-storage`, providing the initial SQLite schema, migrations, and support
+  for creating and reloading queued download jobs.
+
+Application orchestration, protocol engines, executable clients, lifecycle
+persistence beyond initial job creation, and startup recovery are not yet
+implemented.
+
+This document defines boundaries that subsequent implementation must preserve.
+A component described as planned does not exist merely because it appears here.
 
 ## Component ownership
 
@@ -18,8 +25,8 @@ only as they become necessary:
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `gunda-core` | Download domain, application commands and events, scheduling, state transitions, and interfaces for engines and persistence | Planned |
-| `gunda-storage` | SQLite schema, migrations, and implementations of core persistence interfaces | Planned |
+| `gunda-core` | Download domain, lifecycle rules, application commands and events, and interfaces for engines and persistence | Foundation implemented |
+| `gunda-storage` | SQLite schema, migrations, and implementations of core persistence interfaces | Initial queued-job persistence implemented |
 | `gunda-http` | Shared HTTP transport and the direct HTTP file engine | Planned |
 | Desktop application | Tauri composition root and Svelte presentation client | Planned |
 

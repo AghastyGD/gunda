@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/gunda-core",
+    "crates/gunda-storage",
 ]
 resolver = "3"
 
@@ -12,5 +13,8 @@ license = "GPL-3.0-only"
 repository = "https://github.com/AghastyGD/gunda"
 
 [workspace.dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
+tempfile = "3"
 time = "0.3"
+tokio = {version = "1", features = ["macros", "rt-multi-thread"]}
 url = "2"

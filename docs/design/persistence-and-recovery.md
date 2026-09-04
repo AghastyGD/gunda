@@ -1,6 +1,6 @@
 # Persistence and Recovery
 
-Status: Accepted design, not implemented
+Status: Accepted design, partially implemented
 
 ## Responsibilities
 
@@ -11,11 +11,27 @@ types, connections, migrations, and schema mapping.
 The abstraction isolates application policy from storage mechanics. It is not a
 commitment to support arbitrary database engines.
 
+## Current implementation
+
+The initial repository implementation creates queued download jobs
+transactionally and reloads them by ID from SQLite. Public request headers and
+native destination paths are preserved across repository reopen.
+
+Lifecycle updates, resource inspection metadata, resolved destinations,
+failures, job listing, and startup recovery are not yet implemented. They will
+be introduced together with the repository operations that maintain their
+invariants.
+
 ## Data model
 
-The first schema should contain only generic job data: identity, request URL,
-origin, destination intent, resolved path, resource kind, lifecycle state,
-durable byte checkpoints, failure information, and timestamps.
+The generic schema is introduced incrementally with the behavior that maintains
+it. The initial migration stores creation-time identity, request metadata,
+origin, destination intent, initial lifecycle state, progress defaults, and
+timestamps.
+
+Resolved paths, resource information, failures, and mutable lifecycle
+checkpoints are added with the repository operations responsible for persisting
+and restoring them.
 
 Enums use explicit stable text values. Database constraints should reject
 unknown states and other impossible values where practical. Protocol-specific
