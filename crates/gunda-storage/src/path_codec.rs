@@ -1,22 +1,16 @@
 use std::path::{Path, PathBuf};
 
-use gunda_core::application::{
-    RepositoryError, RepositoryErrorKind,
-};
+use gunda_core::application::{RepositoryError, RepositoryErrorKind};
 
 #[cfg(unix)]
-pub(crate) fn encode(
-    path: &Path,
-) -> Result<Vec<u8>, RepositoryError> {
+pub(crate) fn encode(path: &Path) -> Result<Vec<u8>, RepositoryError> {
     use std::os::unix::ffi::OsStrExt;
 
     Ok(path.as_os_str().as_bytes().to_vec())
 }
 
 #[cfg(unix)]
-pub(crate) fn decode(
-    bytes: &[u8],
-) -> Result<PathBuf, RepositoryError> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<PathBuf, RepositoryError> {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
@@ -24,9 +18,7 @@ pub(crate) fn decode(
 }
 
 #[cfg(windows)]
-pub(crate) fn encode(
-    path: &Path,
-) -> Result<Vec<u8>, RepositoryError> {
+pub(crate) fn encode(path: &Path) -> Result<Vec<u8>, RepositoryError> {
     use std::os::windows::ffi::OsStrExt;
 
     Ok(path
@@ -37,9 +29,7 @@ pub(crate) fn encode(
 }
 
 #[cfg(windows)]
-pub(crate) fn decode(
-    bytes: &[u8],
-) -> Result<PathBuf, RepositoryError> {
+pub(crate) fn decode(bytes: &[u8]) -> Result<PathBuf, RepositoryError> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
@@ -58,32 +48,24 @@ pub(crate) fn decode(
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn encode(
-    path: &Path,
-) -> Result<Vec<u8>, RepositoryError> {
-    let text = path.to_str().ok_or_else(|| {
-        invalid_path("path cannot be represented on this platform")
-    })?;
+pub(crate) fn encode(path: &Path) -> Result<Vec<u8>, RepositoryError> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| invalid_path("path cannot be represented on this platform"))?;
 
     Ok(text.as_bytes().to_vec())
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn decode(
-    bytes: &[u8],
-) -> Result<PathBuf, RepositoryError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        invalid_path("stored path is not valid UTF-8")
-    })?;
+pub(crate) fn decode(bytes: &[u8]) -> Result<PathBuf, RepositoryError> {
+    let text =
+        std::str::from_utf8(bytes).map_err(|_| invalid_path("stored path is not valid UTF-8"))?;
 
     Ok(PathBuf::from(text))
 }
 
 fn invalid_path(message: &'static str) -> RepositoryError {
-    RepositoryError::new(
-        RepositoryErrorKind::InvalidData,
-        message,
-    )
+    RepositoryError::new(RepositoryErrorKind::InvalidData, message)
 }
 
 #[cfg(test)]
@@ -94,9 +76,7 @@ mod tests {
 
     #[test]
     fn native_path_round_trips_through_binary_representation() {
-        let original = PathBuf::from("downloads")
-            .join("nested")
-            .join("file.iso");
+        let original = PathBuf::from("downloads").join("nested").join("file.iso");
 
         let encoded = encode(&original).expect("path must encode");
         let decoded = decode(&encoded).expect("path must decode");
@@ -110,9 +90,7 @@ mod tests {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
 
-        let original = PathBuf::from(OsString::from_vec(vec![
-            b'f', b'i', b'l', b'e', 0xff,
-        ]));
+        let original = PathBuf::from(OsString::from_vec(vec![b'f', b'i', b'l', b'e', 0xff]));
 
         let encoded = encode(&original).expect("path must encode");
         let decoded = decode(&encoded).expect("path must decode");
