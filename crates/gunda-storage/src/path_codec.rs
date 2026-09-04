@@ -36,16 +36,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<PathBuf, RepositoryError> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
 
-    if !bytes.len().is_multiple_of(2) {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+
+    if !remainder.is_empty() {
         return Err(invalid_path(
             "stored Windows path has an invalid byte length",
         ));
     }
 
-    let wide: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect();
+    let wide: Vec<u16> = pairs.iter().copied().map(u16::from_le_bytes).collect();
 
     Ok(PathBuf::from(OsString::from_wide(&wide)))
 }
@@ -120,5 +119,15 @@ mod tests {
         let decoded = decode(&encoded).expect("path must decode");
 
         assert_eq!(decoded, original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn odd_length_windows_path_is_rejected() {
+        use gunda_core::application::RepositoryErrorKind;
+
+        let error = decode(&[0x61]).expect_err("odd byte length must be rejected");
+
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
     }
 }
