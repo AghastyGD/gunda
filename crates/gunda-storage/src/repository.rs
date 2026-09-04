@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
@@ -71,42 +70,36 @@ impl SqliteDownloadRepository {
 }
 
 impl DownloadRepository for SqliteDownloadRepository {
-    fn create(
+    async fn create(
         &self,
         download: NewDownload,
         created_at: OffsetDateTime,
-    ) -> impl Future<Output = Result<DownloadJob, RepositoryError>> + Send {
-        async move {
-            ensure_persistable(&download)?;
+    ) -> Result<DownloadJob, RepositoryError> {
+        ensure_persistable(&download)?;
 
-            let created_at_unix_ms = encode_timestamp(created_at)?;
+        let created_at_unix_ms = encode_timestamp(created_at)?;
 
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|_| internal_error("could not start download creation transaction"))?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| internal_error("could not start download creation transaction"))?;
 
-            let id = insert_download(&mut transaction, &download, created_at_unix_ms).await?;
+        let id = insert_download(&mut transaction, &download, created_at_unix_ms).await?;
 
-            insert_headers(&mut transaction, id, download.request().headers()).await?;
+        insert_headers(&mut transaction, id, download.request().headers()).await?;
 
-            transaction
-                .commit()
-                .await
-                .map_err(|_| internal_error("could not commit download creation"))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| internal_error("could not commit download creation"))?;
 
-            Ok(DownloadJob::new(id, download, created_at))
-        }
+        Ok(DownloadJob::new(id, download, created_at))
     }
 
-    fn find_by_id(
-        &self,
-        id: DownloadId,
-    ) -> impl Future<Output = Result<Option<DownloadJob>, RepositoryError>> + Send {
-        async move {
-            let row = sqlx::query(
-                r#"
+    async fn find_by_id(&self, id: DownloadId) -> Result<Option<DownloadJob>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
                 SELECT
                     id,
                     source_url,
@@ -124,29 +117,28 @@ impl DownloadRepository for SqliteDownloadRepository {
                 FROM downloads
                 WHERE id = $1
                 "#,
-            )
-            .bind(id.value())
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|_| internal_error("could not load download"))?;
+        )
+        .bind(id.value())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| internal_error("could not load download"))?;
 
-            let Some(row) = row else {
-                return Ok(None);
-            };
+        let Some(row) = row else {
+            return Ok(None);
+        };
 
-            let stored = StoredDownload::from_row(&row)?;
+        let stored = StoredDownload::from_row(&row)?;
 
-            validate_initial_job(&stored)?;
+        validate_initial_job(&stored)?;
 
-            let stored_id = DownloadId::new(stored.id)
-                .map_err(|_| invalid_data("stored download has an invalid ID"))?;
+        let stored_id = DownloadId::new(stored.id)
+            .map_err(|_| invalid_data("stored download has an invalid ID"))?;
 
-            let headers = load_headers(&self.pool, stored_id).await?;
-            let created_at = decode_timestamp(stored.created_at_unix_ms)?;
-            let download = stored.to_new_download(headers)?;
+        let headers = load_headers(&self.pool, stored_id).await?;
+        let created_at = decode_timestamp(stored.created_at_unix_ms)?;
+        let download = stored.to_new_download(headers)?;
 
-            Ok(Some(DownloadJob::new(stored_id, download, created_at)))
-        }
+        Ok(Some(DownloadJob::new(stored_id, download, created_at)))
     }
 }
 

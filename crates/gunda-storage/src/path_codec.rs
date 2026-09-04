@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use gunda_core::application::{RepositoryError, RepositoryErrorKind};
+use gunda_core::application::RepositoryError;
+
+#[cfg(not(unix))]
+use gunda_core::application::RepositoryErrorKind;
 
 #[cfg(unix)]
 pub(crate) fn encode(path: &Path) -> Result<Vec<u8>, RepositoryError> {
@@ -64,6 +67,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<PathBuf, RepositoryError> {
     Ok(PathBuf::from(text))
 }
 
+#[cfg(not(unix))]
 fn invalid_path(message: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, message)
 }
