@@ -27,7 +27,7 @@ where
             let id = job.id();
 
             if jobs.insert(id, job).is_some() {
-                return Err(invalid_startup_state(
+                return Err(invalid_repository_data(
                     "repository returned duplicate download IDs",
                 ));
             }
@@ -46,7 +46,7 @@ where
         let id = job.id();
 
         if self.jobs.contains_key(&id) {
-            return Err(invalid_startup_state(
+            return Err(invalid_repository_data(
                 "repository returned an existing download ID",
             ));
         }
@@ -84,7 +84,7 @@ where
     }
 }
 
-fn invalid_startup_state(message: &'static str) -> RepositoryError {
+fn invalid_repository_data(message: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, message)
 }
 
@@ -288,5 +288,26 @@ mod tests {
 
         assert!(result.is_err());
         assert!(manager.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_created_id_does_not_replace_an_existing_job() {
+        let original = job(1);
+        let repository = FakeRepository::with_jobs(vec![original.clone()]);
+
+        repository.next_id.store(1, Ordering::Relaxed);
+
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let error = match manager.create(new_download("replacement.bin")).await {
+            Ok(_) => panic!("duplicate ID must not produce a success event"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
+        assert_eq!(manager.len(), 1);
+        assert!(manager.job(original.id()) == Some(&original));
     }
 }
