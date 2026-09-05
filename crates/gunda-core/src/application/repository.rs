@@ -23,6 +23,12 @@ pub trait DownloadRepository: Send + Sync {
         &self,
         id: DownloadId,
     ) -> impl Future<Output = Result<Option<DownloadJob>, RepositoryError>> + Send;
+
+    /// Loads all persisted downloads in ascending identifier order.
+    ///
+    /// Returning a deterministic order keeps startup snapshots stable across
+    /// repository implementations.
+    fn list(&self) -> impl Future<Output = Result<Vec<DownloadJob>, RepositoryError>> + Send;
 }
 
 /// Stable classification of persistence failures.

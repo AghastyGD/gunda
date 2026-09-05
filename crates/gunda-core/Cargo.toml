@@ -9,3 +9,6 @@ repository.workspace = true
 [dependencies]
 time.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

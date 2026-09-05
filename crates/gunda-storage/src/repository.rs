@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -78,6 +79,7 @@ impl DownloadRepository for SqliteDownloadRepository {
         ensure_persistable(&download)?;
 
         let created_at_unix_ms = encode_timestamp(created_at)?;
+        let created_at = decode_timestamp(created_at_unix_ms)?;
 
         let mut transaction = self
             .pool
@@ -98,47 +100,109 @@ impl DownloadRepository for SqliteDownloadRepository {
     }
 
     async fn find_by_id(&self, id: DownloadId) -> Result<Option<DownloadJob>, RepositoryError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| internal_error("could not start download lookup transaction"))?;
+
         let row = sqlx::query(
             r#"
-                SELECT
-                    id,
-                    source_url,
-                    origin,
-                    source_page_url,
-                    source_page_title,
-                    destination_directory,
-                    preferred_filename,
-                    conflict_policy,
-                    state,
-                    downloaded_bytes,
-                    total_bytes,
-                    created_at_unix_ms,
-                    updated_at_unix_ms
-                FROM downloads
-                WHERE id = $1
-                "#,
+        SELECT
+            id,
+            source_url,
+            origin,
+            source_page_url,
+            source_page_title,
+            destination_directory,
+            preferred_filename,
+            conflict_policy,
+            state,
+            downloaded_bytes,
+            total_bytes,
+            created_at_unix_ms,
+            updated_at_unix_ms
+        FROM downloads
+        WHERE id = $1
+        "#,
         )
         .bind(id.value())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(|_| internal_error("could not load download"))?;
 
-        let Some(row) = row else {
-            return Ok(None);
+        let job = if let Some(row) = row {
+            let stored = StoredDownload::from_row(&row)?;
+            let stored_id = stored.download_id()?;
+            let headers = load_headers(&mut transaction, stored_id).await?;
+
+            Some(stored.to_job(stored_id, headers)?)
+        } else {
+            None
         };
 
-        let stored = StoredDownload::from_row(&row)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| internal_error("could not finish download lookup"))?;
 
-        validate_initial_job(&stored)?;
+        Ok(job)
+    }
 
-        let stored_id = DownloadId::new(stored.id)
-            .map_err(|_| invalid_data("stored download has an invalid ID"))?;
+    async fn list(&self) -> Result<Vec<DownloadJob>, RepositoryError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| internal_error("could not start download listing transaction"))?;
 
-        let headers = load_headers(&self.pool, stored_id).await?;
-        let created_at = decode_timestamp(stored.created_at_unix_ms)?;
-        let download = stored.to_new_download(headers)?;
+        let rows = sqlx::query(
+            r#"
+        SELECT
+            id,
+            source_url,
+            origin,
+            source_page_url,
+            source_page_title,
+            destination_directory,
+            preferred_filename,
+            conflict_policy,
+            state,
+            downloaded_bytes,
+            total_bytes,
+            created_at_unix_ms,
+            updated_at_unix_ms
+        FROM downloads
+        ORDER BY id
+        "#,
+        )
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| internal_error("could not list downloads"))?;
 
-        Ok(Some(DownloadJob::new(stored_id, download, created_at)))
+        let mut headers_by_download = load_all_headers(&mut transaction).await?;
+        let mut jobs = Vec::with_capacity(rows.len());
+
+        for row in &rows {
+            let stored = StoredDownload::from_row(row)?;
+            let id = stored.download_id()?;
+            let headers = headers_by_download.remove(&id).unwrap_or_default();
+
+            jobs.push(stored.to_job(id, headers)?);
+        }
+
+        if !headers_by_download.is_empty() {
+            return Err(invalid_data(
+                "stored request headers reference missing downloads",
+            ));
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|_| internal_error("could not finish download listing"))?;
+
+        Ok(jobs)
     }
 }
 
@@ -200,6 +264,23 @@ impl StoredDownload {
             DownloadDestination::new(directory, self.preferred_filename.clone(), conflict_policy),
             origin,
         ))
+    }
+
+    fn download_id(&self) -> Result<DownloadId, RepositoryError> {
+        DownloadId::new(self.id).map_err(|_| invalid_data("stored donwnload has an invalid ID"))
+    }
+
+    fn to_job(
+        &self,
+        id: DownloadId,
+        headers: Vec<RequestHeader>,
+    ) -> Result<DownloadJob, RepositoryError> {
+        validate_initial_job(self)?;
+
+        let created_at = decode_timestamp(self.created_at_unix_ms)?;
+        let download = self.to_new_download(headers)?;
+
+        Ok(DownloadJob::new(id, download, created_at))
     }
 }
 
@@ -296,7 +377,7 @@ async fn insert_headers(
 }
 
 async fn load_headers(
-    pool: &SqlitePool,
+    transaction: &mut Transaction<'_, Sqlite>,
     id: DownloadId,
 ) -> Result<Vec<RequestHeader>, RepositoryError> {
     let rows = sqlx::query(
@@ -308,33 +389,72 @@ async fn load_headers(
         "#,
     )
     .bind(id.value())
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await
     .map_err(|_| internal_error("could not query request headers"))?;
 
-    rows.into_iter()
-        .map(|row| {
-            let name: String = row
-                .try_get("name")
-                .map_err(|_| invalid_data("stored request header name is invalid"))?;
+    rows.iter().map(decode_header).collect()
+}
 
-            let value: String = row
-                .try_get("value")
-                .map_err(|_| invalid_data("stored request header value is invalid"))?;
+async fn load_all_headers(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<BTreeMap<DownloadId, Vec<RequestHeader>>, RepositoryError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            download_id,
+            name,
+            value,
+            sensitivity
+        FROM download_headers
+        ORDER BY download_id, position
+        "#,
+    )
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(|_| internal_error("could not query request headers"))?;
 
-            let sensitivity: String = row
-                .try_get("sensitivity")
-                .map_err(|_| invalid_data("stored request header sensitivity is invalid"))?;
+    let mut headers_by_download = BTreeMap::new();
 
-            if sensitivity != "public" {
-                return Err(invalid_data(
-                    "stored request header has unsupported sensitivity",
-                ));
-            }
+    for row in &rows {
+        let raw_download_id: i64 = row
+            .try_get("download_id")
+            .map_err(|_| invalid_data("stored request header has an invalid download ID"))?;
 
-            Ok(RequestHeader::new(name, value, HeaderSensitivity::Public))
-        })
-        .collect()
+        let download_id = DownloadId::new(raw_download_id)
+            .map_err(|_| invalid_data("stored request header has an invalid download ID"))?;
+
+        let header = decode_header(row)?;
+
+        headers_by_download
+            .entry(download_id)
+            .or_insert_with(Vec::new)
+            .push(header);
+    }
+
+    Ok(headers_by_download)
+}
+
+fn decode_header(row: &SqliteRow) -> Result<RequestHeader, RepositoryError> {
+    let name: String = row
+        .try_get("name")
+        .map_err(|_| invalid_data("stored request header name is invalid"))?;
+
+    let value: String = row
+        .try_get("value")
+        .map_err(|_| invalid_data("stored request header value is invalid"))?;
+
+    let sensitivity: String = row
+        .try_get("sensitivity")
+        .map_err(|_| invalid_data("stored request header sensitivity is invalid"))?;
+
+    if sensitivity != "public" {
+        return Err(invalid_data(
+            "stored request header has unsupported sensitivity",
+        ));
+    }
+
+    Ok(RequestHeader::new(name, value, HeaderSensitivity::Public))
 }
 
 fn ensure_persistable(download: &NewDownload) -> Result<(), RepositoryError> {
@@ -453,8 +573,8 @@ mod tests {
 
     use gunda_core::application::{DownloadRepository, RepositoryErrorKind};
     use gunda_core::download::{
-        DownloadDestination, DownloadId, DownloadOrigin, DownloadState, FileConflictPolicy,
-        HeaderSensitivity, NewDownload, RequestContext, RequestHeader,
+        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
+        FileConflictPolicy, HeaderSensitivity, NewDownload, RequestContext, RequestHeader,
     };
     use tempfile::tempdir;
     use time::OffsetDateTime;
@@ -620,5 +740,146 @@ mod tests {
         };
 
         assert_eq!(error.kind(), RepositoryErrorKind::SensitiveDataUnsupported);
+    }
+
+    #[tokio::test]
+    async fn list_restores_all_jobs_after_repository_reopen() {
+        let directory = tempdir().expect("temporary directory must exist");
+        let database_path = directory.path().join("gunda.sqlite3");
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must open");
+
+        let first = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("first download must be created");
+
+        let second = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("second download must be created");
+
+        repository.close().await;
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must reopen");
+
+        let loaded = repository.list().await.expect("downloads must be listed");
+
+        let loaded_ids: Vec<DownloadId> = loaded.iter().map(DownloadJob::id).collect();
+
+        assert_eq!(loaded_ids, vec![first.id(), second.id()]);
+    }
+
+    #[tokio::test]
+    async fn listing_during_creation_observes_complete_jobs() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+        let mut expected = Vec::new();
+
+        for _ in 0..16 {
+            let (listed, created) = tokio::join!(
+                repository.list(),
+                repository.create(
+                    sample_download(HeaderSensitivity::Public),
+                    OffsetDateTime::UNIX_EPOCH,
+                ),
+            );
+
+            let listed = listed.expect("concurrent creation must not invalidate listing");
+            let created = created.expect("creation must succeed");
+
+            assert!(listed.len() == expected.len() || listed.len() == expected.len() + 1);
+
+            expected.push(created);
+
+            assert!(listed.as_slice() == &expected[..listed.len()]);
+        }
+
+        let loaded = repository.list().await.expect("final listing must succeed");
+
+        assert!(loaded == expected);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn timestamps_round_trip_at_database_precision() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        for nanos in [1_234_567_i128, -1, -1_234_567] {
+            let input = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                .expect("test timestamp must be valid");
+
+            let created = repository
+                .create(sample_download(HeaderSensitivity::Public), input)
+                .await
+                .expect("creation must succeed");
+
+            let loaded = repository
+                .find_by_id(created.id())
+                .await
+                .expect("lookup must succeed")
+                .expect("job must exist");
+
+            assert_eq!(
+                created.created_at().unix_timestamp_nanos(),
+                nanos.div_euclid(1_000_000) * 1_000_000,
+            );
+
+            assert!(created == loaded);
+        }
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_job_prevents_manager_startup() {
+        use gunda_core::application::DownloadManager;
+
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("first job must be created");
+
+        let second = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("second job must be created");
+
+        sqlx::query("UPDATE downloads SET source_url = 'invalid URL' WHERE id = $1")
+            .bind(second.id().value())
+            .execute(&repository.pool)
+            .await
+            .expect("test must introduce invalid stored data");
+
+        let error = match DownloadManager::start(repository).await {
+            Ok(_) => panic!("invalid data must prevent manager startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
     }
 }
