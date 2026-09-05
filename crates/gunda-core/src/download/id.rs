@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 /// Identifier of a download job persisted in the local database.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DownloadId(i64);
 
 impl DownloadId {

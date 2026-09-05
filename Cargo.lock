@@ -402,6 +402,7 @@ name = "gunda-core"
 version = "0.1.0"
 dependencies = [
  "time",
+ "tokio",
  "url",
 ]
 
