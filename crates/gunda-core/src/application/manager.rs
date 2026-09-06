@@ -19,41 +19,60 @@ where
     R: DownloadRepository,
 {
     /// Loads durable application state before accepting client operations.
+    #[tracing::instrument(name = "manager.start", skip_all)]
     pub async fn start(repository: R) -> Result<Self, RepositoryError> {
-        let persisted_jobs = repository.list().await?;
-        let mut jobs = BTreeMap::new();
+        let result = async {
+            let persisted_jobs = repository.list().await?;
+            let mut jobs = BTreeMap::new();
 
-        for job in persisted_jobs {
-            let id = job.id();
+            for job in persisted_jobs {
+                let id = job.id();
 
-            if jobs.insert(id, job).is_some() {
-                return Err(invalid_repository_data(
-                    "repository returned duplicate download IDs",
-                ));
+                if jobs.insert(id, job).is_some() {
+                    return Err(invalid_repository_data(
+                        "repository returned duplicate download IDs",
+                    ));
+                }
             }
-        }
 
-        Ok(Self { repository, jobs })
+            tracing::info!(jobs_loaded = jobs.len(), "download manager started");
+
+            Ok(Self { repository, jobs })
+        }
+        .await;
+
+        result.inspect_err(|error| report_manager_error("manager.start", error))
     }
 
     /// Persists a new job before exposing it through application state.
+    #[tracing::instrument(name = "manager.create", skip_all, fields(download_id = tracing::field::Empty))]
     pub async fn create(
         &mut self,
         download: NewDownload,
     ) -> Result<DownloadEvent, RepositoryError> {
-        let created_at = OffsetDateTime::now_utc();
-        let job = self.repository.create(download, created_at).await?;
-        let id = job.id();
+        let result = async {
+            let created_at = OffsetDateTime::now_utc();
+            let job = self.repository.create(download, created_at).await?;
+            let id = job.id();
 
-        if self.jobs.contains_key(&id) {
-            return Err(invalid_repository_data(
-                "repository returned an existing download ID",
-            ));
+            tracing::Span::current().record("download_id", id.value());
+
+            if self.jobs.contains_key(&id) {
+                return Err(invalid_repository_data(
+                    "repository returned an existing download ID",
+                ));
+            }
+
+            let state = job.state();
+            self.jobs.insert(id, job);
+
+            tracing::info!(state = ?state, "download registered");
+
+            Ok(DownloadEvent::Created { id })
         }
+        .await;
 
-        self.jobs.insert(id, job);
-
-        Ok(DownloadEvent::Created { id })
+        result.inspect_err(|error| report_manager_error("manager.create", error))
     }
 
     /// Returns an immutable job snapshot owned by the manager.
@@ -86,6 +105,14 @@ where
 
 fn invalid_repository_data(message: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, message)
+}
+
+fn report_manager_error(operation: &'static str, error: &RepositoryError) {
+    tracing::warn!(
+        operation,
+        error_kind = ?error.kind(),
+        "manager operation failed"
+    )
 }
 
 #[cfg(test)]

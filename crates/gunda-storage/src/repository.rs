@@ -9,7 +9,7 @@ use gunda_core::download::{
 };
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{ConnectOptions, Row, Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 use url::Url;
 
@@ -24,6 +24,7 @@ pub struct SqliteDownloadRepository {
 
 impl SqliteDownloadRepository {
     /// Opens or creates a database and applies pending migrations.
+    #[tracing::instrument(name = "storage.open", level = "debug", skip_all)]
     pub async fn open(path: impl AsRef<Path>) -> Result<Self, RepositoryError> {
         let options = SqliteConnectOptions::new()
             .filename(path)
@@ -31,23 +32,29 @@ impl SqliteDownloadRepository {
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
 
-        Self::connect(options).await
+        Self::connect(options)
+            .await
+            .inspect_err(|error| report_storage_error("storage.open", error))
     }
 
     /// Opens an isolated in-memory database.
+    #[tracing::instrument(name = "storage.open_in_memory", level = "debug", skip_all)]
     pub async fn open_in_memory() -> Result<Self, RepositoryError> {
         let options = SqliteConnectOptions::new()
             .in_memory(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(5));
 
-        Self::connect(options).await
+        Self::connect(options)
+            .await
+            .inspect_err(|error| report_storage_error("storage.open_in_memory", error))
     }
 
+    #[tracing::instrument(name = "storage.connect", level = "debug", skip_all)]
     async fn connect(options: SqliteConnectOptions) -> Result<Self, RepositoryError> {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
-            .connect_with(options)
+            .connect_with(options.disable_statement_logging())
             .await
             .map_err(|_| {
                 RepositoryError::new(
@@ -56,153 +63,178 @@ impl SqliteDownloadRepository {
                 )
             })?;
 
-        MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|_| internal_error("could not apply database migrations"))?;
+        apply_migrations(&pool).await?;
+
+        tracing::debug!("download database ready");
 
         Ok(Self { pool })
     }
 
     /// Closes the pool after waiting for checked-out connections.
+    #[tracing::instrument(name = "storage.close", level = "debug", skip_all)]
     pub async fn close(self) {
         self.pool.close().await;
+        tracing::debug!("download database closed");
     }
 }
 
 impl DownloadRepository for SqliteDownloadRepository {
+    #[tracing::instrument(name = "storage.create", level = "debug", skip_all, fields(download_id = tracing::field::Empty))]
     async fn create(
         &self,
         download: NewDownload,
         created_at: OffsetDateTime,
     ) -> Result<DownloadJob, RepositoryError> {
-        ensure_persistable(&download)?;
+        let result = async {
+            ensure_persistable(&download)?;
 
-        let created_at_unix_ms = encode_timestamp(created_at)?;
-        let created_at = decode_timestamp(created_at_unix_ms)?;
+            let created_at_unix_ms = encode_timestamp(created_at)?;
+            let created_at = decode_timestamp(created_at_unix_ms)?;
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| internal_error("could not start download creation transaction"))?;
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| internal_error("could not start download creation transaction"))?;
 
-        let id = insert_download(&mut transaction, &download, created_at_unix_ms).await?;
+            let id = insert_download(&mut transaction, &download, created_at_unix_ms).await?;
 
-        insert_headers(&mut transaction, id, download.request().headers()).await?;
+            insert_headers(&mut transaction, id, download.request().headers()).await?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|_| internal_error("could not commit download creation"))?;
+            transaction
+                .commit()
+                .await
+                .map_err(|_| internal_error("could not commit download creation"))?;
 
-        Ok(DownloadJob::new(id, download, created_at))
+            tracing::Span::current().record("download_id", id.value());
+            tracing::debug!("download committed");
+
+            Ok(DownloadJob::new(id, download, created_at))
+        }
+        .await;
+
+        result.inspect_err(|error| report_storage_error("storage.create", error))
     }
 
+    #[tracing::instrument(name = "storage.find_by_id", level = "debug", skip_all, fields(download_id = id.value()))]
     async fn find_by_id(&self, id: DownloadId) -> Result<Option<DownloadJob>, RepositoryError> {
-        let mut transaction = self
-            .pool
-            .begin()
+        let result = async {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| internal_error("could not start download lookup transaction"))?;
+
+            let row = sqlx::query(
+                r#"
+            SELECT
+                id,
+                source_url,
+                origin,
+                source_page_url,
+                source_page_title,
+                destination_directory,
+                preferred_filename,
+                conflict_policy,
+                state,
+                downloaded_bytes,
+                total_bytes,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM downloads
+            WHERE id = $1
+            "#,
+            )
+            .bind(id.value())
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(|_| internal_error("could not start download lookup transaction"))?;
+            .map_err(|_| internal_error("could not load download"))?;
 
-        let row = sqlx::query(
-            r#"
-        SELECT
-            id,
-            source_url,
-            origin,
-            source_page_url,
-            source_page_title,
-            destination_directory,
-            preferred_filename,
-            conflict_policy,
-            state,
-            downloaded_bytes,
-            total_bytes,
-            created_at_unix_ms,
-            updated_at_unix_ms
-        FROM downloads
-        WHERE id = $1
-        "#,
-        )
-        .bind(id.value())
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(|_| internal_error("could not load download"))?;
+            let job = if let Some(row) = row {
+                let stored = StoredDownload::from_row(&row)?;
+                let stored_id = stored.download_id()?;
+                let headers = load_headers(&mut transaction, stored_id).await?;
 
-        let job = if let Some(row) = row {
-            let stored = StoredDownload::from_row(&row)?;
-            let stored_id = stored.download_id()?;
-            let headers = load_headers(&mut transaction, stored_id).await?;
+                Some(stored.to_job(stored_id, headers)?)
+            } else {
+                None
+            };
 
-            Some(stored.to_job(stored_id, headers)?)
-        } else {
-            None
-        };
+            transaction
+                .commit()
+                .await
+                .map_err(|_| internal_error("could not finish download lookup"))?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|_| internal_error("could not finish download lookup"))?;
+            tracing::debug!(found = job.is_some(), "download lookup completed");
 
-        Ok(job)
+            Ok(job)
+        }
+        .await;
+
+        result.inspect_err(|error| report_storage_error("storage.find_by_id", error))
     }
 
+    #[tracing::instrument(name = "storage.list", level = "debug", skip_all)]
     async fn list(&self) -> Result<Vec<DownloadJob>, RepositoryError> {
-        let mut transaction = self
-            .pool
-            .begin()
+        let result = async {
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| internal_error("could not start download listing transaction"))?;
+
+            let rows = sqlx::query(
+                r#"
+            SELECT
+                id,
+                source_url,
+                origin,
+                source_page_url,
+                source_page_title,
+                destination_directory,
+                preferred_filename,
+                conflict_policy,
+                state,
+                downloaded_bytes,
+                total_bytes,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            FROM downloads
+            ORDER BY id
+            "#,
+            )
+            .fetch_all(&mut *transaction)
             .await
-            .map_err(|_| internal_error("could not start download listing transaction"))?;
+            .map_err(|_| internal_error("could not list downloads"))?;
 
-        let rows = sqlx::query(
-            r#"
-        SELECT
-            id,
-            source_url,
-            origin,
-            source_page_url,
-            source_page_title,
-            destination_directory,
-            preferred_filename,
-            conflict_policy,
-            state,
-            downloaded_bytes,
-            total_bytes,
-            created_at_unix_ms,
-            updated_at_unix_ms
-        FROM downloads
-        ORDER BY id
-        "#,
-        )
-        .fetch_all(&mut *transaction)
-        .await
-        .map_err(|_| internal_error("could not list downloads"))?;
+            let mut headers_by_download = load_all_headers(&mut transaction).await?;
+            let mut jobs = Vec::with_capacity(rows.len());
 
-        let mut headers_by_download = load_all_headers(&mut transaction).await?;
-        let mut jobs = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let stored = StoredDownload::from_row(row)?;
+                let id = stored.download_id()?;
+                let headers = headers_by_download.remove(&id).unwrap_or_default();
 
-        for row in &rows {
-            let stored = StoredDownload::from_row(row)?;
-            let id = stored.download_id()?;
-            let headers = headers_by_download.remove(&id).unwrap_or_default();
+                jobs.push(stored.to_job(id, headers)?);
+            }
 
-            jobs.push(stored.to_job(id, headers)?);
+            if !headers_by_download.is_empty() {
+                return Err(invalid_data(
+                    "stored request headers reference missing downloads",
+                ));
+            }
+
+            transaction
+                .commit()
+                .await
+                .map_err(|_| internal_error("could not finish download listing"))?;
+
+            tracing::debug!(jobs_loaded = jobs.len(), "downloads loaded");
+
+            Ok(jobs)
         }
-
-        if !headers_by_download.is_empty() {
-            return Err(invalid_data(
-                "stored request headers reference missing downloads",
-            ));
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|_| internal_error("could not finish download listing"))?;
-
-        Ok(jobs)
+        .await;
+        result.inspect_err(|error| report_storage_error("storage.list", error))
     }
 }
 
@@ -282,6 +314,26 @@ impl StoredDownload {
 
         Ok(DownloadJob::new(id, download, created_at))
     }
+}
+
+#[tracing::instrument(name = "storage.migrate", level = "debug", skip_all)]
+async fn apply_migrations(pool: &SqlitePool) -> Result<(), RepositoryError> {
+    MIGRATOR
+        .run(pool)
+        .await
+        .map_err(|_| internal_error("could not apply database migrations"))?;
+
+    tracing::debug!("database migrations applied");
+
+    Ok(())
+}
+
+fn report_storage_error(operation: &'static str, error: &RepositoryError) {
+    tracing::warn!(
+        operation,
+        error_kind = ?error.kind(),
+        "repository operation failed"
+    );
 }
 
 async fn insert_download(
