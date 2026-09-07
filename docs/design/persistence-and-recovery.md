@@ -13,14 +13,33 @@ commitment to support arbitrary database engines.
 
 ## Current implementation
 
-The initial repository implementation creates queued download jobs
-transactionally and reloads them by ID from SQLite. Public request headers and
-native destination paths are preserved across repository reopen.
+The SQLite repository supports transactional creation, lookup by ID, and listing
+of initial queued download jobs.
 
-Lifecycle updates, resource inspection metadata, resolved destinations,
-failures, job listing, and startup recovery are not yet implemented. They will
-be introduced together with the repository operations that maintain their
-invariants.
+Creation commits the job and its public request headers before returning.
+Reloading preserves header order, native destination paths, and timestamps
+normalized to millisecond precision.
+
+Lookup and listing read job rows and their associated headers within a single
+transaction, producing a consistent database snapshot.
+
+The manager uses listing to populate its runtime registry before startup
+succeeds. This is startup loading, not interrupted-download recovery.
+
+The adapter currently accepts only initial queued-job records. Unsupported
+persisted lifecycle states are rejected rather than silently reset to `Queued`.
+
+Persistent lifecycle updates, resource inspection metadata, resolved
+destinations, failures, mutable progress checkpoints, and interrupted-download
+recovery are not implemented yet. They will be introduced with the repository
+operations that maintain their invariants.
+
+Destination paths use native platform encodings. Supporting Linux and Windows
+does not guarantee that a database containing native paths can be transferred
+between operating systems.
+
+The execution, finalization, and recovery sections below describe required
+future behavior, not existing transfer capabilities.
 
 ## Data model
 
@@ -39,9 +58,19 @@ resume data belongs in protocol-specific tables introduced with the relevant
 engine. HLS segment state, for example, does not belong in a generic downloads
 row.
 
-Request headers need a separate persistence decision. Browser-derived cookies,
-authorization values, and tokens remain runtime-only until storage, access,
-expiry, and deletion behavior have an accepted security design.
+The current adapter persists only headers explicitly classified as public.
+It rejects requests containing explicitly sensitive headers and rejects
+browser-originated jobs before writing them.
+
+Browser-derived cookies, authorization values, and tokens remain runtime-only
+until storage, access, expiry, and deletion behavior have an accepted security
+design. Authenticated restart recovery is not currently supported.
+
+Header classification is not general-purpose secret detection. Source URLs are
+currently persisted as supplied and may themselves contain credentials or
+tokens. Restricting diagnostic output does not encrypt or sanitize stored data;
+URL credential handling requires a separate policy before claiming safe
+persistence of arbitrary authenticated requests.
 
 ## Migrations
 
@@ -93,17 +122,22 @@ silently producing a corrupt final file.
 
 ## Failure behavior
 
-Storage errors are translated to application errors before reaching clients. A
-state or progress update is not published as committed when its database write
-failed. Disk-full, permission, integrity, and storage failures remain distinct
-enough for retry policy and user action.
+Storage errors are translated to application errors before reaching callers.
+During creation, a failed database operation does not add a job to the manager
+or return a successful creation event.
+
+As persistent lifecycle updates are introduced, state and progress changes must
+not be published as committed when their database write failed. Error
+classification must distinguish disk-full, permission, integrity, and storage
+failures sufficiently for retry policy and user action.
 
 Removing a job record and deleting partial or final output are separate choices.
 Deletion must operate on resolved, validated paths owned by that job.
 
 ## Test obligations
 
-Persistence tests must cover:
+As the corresponding behavior is introduced, persistence and recovery tests
+must cover:
 
 - creation before scheduling and reload after reopening the database;
 - valid and invalid enum values and state changes;

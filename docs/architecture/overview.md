@@ -1,32 +1,37 @@
 # Architecture Overview
 
-Status: Accepted target constraints, not an implementation inventory
+Status: Accepted architecture with current implementation notes
 
 ## Current state
 
-The repository contains the initial Rust workspace with:
+The Rust workspace contains:
 
-- `gunda-core`, providing the download domain model, lifecycle rules,
-  application commands and events, and the persistence boundary;
-- `gunda-storage`, providing the initial SQLite schema, migrations, and support
-  for creating and reloading queued download jobs.
+- `gunda-core`, providing the download domain, lifecycle rules, application
+  command and event types, the repository contract, and a download manager;
+- `gunda-storage`, providing SQLite migrations and transactional creation,
+  lookup, and listing of initial queued jobs through SQLx.
 
-Application orchestration, protocol engines, executable clients, lifecycle
-persistence beyond initial job creation, and startup recovery are not yet
-implemented.
+The manager loads persisted jobs before startup succeeds, exposes read-only
+snapshots, and persists newly created jobs before inserting them into its
+runtime registry.
 
-This document defines boundaries that subsequent implementation must preserve.
-A component described as planned does not exist merely because it appears here.
+Manager and storage operations emit structured tracing with explicitly selected
+safe fields. Libraries do not configure a global subscriber.
+
+Protocol engines, executable clients, persistent lifecycle updates, scheduling,
+and interrupted-download recovery are not implemented yet.
+
+The remaining sections describe accepted responsibilities and boundaries.
+Planned behavior must not be interpreted as an existing capability.
 
 ## Component ownership
 
-The first useful implementation is expected to introduce these responsibilities
-only as they become necessary:
+Components have the following responsibilities and implementation status:
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| `gunda-core` | Download domain, lifecycle rules, application commands and events, and interfaces for engines and persistence | Foundation implemented |
-| `gunda-storage` | SQLite schema, migrations, and implementations of core persistence interfaces | Initial queued-job persistence implemented |
+| `gunda-core` | Download domain, lifecycle rules, command and event types, repository contract, and application orchestration | Initial domain and manager implemented; execution orchestration remains planned |
+| `gunda-storage` | SQLite schema, migrations, and implementation of the core repository contract | Initial queued-job creation, lookup, and listing implemented |
 | `gunda-http` | Shared HTTP transport and the direct HTTP file engine | Planned |
 | Desktop application | Tauri composition root and Svelte presentation client | Planned |
 
@@ -49,7 +54,7 @@ composition root selects concrete adapters and supplies them to the application
 layer. Presentation clients send commands and observe snapshots or events. They
 do not receive mutable access to downloader internals.
 
-Dependency direction is therefore:
+The accepted dependency direction, including planned components, is:
 
 ```text
 desktop composition root
@@ -64,9 +69,22 @@ core.
 
 ## Download flow
 
-Clients submit intent through an application API. Creation succeeds only after
-the job is stored. The download manager can then inspect the request, select an
-engine, and schedule execution.
+The implemented creation flow is:
+
+1. The caller supplies a new download to the manager.
+2. The manager requests creation through the repository contract.
+3. The SQLite adapter commits the job and its public request headers.
+4. The manager adds the persisted job to its runtime registry.
+5. The manager returns a `Created` event to the caller.
+
+A failed repository operation does not add a job to the manager. Returning an
+event does not imply an event bus or subscription mechanism exists.
+
+At startup, the manager loads the repository snapshot before returning a usable
+instance. Its current registry is ordered by download ID; this is not a
+scheduling policy.
+
+The planned execution flow extends these foundations:
 
 ```text
 client command
@@ -81,30 +99,39 @@ engine interface ---> HTTP or future streaming engine
 filesystem and network adapters
 ```
 
-Engines own protocol behavior. They inspect and execute transfers, report
-progress and outcomes, and maintain protocol-specific resume information. They
-do not change persistent jobs directly. The download manager validates state
-transitions, writes durable state, and publishes application events.
+Engines will own protocol behavior: inspection, transfer execution, progress,
+outcomes, and protocol-specific resume information. They must not change
+persistent jobs directly.
+
+The manager will validate lifecycle transitions, persist their results, and
+publish application events. These execution paths are not implemented yet.
 
 The exact Rust engine trait and registration mechanism remain open until direct
 HTTP and HLS requirements provide enough evidence for a stable interface.
 
 ## Durable and runtime state
 
-The `DownloadJob` is the primary durable aggregate. It records request and
-destination intent, origin, resolved resource information, lifecycle state,
-durable progress checkpoints, failures, and timestamps. SQLite is the durable
-store, but it is not proof that bytes exist on disk. Recovery reconciles database
-checkpoints with protocol metadata and partial output.
+`DownloadJob` is the primary aggregate. Its domain model includes request and
+destination intent, origin, optional resolved resource and destination
+information, lifecycle state, progress checkpoints, failures, and timestamps.
+
+The current SQLite adapter persists only the initial queued-job representation.
+Persisting subsequent lifecycle changes, inspection results, resolved
+destinations, failures, and progress checkpoints requires additional repository
+operations and schema changes.
+
+SQLite is the durable store, but a stored checkpoint is not proof that bytes
+exist on disk. Future recovery must reconcile database state with protocol
+metadata and partial output.
 
 Transfer speed, ETA, worker handles, open files, in-flight requests, and emitted
-events are runtime state. Events are notifications, not an event-sourced durable
-model.
+events belong to runtime state as execution is introduced. Events are
+notifications, not an event-sourced durable model.
 
 See [Download lifecycle](../design/download-lifecycle.md) and
 [Persistence and recovery](../design/persistence-and-recovery.md).
 
-## Protocol boundaries
+## Planned protocol boundaries
 
 Direct HTTP files, HLS, and future DASH resources are separate engines behind an
 application-facing boundary. Low-level HTTP behavior such as request headers,
@@ -116,7 +143,7 @@ before adding range acceleration. HLS work begins after the engine boundary has
 been exercised by direct HTTP. DASH does not receive a design until those
 interfaces have been tested by HLS.
 
-## Client and process boundaries
+## Planned client and process boundaries
 
 The desktop application is a client of the application layer. A future browser
 extension is a sensor and browser-facing UI: it may observe candidate requests
@@ -153,8 +180,11 @@ Implementation must preserve these constraints:
 - Supporting authenticated requests and standard encrypted streams does not
   include circumventing DRM systems.
 
-These are architectural constraints, not claims that the current placeholder
-binary implements security controls.
+These constraints apply as each component is implemented. Current protections
+include rejection of browser-originated jobs and explicitly sensitive headers
+by the SQLite adapter, plus restricted diagnostic fields. Network, filesystem
+finalization, and client-boundary protections remain requirements for future
+components.
 
 ## Decisions
 
