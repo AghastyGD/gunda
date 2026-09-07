@@ -1,12 +1,28 @@
 # Download Lifecycle
 
-Status: Accepted design, not implemented
+Status: Accepted design, partially implemented
 
 ## Purpose
 
 A download is a persistent job, not a URL or a running task. This design defines
 the lifecycle that clients, the application layer, engines, and storage share.
-It does not freeze the public Rust types before implementation begins.
+
+## Current implementation
+
+The core implements the download aggregate, lifecycle states, transition
+validation, progress invariants, and command and event types.
+
+The manager creates persisted queued jobs, loads them at startup, and exposes
+read-only access to its runtime registry. Creation returns a `Created` event
+after persistence succeeds; no event delivery infrastructure is implemented.
+
+Domain methods support in-memory lifecycle changes, but the storage adapter
+currently persists only initial queued jobs. Persistent transitions, transfer
+execution, pause, resume, cancellation, retry, removal, and interrupted-download
+recovery are not implemented as manager operations.
+
+The following sections define the lifecycle contract, including behavior that
+will be implemented with transfer execution and recovery.
 
 ## Aggregate
 
@@ -68,15 +84,19 @@ special path for selected downloads.
 
 ## Commands and events
 
-The initial command vocabulary is expected to cover create, pause, resume,
-cancel, retry, and remove. Removal separately decides whether partial data is
-deleted. Presentation clients communicate intent through these commands and do
-not mutate job fields.
+`DownloadCommand` defines create, pause, resume, cancel, retry, and remove
+intent. Defining these variants does not mean every operation has an
+application handler. The manager currently exposes creation directly rather
+than through a general command dispatcher.
 
-Runtime events report creation, state changes, progress, completion, failure,
-and removal. They let an in-process desktop client render current state. Events
-are not the source of durable truth and do not require event sourcing.
+Removal separates removing a job from deciding whether its partial data should
+also be deleted. Presentation clients must not mutate job fields directly.
 
+`DownloadEvent` defines notifications for creation, state changes, progress,
+completion, failure, and removal. Only creation is currently returned by the
+manager; event publication and subscription remain unimplemented.
+
+Events are not the source of durable truth and do not require event sourcing.
 ## Invariants
 
 - Every persisted job has a valid local ID.
@@ -93,7 +113,9 @@ are not the source of durable truth and do not require event sourcing.
 
 ## Open implementation questions
 
-The concrete Rust aggregate layout, engine trait, engine registration strategy,
-progress checkpoint interval, and event delivery mechanism remain open. These
-choices should be made alongside the first implementation and kept close to the
-relevant code unless they introduce a repository-wide constraint.
+The engine trait, engine registration strategy, progress checkpoint interval,
+and event delivery mechanism remain open.
+
+These choices should be made alongside the corresponding implementation and
+kept close to the relevant code unless they introduce a repository-wide
+constraint.

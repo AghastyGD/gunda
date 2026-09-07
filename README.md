@@ -8,21 +8,33 @@ Gunda is a cross-platform download manager developed Linux-first, focused on rel
 
 Gunda is in early development and is not yet usable as a download manager.
 
-The repository currently contains the initial core domain and application model, including download lifecycle management, request context, destinations, resource metadata, commands, events, progress tracking, and failure semantics.
+The Rust workspace currently provides:
 
-The repository now includes the initial SQLite persistence adapter, capable of creating and reloading queued download jobs across application restarts.
+- A download domain model with lifecycle rules, request context, destinations,
+  resource metadata, progress, failures, and application command and event types.
+- SQLite persistence for creating, finding, and listing initial queued jobs.
+- A download manager that loads persisted jobs at startup, exposes read-only
+  snapshots, and persists new jobs before adding them to its runtime registry.
+- Structured tracing for manager and storage operations, with tests guarding
+  against sensitive data appearing in diagnostics.
 
-The next foundation work focuses on application orchestration and startup loading, followed by the first end-to-end HTTP download path.
+Network transfers, persistent lifecycle updates, interrupted-download recovery,
+and executable clients are not implemented yet.
 
 ## Build
 
 Install a current stable Rust toolchain, then run:
 
-```bash
-cargo build --workspace
-cargo test --workspace
+```console
+cargo build --workspace --all-features
+cargo test --workspace --all-features
 ```
-Gunda is not yet runnable as an application. The repository currently contains the core domain and application foundations, while executable clients will be introduced in later milestones.
+
+The workspace currently contains libraries, not a runnable application.
+
+CI builds and tests the workspace on Linux and Windows. Formatting and Clippy
+checks run on Linux. See [Contributing](CONTRIBUTING.md) for the complete local
+validation commands.
 
 ## Documentation
 
