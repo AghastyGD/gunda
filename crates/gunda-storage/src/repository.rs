@@ -934,4 +934,191 @@ mod tests {
 
         assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
     }
+
+    #[tokio::test]
+    async fn execution_metadata_migration_preserves_existing_jobs() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrator;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let directory = tempdir().expect("temporary directory must exist");
+        let database_path = directory.path().join("gunda.sqlite3");
+        let old_migrations = tempdir().expect("temporary migration directory must exist");
+
+        let initial_migration = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join("0001_create_downloads.sql");
+
+        std::fs::copy(
+            initial_migration,
+            old_migrations.path().join("0001_create_downloads.sql"),
+        )
+        .expect("initial migration must be copied");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .disable_statement_logging();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("old database must open");
+
+        let migrator = Migrator::new(old_migrations.path())
+            .await
+            .expect("initial migrator must load");
+
+        migrator
+            .run(&pool)
+            .await
+            .expect("initial schema must be created");
+
+        let repository = SqliteDownloadRepository { pool };
+
+        let original = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created using the original schema");
+
+        repository.close().await;
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must open and apply pending migrations");
+
+        let restored = repository
+            .find_by_id(original.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("existing job must survive migration");
+
+        assert!(restored == original);
+
+        let metadata_is_absent: i64 = sqlx::query_scalar(
+            r#"
+            SELECT
+                resolved_destination_path IS NULL
+                AND resource_kind IS NULL
+                AND resource_display_name IS NULL
+                AND resource_content_type IS NULL
+                AND last_failure_kind IS NULL
+                AND last_failure_message IS NULL
+                AND last_failure_retryable IS NULL
+            FROM downloads
+            WHERE id = $1
+            "#,
+        )
+        .bind(original.id().value())
+        .fetch_one(&repository.pool)
+        .await
+        .expect("new metadata columns must exist");
+
+        assert_eq!(metadata_is_absent, 1);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn resource_metadata_requires_a_resource_kind() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let job = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let error =
+            sqlx::query("UPDATE downloads SET resource_display_name = 'file.iso' WHERE id = $1")
+                .bind(job.id().value())
+                .execute(&repository.pool)
+                .await
+                .expect_err("metadata without a resource kind must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE downloads
+            SET resource_kind = 'file',
+                resource_display_name = 'file.iso'
+            WHERE id = $1
+            "#,
+        )
+        .bind(job.id().value())
+        .execute(&repository.pool)
+        .await
+        .expect("resource metadata with a kind must be accepted");
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn failure_metadata_requires_a_complete_description() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let job = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let error = sqlx::query("UPDATE downloads SET last_failure_kind = 'network' WHERE id = $1")
+            .bind(job.id().value())
+            .execute(&repository.pool)
+            .await
+            .expect_err("partial failure metadata must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE downloads
+            SET last_failure_kind = 'network',
+                last_failure_message = 'connection closed',
+                last_failure_retryable = 1
+            WHERE id = $1
+            "#,
+        )
+        .bind(job.id().value())
+        .execute(&repository.pool)
+        .await
+        .expect("complete failure metadata must be accepted");
+
+        let error = sqlx::query("UPDATE downloads SET last_failure_retryable = 2 WHERE id = $1")
+            .bind(job.id().value())
+            .execute(&repository.pool)
+            .await
+            .expect_err("invalid boolean representation must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        repository.close().await;
+    }
 }

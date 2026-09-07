@@ -11,7 +11,7 @@ mod state;
 pub use destination::{DownloadDestination, FileConflictPolicy, ResolvedDestination};
 pub use failure::{DownloadFailure, FailureKind};
 pub use id::{DownloadId, InvalidDownloadId};
-pub use job::{DownloadJob, NewDownload};
+pub use job::{DownloadJob, DownloadJobSnapshot, NewDownload};
 pub use origin::DownloadOrigin;
 pub use progress::{DownloadProgress, InvalidDownloadProgress};
 pub use request::{HeaderSensitivity, RequestContext, RequestHeader};
