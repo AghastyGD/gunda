@@ -29,6 +29,21 @@ pub trait DownloadRepository: Send + Sync {
     /// Returning a deterministic order keeps startup snapshots stable across
     /// repository implementations.
     fn list(&self) -> impl Future<Output = Result<Vec<DownloadJob>, RepositoryError>> + Send;
+
+    /// Atomically persists the mutable state of an existing download.
+    ///
+    /// Creation-time request context, origin, destination intent, and creation
+    /// timestamp must remain unchanged.
+    ///
+    /// Returns the persisted representation with storage-normalized timestamps.
+    /// This operation does not validate transition history or perform recovery.
+    ///
+    /// Callers must serialize updates for each download. This contract does not
+    /// currently provide optimistic concurrency control.
+    fn save(
+        &self,
+        job: &DownloadJob,
+    ) -> impl Future<Output = Result<DownloadJob, RepositoryError>> + Send;
 }
 
 /// Stable classification of persistence failures.
@@ -48,6 +63,9 @@ pub enum RepositoryErrorKind {
 
     /// An unexpected persistence operation failed.
     Internal,
+
+    /// The download targeted by an update does not exist.
+    NotFound,
 }
 
 /// Persistence error safe for the application and presentation layers.

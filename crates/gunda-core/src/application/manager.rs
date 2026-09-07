@@ -220,6 +220,35 @@ mod tests {
                 .expect("fake repository lock must not be poisoned")
                 .clone())
         }
+
+        async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .expect("fake repository lock must not be poisoned");
+
+            let current = jobs
+                .iter_mut()
+                .find(|current| current.id() == job.id())
+                .ok_or_else(|| {
+                    RepositoryError::new(RepositoryErrorKind::NotFound, "download does not exist")
+                })?;
+
+            if current.request() != job.request()
+                || current.origin() != job.origin()
+                || current.destination() != job.destination()
+                || current.created_at() != job.created_at()
+            {
+                return Err(RepositoryError::new(
+                    RepositoryErrorKind::ConstraintViolation,
+                    "download creation metadata cannot be changed",
+                ));
+            }
+
+            *current = job.clone();
+
+            Ok(current.clone())
+        }
     }
 
     fn new_download(filename: &str) -> NewDownload {

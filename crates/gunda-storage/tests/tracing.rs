@@ -323,6 +323,10 @@ impl DownloadRepository for FailingRepository {
             Ok(Vec::new())
         }
     }
+
+    async fn save(&self, _job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
+        Err(untrusted_error())
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
