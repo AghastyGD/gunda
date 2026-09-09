@@ -106,7 +106,7 @@ where
     }
 
     /// Cancels a queued or paused job deleting its files or history.
-    /// 
+    ///
     /// Cancelling active execution requires worker coordination and is not
     /// supported by this operation yet.
     #[tracing::instrument(name = "manager.cancel", skip_all, fields(download_id = id.value()))]
