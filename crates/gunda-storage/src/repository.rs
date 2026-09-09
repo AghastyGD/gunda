@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use gunda_core::application::{DownloadRepository, RepositoryError, RepositoryErrorKind};
 use gunda_core::download::{
-    DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, FileConflictPolicy,
-    HeaderSensitivity, NewDownload, RequestContext, RequestHeader,
+    DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadJobSnapshot,
+    DownloadOrigin, DownloadProgress, DownloadState, FailureKind, FileConflictPolicy,
+    HeaderSensitivity, NewDownload, RequestContext, RequestHeader, ResolvedDestination,
+    ResourceDescriptor, ResourceKind,
 };
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
@@ -140,7 +142,14 @@ impl DownloadRepository for SqliteDownloadRepository {
                 downloaded_bytes,
                 total_bytes,
                 created_at_unix_ms,
-                updated_at_unix_ms
+                updated_at_unix_ms,
+                resolved_destination_path,
+                resource_kind,
+                resource_display_name,
+                resource_content_type,
+                last_failure_kind,
+                last_failure_message,
+                last_failure_retryable
             FROM downloads
             WHERE id = $1
             "#,
@@ -198,7 +207,14 @@ impl DownloadRepository for SqliteDownloadRepository {
                 downloaded_bytes,
                 total_bytes,
                 created_at_unix_ms,
-                updated_at_unix_ms
+                updated_at_unix_ms,
+                resolved_destination_path,
+                resource_kind,
+                resource_display_name,
+                resource_content_type,
+                last_failure_kind,
+                last_failure_message,
+                last_failure_retryable
             FROM downloads
             ORDER BY id
             "#,
@@ -236,6 +252,123 @@ impl DownloadRepository for SqliteDownloadRepository {
         .await;
         result.inspect_err(|error| report_storage_error("storage.list", error))
     }
+
+    #[tracing::instrument(name = "storage.save", level = "debug", skip_all, fields(download_id = job.id().value()))]
+    async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
+        let result = async {
+            let mut snapshot = job.snapshot();
+
+            ensure_persistable(&snapshot.download)?;
+
+            let created_at_unix_ms = encode_timestamp(snapshot.created_at)?;
+            let updated_at_unix_ms = encode_timestamp(snapshot.updated_at)?;
+
+            snapshot.created_at = decode_timestamp(created_at_unix_ms)?;
+            snapshot.updated_at = decode_timestamp(updated_at_unix_ms)?;
+
+            let downloaded_bytes = encode_byte_count(snapshot.progress.downloaded_bytes())?;
+
+            let total_bytes = snapshot
+                .progress
+                .total_bytes()
+                .map(encode_byte_count)
+                .transpose()?;
+
+            let resolved_destination_path = snapshot
+                .resolved_destination
+                .as_ref()
+                .map(|destination| path_codec::encode(destination.final_path()))
+                .transpose()?;
+
+            let mut transaction = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| internal_error("could not start download update transaction"))?;
+
+            let row = sqlx::query("SELECT * FROM downloads WHERE id = $1")
+                .bind(snapshot.id.value())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| internal_error("could not load download for update"))?
+                .ok_or_else(|| {
+                    RepositoryError::new(RepositoryErrorKind::NotFound, "download does not exist")
+                })?;
+
+            let stored = StoredDownload::from_row(&row)?;
+            let stored_id = stored.download_id()?;
+            let headers = load_headers(&mut transaction, stored_id).await?;
+            let current = stored.to_job(stored_id, headers)?;
+
+            if current.request() != snapshot.download.request()
+                || current.origin() != snapshot.download.origin()
+                || current.destination() != snapshot.download.destination()
+                || current.created_at() != snapshot.created_at
+            {
+                return Err(RepositoryError::new(
+                    RepositoryErrorKind::ConstraintViolation,
+                    "download creation metadata cannot be changed",
+                ));
+            }
+
+            let resource = snapshot.resource.as_ref();
+            let failure = snapshot.last_failure.as_ref();
+
+            let updated = sqlx::query(
+                r#"
+                UPDATE downloads
+                SET state = $1,
+                    downloaded_bytes = $2,
+                    total_bytes = $3,
+                    updated_at_unix_ms = $4,
+                    resolved_destination_path = $5,
+                    resource_kind = $6,
+                    resource_display_name = $7,
+                    resource_content_type = $8,
+                    last_failure_kind = $9,
+                    last_failure_message = $10,
+                    last_failure_retryable = $11
+                WHERE id = $12
+                "#,
+            )
+            .bind(encode_state(snapshot.state))
+            .bind(downloaded_bytes)
+            .bind(total_bytes)
+            .bind(updated_at_unix_ms)
+            .bind(resolved_destination_path)
+            .bind(resource.map(|resource| encode_resource_kind(resource.kind())))
+            .bind(resource.and_then(ResourceDescriptor::display_name))
+            .bind(resource.and_then(ResourceDescriptor::content_type))
+            .bind(failure.map(|failure| encode_failure_kind(failure.kind())))
+            .bind(failure.map(DownloadFailure::message))
+            .bind(failure.map(|failure| i64::from(failure.is_retryable())))
+            .bind(snapshot.id.value())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| internal_error("could not update download"))?;
+
+            if updated.rows_affected() != 1 {
+                return Err(internal_error(
+                    "download update affected an unexpected number of records",
+                ));
+            }
+
+            transaction
+                .commit()
+                .await
+                .map_err(|_| internal_error("could not commit download update"))?;
+
+            tracing::debug!(
+                state = encode_state(snapshot.state),
+                "download update committed"
+            );
+
+            Ok(DownloadJob::restore(snapshot))
+        }
+        .await;
+
+        result.inspect_err(|error| report_storage_error("storage.save", error))
+    }
 }
 
 struct StoredDownload {
@@ -252,6 +385,13 @@ struct StoredDownload {
     total_bytes: Option<i64>,
     created_at_unix_ms: i64,
     updated_at_unix_ms: i64,
+    resolved_destination_path: Option<Vec<u8>>,
+    resource_kind: Option<String>,
+    resource_display_name: Option<String>,
+    resource_content_type: Option<String>,
+    last_failure_kind: Option<String>,
+    last_failure_message: Option<String>,
+    last_failure_retryable: Option<i64>,
 }
 
 impl StoredDownload {
@@ -271,6 +411,13 @@ impl StoredDownload {
                 total_bytes: row.try_get("total_bytes")?,
                 created_at_unix_ms: row.try_get("created_at_unix_ms")?,
                 updated_at_unix_ms: row.try_get("updated_at_unix_ms")?,
+                resolved_destination_path: row.try_get("resolved_destination_path")?,
+                resource_kind: row.try_get("resource_kind")?,
+                resource_display_name: row.try_get("resource_display_name")?,
+                resource_content_type: row.try_get("resource_content_type")?,
+                last_failure_kind: row.try_get("last_failure_kind")?,
+                last_failure_message: row.try_get("last_failure_message")?,
+                last_failure_retryable: row.try_get("last_failure_retryable")?,
             })
         };
 
@@ -307,12 +454,65 @@ impl StoredDownload {
         id: DownloadId,
         headers: Vec<RequestHeader>,
     ) -> Result<DownloadJob, RepositoryError> {
-        validate_initial_job(self)?;
-
-        let created_at = decode_timestamp(self.created_at_unix_ms)?;
         let download = self.to_new_download(headers)?;
 
-        Ok(DownloadJob::new(id, download, created_at))
+        ensure_persistable(&download)
+            .map_err(|_| invalid_data("stored request context is not supported"))?;
+
+        let downloaded_bytes = decode_byte_count(self.downloaded_bytes)?;
+        let total_bytes = self.total_bytes.map(decode_byte_count).transpose()?;
+
+        let progress = DownloadProgress::new(downloaded_bytes, total_bytes)
+            .map_err(|_| invalid_data("stored progress is invalid"))?;
+
+        let resolved_destination = self
+            .resolved_destination_path
+            .as_deref()
+            .map(path_codec::decode)
+            .transpose()?
+            .map(ResolvedDestination::new);
+
+        Ok(DownloadJob::restore(DownloadJobSnapshot {
+            id,
+            download,
+            resolved_destination,
+            resource: self.decode_resource()?,
+            state: decode_state(&self.state)?,
+            progress,
+            last_failure: self.decode_failure()?,
+            created_at: decode_timestamp(self.created_at_unix_ms)?,
+            updated_at: decode_timestamp(self.updated_at_unix_ms)?,
+        }))
+    }
+
+    fn decode_resource(&self) -> Result<Option<ResourceDescriptor>, RepositoryError> {
+        match self.resource_kind.as_deref() {
+            Some(kind) => Ok(Some(ResourceDescriptor::new(
+                decode_resource_kind(kind)?,
+                self.resource_display_name.clone(),
+                self.resource_content_type.clone(),
+            ))),
+            None if self.resource_display_name.is_none()
+                && self.resource_content_type.is_none() =>
+            {
+                Ok(None)
+            }
+            None => Err(invalid_data("stored resource metadata is incomplete")),
+        }
+    }
+
+    fn decode_failure(&self) -> Result<Option<DownloadFailure>, RepositoryError> {
+        match (
+            self.last_failure_kind.as_deref(),
+            self.last_failure_message.as_deref(),
+            self.last_failure_retryable,
+        ) {
+            (None, None, None) => Ok(None),
+            (Some(kind), Some(message), Some(retryable @ (0 | 1))) => Ok(Some(
+                DownloadFailure::new(decode_failure_kind(kind)?, message, retryable == 1),
+            )),
+            _ => Err(invalid_data("stored failure metadata is invalid")),
+        }
     }
 }
 
@@ -579,22 +779,6 @@ fn decode_conflict_policy(policy: &str) -> Result<FileConflictPolicy, Repository
     }
 }
 
-fn validate_initial_job(stored: &StoredDownload) -> Result<(), RepositoryError> {
-    if stored.id <= 0 {
-        return Err(invalid_data("stored download has an invalid ID"));
-    }
-
-    if stored.state != "queued"
-        || stored.downloaded_bytes != 0
-        || stored.total_bytes.is_some()
-        || stored.updated_at_unix_ms != stored.created_at_unix_ms
-    {
-        return Err(invalid_data("stored download is not an initial queued job"));
-    }
-
-    Ok(())
-}
-
 fn encode_timestamp(timestamp: OffsetDateTime) -> Result<i64, RepositoryError> {
     let milliseconds = timestamp.unix_timestamp_nanos().div_euclid(1_000_000);
 
@@ -611,6 +795,98 @@ fn decode_timestamp(milliseconds: i64) -> Result<OffsetDateTime, RepositoryError
         .map_err(|_| invalid_data("stored download timestamp is invalid"))
 }
 
+const fn encode_state(state: DownloadState) -> &'static str {
+    match state {
+        DownloadState::Queued => "queued",
+        DownloadState::Inspecting => "inspecting",
+        DownloadState::Downloading => "downloading",
+        DownloadState::Paused => "paused",
+        DownloadState::Finalizing => "finalizing",
+        DownloadState::Completed => "completed",
+        DownloadState::Failed => "failed",
+        DownloadState::Cancelled => "cancelled",
+        DownloadState::Interrupted => "interrupted",
+    }
+}
+
+fn decode_state(value: &str) -> Result<DownloadState, RepositoryError> {
+    match value {
+        "queued" => Ok(DownloadState::Queued),
+        "inspecting" => Ok(DownloadState::Inspecting),
+        "downloading" => Ok(DownloadState::Downloading),
+        "paused" => Ok(DownloadState::Paused),
+        "finalizing" => Ok(DownloadState::Finalizing),
+        "completed" => Ok(DownloadState::Completed),
+        "failed" => Ok(DownloadState::Failed),
+        "cancelled" => Ok(DownloadState::Cancelled),
+        "interrupted" => Ok(DownloadState::Interrupted),
+        _ => Err(invalid_data("stored lifecycle state is invalid")),
+    }
+}
+
+const fn encode_resource_kind(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Unknown => "unknown",
+        ResourceKind::File => "file",
+        ResourceKind::Hls => "hls",
+        ResourceKind::Dash => "dash",
+    }
+}
+
+fn decode_resource_kind(value: &str) -> Result<ResourceKind, RepositoryError> {
+    match value {
+        "unknown" => Ok(ResourceKind::Unknown),
+        "file" => Ok(ResourceKind::File),
+        "hls" => Ok(ResourceKind::Hls),
+        "dash" => Ok(ResourceKind::Dash),
+        _ => Err(invalid_data("stored resource kind is invalid")),
+    }
+}
+
+const fn encode_failure_kind(kind: FailureKind) -> &'static str {
+    match kind {
+        FailureKind::Network => "network",
+        FailureKind::Authentication => "authentication",
+        FailureKind::RemoteRejected => "remote_rejected",
+        FailureKind::InvalidResponse => "invalid_response",
+        FailureKind::UnsupportedResource => "unsupported_resource",
+        FailureKind::PermissionDenied => "permission_denied",
+        FailureKind::DiskFull => "disk_full",
+        FailureKind::Integrity => "integrity",
+        FailureKind::Storage => "storage",
+        FailureKind::Internal => "internal",
+    }
+}
+
+fn decode_failure_kind(value: &str) -> Result<FailureKind, RepositoryError> {
+    match value {
+        "network" => Ok(FailureKind::Network),
+        "authentication" => Ok(FailureKind::Authentication),
+        "remote_rejected" => Ok(FailureKind::RemoteRejected),
+        "invalid_response" => Ok(FailureKind::InvalidResponse),
+        "unsupported_resource" => Ok(FailureKind::UnsupportedResource),
+        "permission_denied" => Ok(FailureKind::PermissionDenied),
+        "disk_full" => Ok(FailureKind::DiskFull),
+        "integrity" => Ok(FailureKind::Integrity),
+        "storage" => Ok(FailureKind::Storage),
+        "internal" => Ok(FailureKind::Internal),
+        _ => Err(invalid_data("stored failure kind is invalid")),
+    }
+}
+
+fn encode_byte_count(value: u64) -> Result<i64, RepositoryError> {
+    i64::try_from(value).map_err(|_| {
+        RepositoryError::new(
+            RepositoryErrorKind::ConstraintViolation,
+            "download byte count exceeds the storage range",
+        )
+    })
+}
+
+fn decode_byte_count(value: i64) -> Result<u64, RepositoryError> {
+    u64::try_from(value).map_err(|_| invalid_data("stored byte count is negative"))
+}
+
 fn invalid_data(message: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, message)
 }
@@ -625,11 +901,13 @@ mod tests {
 
     use gunda_core::application::{DownloadRepository, RepositoryErrorKind};
     use gunda_core::download::{
-        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
-        FileConflictPolicy, HeaderSensitivity, NewDownload, RequestContext, RequestHeader,
+        DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin,
+        DownloadProgress, DownloadState, FailureKind, FileConflictPolicy, HeaderSensitivity,
+        NewDownload, RequestContext, RequestHeader, ResolvedDestination, ResourceDescriptor,
+        ResourceKind,
     };
     use tempfile::tempdir;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
     use url::Url;
 
     use super::SqliteDownloadRepository;
@@ -675,6 +953,49 @@ mod tests {
 
     fn test_id(value: i64) -> DownloadId {
         DownloadId::new(value).expect("test ID must be valid")
+    }
+
+    fn failed_job(mut job: DownloadJob) -> DownloadJob {
+        let inspected_at = job.created_at() + Duration::seconds(1);
+        let downloading_at = job.created_at() + Duration::seconds(2);
+        let failed_at = job.created_at() + Duration::seconds(3);
+
+        job.transition_to(DownloadState::Inspecting, inspected_at)
+            .expect("inspection transition must succeed");
+
+        job.set_resource(
+            ResourceDescriptor::new(
+                ResourceKind::File,
+                Some("file.iso".to_owned()),
+                Some("application/octet-stream".to_owned()),
+            ),
+            inspected_at,
+        );
+
+        job.resolve_destination(
+            ResolvedDestination::new(PathBuf::from("downloads").join("images").join("file.iso")),
+            inspected_at,
+        );
+
+        job.transition_to(DownloadState::Downloading, downloading_at)
+            .expect("download transition must succeed");
+
+        job.update_progress(
+            DownloadProgress::new(512, Some(1024)).expect("progress must be valid"),
+            downloading_at,
+        );
+
+        job.fail(
+            DownloadFailure::new(
+                FailureKind::Network,
+                "connection closed before the response completed",
+                true,
+            ),
+            failed_at,
+        )
+        .expect("failure transition must succeed");
+
+        job
     }
 
     #[tokio::test]
@@ -933,5 +1254,422 @@ mod tests {
         };
 
         assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn execution_metadata_migration_preserves_existing_jobs() {
+        use sqlx::ConnectOptions;
+        use sqlx::migrate::Migrator;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+        let directory = tempdir().expect("temporary directory must exist");
+        let database_path = directory.path().join("gunda.sqlite3");
+        let old_migrations = tempdir().expect("temporary migration directory must exist");
+
+        let initial_migration = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join("0001_create_downloads.sql");
+
+        std::fs::copy(
+            initial_migration,
+            old_migrations.path().join("0001_create_downloads.sql"),
+        )
+        .expect("initial migration must be copied");
+
+        let options = SqliteConnectOptions::new()
+            .filename(&database_path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .disable_statement_logging();
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("old database must open");
+
+        let migrator = Migrator::new(old_migrations.path())
+            .await
+            .expect("initial migrator must load");
+
+        migrator
+            .run(&pool)
+            .await
+            .expect("initial schema must be created");
+
+        let repository = SqliteDownloadRepository { pool };
+
+        let original = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created using the original schema");
+
+        repository.close().await;
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must open and apply pending migrations");
+
+        let restored = repository
+            .find_by_id(original.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("existing job must survive migration");
+
+        assert!(restored == original);
+
+        let metadata_is_absent: i64 = sqlx::query_scalar(
+            r#"
+            SELECT
+                resolved_destination_path IS NULL
+                AND resource_kind IS NULL
+                AND resource_display_name IS NULL
+                AND resource_content_type IS NULL
+                AND last_failure_kind IS NULL
+                AND last_failure_message IS NULL
+                AND last_failure_retryable IS NULL
+            FROM downloads
+            WHERE id = $1
+            "#,
+        )
+        .bind(original.id().value())
+        .fetch_one(&repository.pool)
+        .await
+        .expect("new metadata columns must exist");
+
+        assert_eq!(metadata_is_absent, 1);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn resource_metadata_requires_a_resource_kind() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let job = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let error =
+            sqlx::query("UPDATE downloads SET resource_display_name = 'file.iso' WHERE id = $1")
+                .bind(job.id().value())
+                .execute(&repository.pool)
+                .await
+                .expect_err("metadata without a resource kind must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE downloads
+            SET resource_kind = 'file',
+                resource_display_name = 'file.iso'
+            WHERE id = $1
+            "#,
+        )
+        .bind(job.id().value())
+        .execute(&repository.pool)
+        .await
+        .expect("resource metadata with a kind must be accepted");
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn failure_metadata_requires_a_complete_description() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let job = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let error = sqlx::query("UPDATE downloads SET last_failure_kind = 'network' WHERE id = $1")
+            .bind(job.id().value())
+            .execute(&repository.pool)
+            .await
+            .expect_err("partial failure metadata must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        sqlx::query(
+            r#"
+            UPDATE downloads
+            SET last_failure_kind = 'network',
+                last_failure_message = 'connection closed',
+                last_failure_retryable = 1
+            WHERE id = $1
+            "#,
+        )
+        .bind(job.id().value())
+        .execute(&repository.pool)
+        .await
+        .expect("complete failure metadata must be accepted");
+
+        let error = sqlx::query("UPDATE downloads SET last_failure_retryable = 2 WHERE id = $1")
+            .bind(job.id().value())
+            .execute(&repository.pool)
+            .await
+            .expect_err("invalid boolean representation must be rejected");
+
+        assert!(
+            error
+                .as_database_error()
+                .is_some_and(|error| error.is_check_violation())
+        );
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn saved_job_survives_reopen_and_listing() {
+        let directory = tempdir().expect("temporary directory must exist");
+        let database_path = directory.path().join("gunda.sqlite3");
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must open");
+
+        let created = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let changed = failed_job(created);
+
+        let saved = repository.save(&changed).await.expect("job must be saved");
+
+        assert!(saved == changed);
+
+        repository.close().await;
+
+        let repository = SqliteDownloadRepository::open(&database_path)
+            .await
+            .expect("repository must reopen");
+
+        let loaded = repository
+            .find_by_id(saved.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("saved job must exist");
+
+        assert!(loaded == saved);
+
+        let listed = repository.list().await.expect("listing must succeed");
+
+        assert!(listed == vec![saved]);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn saving_a_missing_job_does_not_insert_it() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let job = DownloadJob::new(
+            test_id(404),
+            sample_download(HeaderSensitivity::Public),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        let error = match repository.save(&job).await {
+            Ok(_) => panic!("saving a missing job must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::NotFound);
+        assert!(
+            repository
+                .list()
+                .await
+                .expect("listing must succeed")
+                .is_empty()
+        );
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn saving_rejects_changes_to_creation_metadata() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let original = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let mut snapshot = original.snapshot();
+        snapshot.created_at += Duration::seconds(1);
+
+        let changed = DownloadJob::restore(snapshot);
+
+        let error = match repository.save(&changed).await {
+            Ok(_) => panic!("creation metadata must remain immutable"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::ConstraintViolation);
+
+        let loaded = repository
+            .find_by_id(original.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("original job must exist");
+
+        assert!(loaded == original);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn saving_normalizes_update_timestamp() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let mut job = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        for nanos in [1_234_567_i128, -1, -1_234_567] {
+            let timestamp =
+                OffsetDateTime::from_unix_timestamp_nanos(nanos).expect("timestamp must be valid");
+
+            job.update_progress(DownloadProgress::default(), timestamp);
+
+            let saved = repository.save(&job).await.expect("save must succeed");
+
+            assert_eq!(
+                saved.updated_at().unix_timestamp_nanos(),
+                nanos.div_euclid(1_000_000) * 1_000_000,
+            );
+
+            let loaded = repository
+                .find_by_id(job.id())
+                .await
+                .expect("lookup must succeed")
+                .expect("job must exist");
+
+            assert!(loaded == saved);
+        }
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn byte_count_overflow_leaves_persisted_job_unchanged() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let original = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        let mut changed = original.clone();
+
+        changed.update_progress(
+            DownloadProgress::new(u64::MAX, None).expect("unknown total permits the domain value"),
+            OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+        );
+
+        let error = match repository.save(&changed).await {
+            Ok(_) => panic!("unsupported byte count must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::ConstraintViolation);
+
+        let loaded = repository
+            .find_by_id(original.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("original job must exist");
+
+        assert!(loaded == original);
+
+        repository.close().await;
+    }
+
+    #[tokio::test]
+    async fn database_update_failure_preserves_previous_job() {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let original = repository
+            .create(
+                sample_download(HeaderSensitivity::Public),
+                OffsetDateTime::UNIX_EPOCH,
+            )
+            .await
+            .expect("job must be created");
+
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_download_updates
+            BEFORE UPDATE ON downloads
+            BEGIN
+                SELECT RAISE(ABORT, 'test update rejection');
+            END
+            "#,
+        )
+        .execute(&repository.pool)
+        .await
+        .expect("failure injection trigger must be created");
+
+        let changed = failed_job(original.clone());
+
+        assert!(repository.save(&changed).await.is_err());
+
+        let loaded = repository
+            .find_by_id(original.id())
+            .await
+            .expect("lookup must succeed")
+            .expect("original job must exist");
+
+        assert!(loaded == original);
+
+        repository.close().await;
     }
 }

@@ -45,6 +45,25 @@ impl NewDownload {
     }
 }
 
+/// Complete domain representation used to restore a persisted download.
+///
+/// Storage adapters must decode raw values into valid domain types before
+/// constructing this snapshot.
+///
+/// This is a persistence boundary, not an application command.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DownloadJobSnapshot {
+    pub id: DownloadId,
+    pub download: NewDownload,
+    pub resolved_destination: Option<ResolvedDestination>,
+    pub resource: Option<ResourceDescriptor>,
+    pub state: DownloadState,
+    pub progress: DownloadProgress,
+    pub last_failure: Option<DownloadFailure>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 /// Primary persistent aggregate representing a download.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DownloadJob {
@@ -77,6 +96,56 @@ impl DownloadJob {
             last_failure: None,
             created_at,
             updated_at: created_at,
+        }
+    }
+
+    /// Restores an existing aggregate without replaying lifecycle transitions.
+    ///
+    /// This does not authorize execution, perform recovery, or emit events.
+    /// Application code must use lifecycle methods for new state changes.
+    #[must_use]
+    pub fn restore(snapshot: DownloadJobSnapshot) -> Self {
+        let NewDownload {
+            request,
+            destination,
+            origin,
+        } = snapshot.download;
+
+        Self {
+            id: snapshot.id,
+            request,
+            origin,
+            destination,
+            resolved_destination: snapshot.resolved_destination,
+            resource: snapshot.resource,
+            state: snapshot.state,
+            progress: snapshot.progress,
+            last_failure: snapshot.last_failure,
+            created_at: snapshot.created_at,
+            updated_at: snapshot.updated_at,
+        }
+    }
+
+    /// Captures the complete domain state without changing the aggregate.
+    ///
+    /// The snapshot preserves timestamp precision. Storage adapters are
+    /// responsible for normalizing timestamps to their supported precision.
+    #[must_use]
+    pub fn snapshot(&self) -> DownloadJobSnapshot {
+        DownloadJobSnapshot {
+            id: self.id,
+            download: NewDownload::new(
+                self.request.clone(),
+                self.destination.clone(),
+                self.origin.clone(),
+            ),
+            resolved_destination: self.resolved_destination.clone(),
+            resource: self.resource.clone(),
+            state: self.state,
+            progress: self.progress,
+            last_failure: self.last_failure.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
         }
     }
 
@@ -341,5 +410,128 @@ mod tests {
 
         assert_eq!(failure.kind(), FailureKind::Network);
         assert!(failure.is_retryable());
+    }
+
+    #[test]
+    fn initial_job_survives_snapshot_rount_trip() {
+        let original = sample_job();
+
+        let restored = DownloadJob::restore(original.snapshot());
+
+        assert!(restored == original);
+    }
+
+    #[test]
+    fn snapshot_restores_progress_metadata_and_failure() {
+        let mut original = sample_job();
+        let inspected_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(1);
+        let downloading_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(2);
+        let failed_at = OffsetDateTime::UNIX_EPOCH + Duration::seconds(3);
+
+        original
+            .transition_to(DownloadState::Inspecting, inspected_at)
+            .expect("inspection transition must succeed");
+
+        original.set_resource(
+            ResourceDescriptor::new(
+                ResourceKind::File,
+                Some("image.iso".to_owned()),
+                Some("application/octet-strem".to_owned()),
+            ),
+            inspected_at,
+        );
+
+        original.resolve_destination(
+            ResolvedDestination::new(PathBuf::from("downloads").join("image.iso")),
+            inspected_at,
+        );
+
+        original
+            .transition_to(DownloadState::Downloading, downloading_at)
+            .expect("download transition must succeed");
+
+        original.update_progress(
+            DownloadProgress::new(512, Some(1024)).expect("progress must be valid"),
+            downloading_at,
+        );
+
+        original
+            .fail(
+                DownloadFailure::new(
+                    FailureKind::Network,
+                    "connection closed before the response completed",
+                    true,
+                ),
+                failed_at,
+            )
+            .expect("failure transition must succeed");
+
+        let restored = DownloadJob::restore(original.snapshot());
+
+        assert!(restored == original);
+        assert_eq!(restored.state(), DownloadState::Failed);
+        assert_eq!(restored.progress().downloaded_bytes(), 512);
+        assert_eq!(restored.progress().total_bytes(), Some(1024));
+        assert_eq!(restored.updated_at(), failed_at);
+    }
+
+    #[test]
+    fn restoring_an_active_job_does_not_perform_recovery() {
+        let mut original = sample_job();
+
+        original
+            .transition_to(
+                DownloadState::Inspecting,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+            )
+            .expect("inspection transition must succeed");
+
+        original
+            .transition_to(
+                DownloadState::Downloading,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
+            )
+            .expect("download transition must succeed");
+
+        let restored = DownloadJob::restore(original.snapshot());
+
+        assert!(restored == original);
+        assert_eq!(restored.state(), DownloadState::Downloading);
+    }
+
+    #[test]
+    fn snapshot_preserves_a_previous_failure_after_retry() {
+        let mut original = sample_job();
+
+        original
+            .transition_to(
+                DownloadState::Inspecting,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(1),
+            )
+            .expect("inspection transition must succeed");
+
+        original
+            .fail(
+                DownloadFailure::new(
+                    FailureKind::Network,
+                    "connection could not be established",
+                    true,
+                ),
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(2),
+            )
+            .expect("failure transition must succeed");
+
+        original
+            .transition_to(
+                DownloadState::Queued,
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(3),
+            )
+            .expect("retry transition must succeed");
+
+        let restored = DownloadJob::restore(original.snapshot());
+
+        assert!(restored == original);
+        assert_eq!(restored.state(), DownloadState::Queued);
+        assert!(restored.last_failure().is_some());
     }
 }
