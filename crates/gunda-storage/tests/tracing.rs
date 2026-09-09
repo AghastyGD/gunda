@@ -329,6 +329,32 @@ impl DownloadRepository for FailingRepository {
     }
 }
 
+struct SaveFailingRepository {
+    job: DownloadJob,
+}
+
+impl DownloadRepository for SaveFailingRepository {
+    async fn create(
+        &self,
+        _download: NewDownload,
+        _created_at: OffsetDateTime,
+    ) -> Result<DownloadJob, RepositoryError> {
+        Err(untrusted_error())
+    }
+
+    async fn find_by_id(&self, id: DownloadId) -> Result<Option<DownloadJob>, RepositoryError> {
+        Ok((self.job.id() == id).then(|| self.job.clone()))
+    }
+
+    async fn list(&self) -> Result<Vec<DownloadJob>, RepositoryError> {
+        Ok(vec![self.job.clone()])
+    }
+
+    async fn save(&self, _job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
+        Err(untrusted_error())
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn manager_logs_only_the_category_of_repository_errors() {
     let output = capture_logs(async {
@@ -360,5 +386,93 @@ async fn manager_logs_only_the_category_of_repository_errors() {
     assert!(output.contains("error_kind=Unavailable"));
     assert!(output.contains("manager operation failed"));
 
+    assert_no_private_data(&output);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lifecycle_operations_emit_safe_context() {
+    let output = capture_logs(async {
+        let repository = SqliteDownloadRepository::open_in_memory()
+            .await
+            .expect("repository must open");
+
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let created = manager
+            .create(request(DownloadOrigin::Desktop, false))
+            .await
+            .expect("creation must succeed");
+
+        let id = created.download_id();
+
+        manager.pause(id).await.expect("pause must succed");
+        manager.resume(id).await.expect("resume must succed");
+        manager.cancel(id).await.expect("cancel must succeed");
+
+        assert!(manager.resume(id).await.is_err());
+
+        let missing = DownloadId::new(404).expect("ID must be valid");
+        assert!(manager.pause(missing).await.is_err());
+
+        manager.into_repository().close().await;
+    })
+    .await;
+
+    for expected in [
+        "manager.pause",
+        "manager.resume",
+        "manager.cancel",
+        "storage.save",
+        "download update committed",
+        "download state change committed",
+        "download_id=1",
+        "current=Paused",
+        "current=Queued",
+        "current=Cancelled",
+        "InvalidOperation",
+        "NotFound",
+    ] {
+        assert!(
+            output.contains(expected),
+            "expected safe diagnostic context is missing: {expected}"
+        );
+    }
+
+    assert_no_private_data(&output);
+    assert!(!output.contains("sqlx::query"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_lifecycle_update_logs_no_success_or_private_error() {
+    let output = capture_logs(async {
+        let id = DownloadId::new(1).expect("ID must be valid");
+
+        let original = DownloadJob::new(
+            id,
+            request(DownloadOrigin::Desktop, false),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+
+        let repository = SaveFailingRepository {
+            job: original.clone(),
+        };
+
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        assert!(manager.pause(id).await.is_err());
+        assert!(manager.job(id) == Some(&original));
+    })
+    .await;
+
+    assert!(output.contains("manager.pause"));
+    assert!(output.contains("download_id=1"));
+    assert!(output.contains("error_kind=Unavailable"));
+    assert!(output.contains("manager operation failed"));
+
+    assert!(!output.contains("download state change committed"));
     assert_no_private_data(&output);
 }
