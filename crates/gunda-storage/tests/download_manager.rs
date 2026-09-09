@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use gunda_core::application::{DownloadEvent, DownloadManager, RepositoryErrorKind};
 use gunda_core::download::{
-    DownloadDestination, DownloadOrigin, FileConflictPolicy, HeaderSensitivity, NewDownload,
-    RequestContext, RequestHeader,
+    DownloadDestination, DownloadOrigin, DownloadState, FileConflictPolicy, HeaderSensitivity,
+    NewDownload, RequestContext, RequestHeader,
 };
 use gunda_storage::SqliteDownloadRepository;
 use tempfile::tempdir;
@@ -149,6 +149,73 @@ async fn rejected_creation_preserves_jobs_in_memory_and_on_disk() {
         .expect("manager must restart");
 
     assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn manager_state_changes_survive_repository_reopen() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must open");
+
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must start");
+
+    let created = manager
+        .create(new_download("managed.bin", Vec::new()))
+        .await
+        .expect("creation must succeed");
+
+    let id = created.download_id();
+
+    manager.pause(id).await.expect("pause must succeed");
+
+    let paused = manager.job(id).expect("job must exist").clone();
+
+    assert_eq!(paused.state(), DownloadState::Paused);
+    assert_eq!(
+        paused
+            .updated_at()
+            .unix_timestamp_nanos()
+            .rem_euclid(1_000_000),
+        0,
+    );
+
+    manager.into_repository().close().await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must restart");
+
+    assert!(manager.job(id) == Some(&paused));
+
+    manager.resume(id).await.expect("resume must succeed");
+    manager.cancel(id).await.expect("cancel must succeed");
+
+    let cancelled = manager.job(id).expect("job must exist").clone();
+
+    assert_eq!(cancelled.state(), DownloadState::Cancelled);
+
+    manager.into_repository().close().await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+
+    let manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must restart");
+
+    assert!(manager.job(id) == Some(&cancelled));
 
     manager.into_repository().close().await;
 }

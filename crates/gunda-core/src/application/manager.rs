@@ -2,8 +2,13 @@ use std::collections::BTreeMap;
 
 use time::OffsetDateTime;
 
-use super::{DownloadEvent, DownloadRepository, RepositoryError, RepositoryErrorKind};
-use crate::download::{DownloadId, DownloadJob, NewDownload};
+use super::{
+    DownloadEvent, DownloadManagerError, DownloadRepository, RepositoryError, RepositoryErrorKind,
+};
+use crate::{
+    application::DownloadCommandKind,
+    download::{DownloadId, DownloadJob, DownloadState, NewDownload},
+};
 
 /// Coordinates durable download jobs for application clients.
 ///
@@ -75,6 +80,107 @@ where
         result.inspect_err(|error| report_manager_error("manager.create", error))
     }
 
+    /// Pauses a queued job before execution begins.
+    ///
+    /// Passing active execution requires worker coordination and is not
+    /// supported by this operation ye.
+    #[tracing::instrument(name = "manager.pause", skip_all, fields(download_id = id.value()))]
+    pub async fn pause(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+        self.change_idle_state(id, DownloadCommandKind::Pause)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.pause", error);
+            })
+    }
+
+    /// Returns a paused job to the queue.
+    ///
+    /// This changes sheduling eligibility; it does not start a transfer.
+    #[tracing::instrument(name = "manager.resume", skip_all, fields(download_id = id.value()))]
+    pub async fn resume(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+        self.change_idle_state(id, DownloadCommandKind::Resume)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.resume", error);
+            })
+    }
+
+    /// Cancels a queued or paused job deleting its files or history.
+    #[tracing::instrument(name = "manager.cancel", skip_all, fields(download_id = id.value()))]
+    pub async fn cancel(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+        self.change_idle_state(id, DownloadCommandKind::Cancel)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.cancel", error);
+            })
+    }
+
+    async fn change_idle_state(
+        &mut self,
+        id: DownloadId,
+        command: DownloadCommandKind,
+    ) -> Result<DownloadEvent, DownloadManagerError> {
+        let current = self
+            .jobs
+            .get(&id)
+            .ok_or(DownloadManagerError::NotFound { id })?;
+
+        let previous = current.state();
+
+        let next = match (command, previous) {
+            (DownloadCommandKind::Pause, DownloadState::Queued) => DownloadState::Paused,
+            (DownloadCommandKind::Resume, DownloadState::Paused) => DownloadState::Queued,
+            (DownloadCommandKind::Cancel, DownloadState::Queued | DownloadState::Paused) => {
+                DownloadState::Cancelled
+            }
+            _ => {
+                return Err(DownloadManagerError::InvalidOperation {
+                    id,
+                    command,
+                    state: previous,
+                });
+            }
+        };
+
+        let mut candidate = current.clone();
+
+        candidate
+            .transition_to(next, OffsetDateTime::now_utc())
+            .map_err(|_| DownloadManagerError::InvalidOperation {
+                id,
+                command,
+                state: previous,
+            })?;
+
+        let persisted = self.repository.save(&candidate).await?;
+
+        // The adpter may normalize the update timestam, but must preserve
+        // the rest of the submitted aggregate.
+        let mut expected = candidate.snapshot();
+        expected.updated_at = persisted.updated_at();
+
+        if persisted.snapshot() != expected {
+            return Err(invalid_repository_data(
+                "repository returned an inconsistent updated download",
+            )
+            .into());
+        }
+
+        self.jobs.insert(id, persisted);
+
+        tracing::info!(
+            previous = ?previous,
+            current = ?next,
+            "download state change committed"
+        );
+
+        Ok(DownloadEvent::StateChanged {
+            id,
+            previous,
+            current: next,
+        })
+    }
+
     /// Returns an immutable job snapshot owned by the manager.
     #[must_use]
     pub fn job(&self, id: DownloadId) -> Option<&DownloadJob> {
@@ -115,22 +221,47 @@ fn report_manager_error(operation: &'static str, error: &RepositoryError) {
     )
 }
 
+fn report_management_error(operation: &'static str, error: &DownloadManagerError) {
+    match error {
+        DownloadManagerError::NotFound { .. } => {
+            tracing::warn!(
+                operation,
+                error_kind = "NotFound",
+                "manager operation failed"
+            );
+        }
+        DownloadManagerError::InvalidOperation { command, state, .. } => {
+            tracing::warn!(
+                operation,
+                error_kind = "InvalidOperation",
+                command = ?command,
+                state = ?state,
+                "manager operation failed"
+            );
+        }
+        DownloadManagerError::Repository(error) => {
+            report_manager_error(operation, error);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     use time::OffsetDateTime;
     use url::Url;
 
     use super::DownloadManager;
     use crate::application::{
-        DownloadEvent, DownloadRepository, RepositoryError, RepositoryErrorKind,
+        DownloadEvent, DownloadManagerError, DownloadRepository, RepositoryError,
+        RepositoryErrorKind,
     };
     use crate::download::{
-        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, FileConflictPolicy,
-        NewDownload, RequestContext,
+        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
+        FileConflictPolicy, NewDownload, RequestContext,
     };
 
     struct FakeRepository {
@@ -138,6 +269,8 @@ mod tests {
         next_id: AtomicI64,
         fail_list: bool,
         fail_create: bool,
+        fail_save: bool,
+        save_calls: AtomicUsize,
     }
 
     impl FakeRepository {
@@ -149,6 +282,8 @@ mod tests {
                 next_id: AtomicI64::new(next_id),
                 fail_list: false,
                 fail_create: false,
+                fail_save: false,
+                save_calls: AtomicUsize::new(0),
             }
         }
 
@@ -158,6 +293,8 @@ mod tests {
                 next_id: AtomicI64::new(1),
                 fail_list: true,
                 fail_create: false,
+                fail_save: false,
+                save_calls: AtomicUsize::new(0),
             }
         }
 
@@ -167,6 +304,8 @@ mod tests {
                 next_id: AtomicI64::new(1),
                 fail_list: false,
                 fail_create: true,
+                fail_save: false,
+                save_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -222,6 +361,15 @@ mod tests {
         }
 
         async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
+            self.save_calls.fetch_add(1, Ordering::Relaxed);
+
+            if self.fail_save {
+                return Err(RepositoryError::new(
+                    RepositoryErrorKind::Unavailable,
+                    "repository is unavailable",
+                ));
+            }
+
             let mut jobs = self
                 .jobs
                 .lock()
@@ -365,5 +513,217 @@ mod tests {
         assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
         assert_eq!(manager.len(), 1);
         assert!(manager.job(original.id()) == Some(&original));
+    }
+
+    #[tokio::test]
+    async fn idle_operations_persist_before_returning_events() {
+        let original = job(1);
+        let id = original.id();
+
+        let repository = FakeRepository::with_jobs(vec![original]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let event = manager.pause(id).await.expect("pause must succeed");
+
+        assert!(
+            event
+                == DownloadEvent::StateChanged {
+                    id,
+                    previous: DownloadState::Queued,
+                    current: DownloadState::Paused
+                }
+        );
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("lookup must succeed")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Paused);
+        assert!(manager.job(id) == Some(&persisted));
+
+        let event = manager.resume(id).await.expect("resume must succeed");
+
+        assert!(
+            event
+                == DownloadEvent::StateChanged {
+                    id,
+                    previous: DownloadState::Paused,
+                    current: DownloadState::Queued,
+                }
+        );
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("lookup must succeed")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Queued);
+        assert!(manager.job(id) == Some(&persisted));
+
+        let event = manager.cancel(id).await.expect("cancel must succeed");
+
+        assert!(
+            event
+                == DownloadEvent::StateChanged {
+                    id,
+                    previous: DownloadState::Queued,
+                    current: DownloadState::Cancelled,
+                }
+        );
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("lookup must succeed")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Cancelled);
+        assert!(manager.job(id) == Some(&persisted));
+
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 3,);
+    }
+
+    #[tokio::test]
+    async fn failed_pause_preserves_memory_and_persisted_state() {
+        let original = job(1);
+        let id = original.id();
+
+        let mut repository = FakeRepository::with_jobs(vec![original.clone()]);
+        repository.fail_save = true;
+
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let result = manager.pause(id).await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadManagerError::Repository(ref error))
+                if error.kind() == RepositoryErrorKind::Unavailable
+        ));
+
+        assert!(manager.job(id) == Some(&original));
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("lookup must succeed")
+            .expect("job must exist");
+
+        assert!(persisted == original);
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1,);
+    }
+
+    #[tokio::test]
+    async fn invalid_operations_do_not_call_storage() {
+        let original = job(1);
+        let id = original.id();
+
+        let repository = FakeRepository::with_jobs(vec![original.clone()]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let result = manager.resume(id).await;
+
+        assert!(matches!(
+            result,
+            Err(DownloadManagerError::InvalidOperation {
+                state: DownloadState::Queued,
+                ..
+            })
+        ));
+
+        assert!(manager.job(id) == Some(&original));
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
+    }
+
+    #[tokio::test]
+    async fn missing_job_does_not_call_storage() {
+        let repository = FakeRepository::with_jobs(Vec::new());
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let id = DownloadId::new(404).expect("ID must be valid");
+
+        assert!(matches!(
+            manager.pause(id).await,
+            Err(DownloadManagerError::NotFound { id: missing })
+                if missing == id
+        ));
+
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
+    }
+
+    #[tokio::test]
+    async fn active_jobs_require_worker_coordination() {
+        let mut active = job(1);
+        let id = active.id();
+
+        active
+            .transition_to(DownloadState::Inspecting, OffsetDateTime::UNIX_EPOCH)
+            .expect("inspection transition must succeed");
+
+        active
+            .transition_to(DownloadState::Downloading, OffsetDateTime::UNIX_EPOCH)
+            .expect("download transition must succeed");
+
+        let repository = FakeRepository::with_jobs(vec![active.clone()]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        assert!(matches!(
+            manager.pause(id).await,
+            Err(DownloadManagerError::InvalidOperation { .. })
+        ));
+
+        assert!(matches!(
+            manager.cancel(id).await,
+            Err(DownloadManagerError::InvalidOperation { .. })
+        ));
+
+        assert!(manager.job(id) == Some(&active));
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
+    }
+
+    #[tokio::test]
+    async fn cancelled_job_cannot_return_to_the_queue() {
+        let original = job(1);
+        let id = original.id();
+
+        let repository = FakeRepository::with_jobs(vec![original]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        manager.pause(id).await.expect("pause must succeed");
+        manager.cancel(id).await.expect("cancel must succeed");
+
+        assert!(matches!(
+            manager.resume(id).await,
+            Err(DownloadManagerError::InvalidOperation {
+                state: DownloadState::Cancelled,
+                ..
+            })
+        ));
+
+        assert_eq!(
+            manager.job(id).expect("job must exist").state(),
+            DownloadState::Cancelled,
+        );
+
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 2,);
     }
 }
