@@ -82,8 +82,8 @@ where
 
     /// Pauses a queued job before execution begins.
     ///
-    /// Passing active execution requires worker coordination and is not
-    /// supported by this operation ye.
+    /// Pausing active execution requires worker coordination and is not
+    /// supported by this operation yet.
     #[tracing::instrument(name = "manager.pause", skip_all, fields(download_id = id.value()))]
     pub async fn pause(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Pause)
@@ -95,7 +95,7 @@ where
 
     /// Returns a paused job to the queue.
     ///
-    /// This changes sheduling eligibility; it does not start a transfer.
+    /// This changes scheduling eligibility; it does not start a transfer.
     #[tracing::instrument(name = "manager.resume", skip_all, fields(download_id = id.value()))]
     pub async fn resume(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Resume)
@@ -106,6 +106,9 @@ where
     }
 
     /// Cancels a queued or paused job deleting its files or history.
+    /// 
+    /// Cancelling active execution requires worker coordination and is not
+    /// supported by this operation yet.
     #[tracing::instrument(name = "manager.cancel", skip_all, fields(download_id = id.value()))]
     pub async fn cancel(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Cancel)
