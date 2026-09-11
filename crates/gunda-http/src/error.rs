@@ -16,27 +16,15 @@ pub enum HttpError {
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Configuration => {
-                f.write_str("could not configure the HTTP client")
-            }
-            Self::InvalidRequest => {
-                f.write_str("HTTP request context is invalid or unsupported")
-            }
-            Self::Timeout => {
-                f.write_str("HTTP request timed out")
-            }
-            Self::Transport => {
-                f.write_str("HTTP transport failed")
-            }
+            Self::Configuration => f.write_str("could not configure the HTTP client"),
+            Self::InvalidRequest => f.write_str("HTTP request context is invalid or unsupported"),
+            Self::Timeout => f.write_str("HTTP request timed out"),
+            Self::Transport => f.write_str("HTTP transport failed"),
             Self::UnexpectedStatus(status) => {
                 write!(f, "unexpected HTTP response status: {status}")
             }
-            Self::InvalidMetadata => {
-                f.write_str("HTTP response metadata is invalid")
-            }
-            Self::UnsupportedEncoding => {
-                f.write_str("HTTP content encoding is not supported")
-            }
+            Self::InvalidMetadata => f.write_str("HTTP response metadata is invalid"),
+            Self::UnsupportedEncoding => f.write_str("HTTP content encoding is not supported"),
         }
     }
 }
@@ -44,7 +32,7 @@ impl fmt::Display for HttpError {
 impl Error for HttpError {}
 
 // TODO: improve error classification without exposing request context
-pub (crate) fn map_request_error(error: reqwest::Error) -> HttpError {
+pub(crate) fn map_request_error(error: reqwest::Error) -> HttpError {
     if error.is_timeout() {
         HttpError::Timeout
     } else {
