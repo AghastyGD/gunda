@@ -1,0 +1,15 @@
+[package]
+name = "gunda-http"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gunda-core = { path = "../gunda-core" }
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+url.workspace = true
