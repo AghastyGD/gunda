@@ -90,7 +90,7 @@ impl HttpBody {
             let Some(received_bytes) = self.received_bytes.checked_add(size) else {
                 return Err(self.stop_with_error(HttpError::ByteCountOverflow));
             };
-            
+
             if let Some(expected) = self.metadata.content_length()
                 && received_bytes > expected
             {
