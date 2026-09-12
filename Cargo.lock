@@ -522,6 +522,7 @@ dependencies = [
 name = "gunda-http"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "gunda-core",
  "reqwest",
  "tokio",

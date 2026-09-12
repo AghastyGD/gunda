@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 gunda-core = { path = "../gunda-core" }
 reqwest.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "io-util", "time"] }

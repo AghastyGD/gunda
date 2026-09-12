@@ -7,11 +7,12 @@ use reqwest::header::{
 };
 use reqwest::{Client, StatusCode};
 
+use crate::body::HttpBody;
 use crate::error::{HttpError, map_request_error};
 
-/// Metadata reported by a successful HEAD response.
+/// Metadata reported by a successful HTTP response.
 ///
-/// These values are advisory. A subsquent GET must validate its own response.
+/// HEAD metadata is advisory. A subsequent GET validates its own response.
 /// This type intentionally does not implement Debug.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpInspection {
@@ -73,37 +74,67 @@ impl HttpClient {
             .await
             .map_err(map_request_error)?;
 
-        if response.status() != StatusCode::OK {
-            return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
-        }
-
-        let headers = response.headers();
-
-        if let Some(encoding) = single_header(headers, CONTENT_ENCODING)?
-            && !encoding.trim().eq_ignore_ascii_case("identity")
-        {
-            return Err(HttpError::UnsupportedEncoding);
-        }
-
-        let content_length = single_header(headers, CONTENT_LENGTH)?
-            .map(|value| {
-                let value = value.trim();
-
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(HttpError::InvalidMetadata);
-                }
-
-                value.parse::<u64>().map_err(|_| HttpError::InvalidMetadata)
-            })
-            .transpose()?;
-
-        let content_type = single_header(headers, CONTENT_TYPE)?.map(str::to_owned);
-
-        Ok(HttpInspection {
-            content_length,
-            content_type,
-        })
+        inspect_response(&response)
     }
+
+    /// Opens a full-resource GET and validates its response metadata.
+    ///
+    /// The body is consumed incrementally through HttpBody.
+    /// A previous HEAD request is not required.
+    pub async fn open(&self, request: &RequestContext) -> Result<HttpBody, HttpError> {
+        validate_url(request)?;
+        let headers = request_headers(request)?;
+
+        let response = self
+            .client
+            .get(request.url().clone())
+            .headers(headers)
+            .send()
+            .await
+            .map_err(map_request_error)?;
+
+        let metadata = inspect_response(&response)?;
+
+        Ok(HttpBody::new(response, metadata))
+    }
+}
+
+fn inspect_response(response: &reqwest::Response) -> Result<HttpInspection, HttpError> {
+    if response.status() != StatusCode::OK {
+        return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
+    }
+
+    let headers = response.headers();
+
+    // Partial responses are not supported by this full-resource request path.
+    if headers.contains_key(reqwest::header::CONTENT_RANGE) {
+        return Err(HttpError::InvalidMetadata);
+    }
+
+    if let Some(encoding) = single_header(headers, CONTENT_ENCODING)?
+        && !encoding.trim().eq_ignore_ascii_case("identity")
+    {
+        return Err(HttpError::UnsupportedEncoding);
+    }
+
+    let content_length = single_header(headers, CONTENT_LENGTH)?
+        .map(|value| {
+            let value = value.trim();
+
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(HttpError::InvalidMetadata);
+            }
+
+            value.parse::<u64>().map_err(|_| HttpError::InvalidMetadata)
+        })
+        .transpose()?;
+
+    let content_type = single_header(headers, CONTENT_TYPE)?.map(str::to_owned);
+
+    Ok(HttpInspection {
+        content_length,
+        content_type,
+    })
 }
 
 fn validate_url(request: &RequestContext) -> Result<(), HttpError> {

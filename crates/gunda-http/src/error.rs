@@ -11,6 +11,8 @@ pub enum HttpError {
     UnexpectedStatus(u16),
     InvalidMetadata,
     UnsupportedEncoding,
+    BodyLengthMismatch,
+    ByteCountOverflow,
 }
 
 impl fmt::Display for HttpError {
@@ -25,6 +27,12 @@ impl fmt::Display for HttpError {
             }
             Self::InvalidMetadata => f.write_str("HTTP response metadata is invalid"),
             Self::UnsupportedEncoding => f.write_str("HTTP content encoding is not supported"),
+            Self::BodyLengthMismatch => {
+                f.write_str("HTTP body length does not match response metadata")
+            }
+            Self::ByteCountOverflow => {
+                f.write_str("HTTP body byte count exceeds the supported range")
+            }
         }
     }
 }
