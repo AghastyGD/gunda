@@ -58,12 +58,17 @@ impl From<HttpError> for PartialDownloadError {
 /// This is not a finalized destination or a completed download job.
 /// It intentionally does not implement Debug.
 pub struct PartialDownload {
+    id: DownloadId,
     path: PathBuf,
     written_bytes: u64,
     metadata: HttpInspection,
 }
 
 impl PartialDownload {
+    #[must_use]
+    pub fn id(&self) -> DownloadId {
+        self.id
+    }
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -143,6 +148,7 @@ pub async fn download_to_partial(
     drop(file);
 
     Ok(PartialDownload {
+        id,
         path,
         written_bytes,
         metadata,
