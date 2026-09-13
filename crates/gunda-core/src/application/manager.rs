@@ -105,7 +105,7 @@ where
             })
     }
 
-    /// Cancels a queued or paused job deleting its files or history.
+    /// Cancels a queued or paused job without deleting its files or history.
     ///
     /// Cancelling active execution requires worker coordination and is not
     /// supported by this operation yet.
