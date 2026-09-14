@@ -7,7 +7,6 @@ use crate::{HttpError, HttpInspection};
 /// Incremental HTTP response body.
 ///
 /// Received bytes are transport observations, not durable file checkpoints.
-/// This type intentionally does not implement debug.
 pub struct HttpBody {
     response: Option<Response>,
     metadata: HttpInspection,

@@ -5,20 +5,14 @@ use crate::download::{
     ResourceDescriptor,
 };
 
-/// Owned input for one execution attempt.
-///
-/// Lifecycle state and persistence remain application concerns.
-/// This type intentionally does not implement Debug.
+/// Input for a single execution attempt
 pub struct ExecutionInput {
     pub id: DownloadId,
     pub request: RequestContext,
     pub destination: DownloadDestination,
 }
 
-/// Opens a resource and prepares its transfer.
-///
-/// This initial contract does not define protocol discovery, resume,
-/// active cancellation, or intermediate progress reporting.
+/// Opens a resource and prepares it for transfer.
 pub trait DownloadExecutor: Send + Sync {
     type Prepared: PreparedTransfer;
 
@@ -49,8 +43,6 @@ pub trait StagedTransfer: Send + Sized {
 }
 
 /// Successful filesystem publication, not a persisted Completed job.
-///
-/// This type intentionally does not implement Debug.
 pub struct ExecutionOutput {
     pub destination: ResolvedDestination,
     pub written_bytes: u64,
