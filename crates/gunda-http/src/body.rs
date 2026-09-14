@@ -43,6 +43,14 @@ impl HttpBody {
         self.response.is_none() && self.failure.is_none()
     }
 
+    /// Reports whether this body can start a complete transfer.
+    ///
+    /// Failed, exhausted, or partially consumed bodies cannot be reused.
+    #[must_use]
+    pub(crate) fn is_unconsumed(&self) -> bool {
+        self.response.is_some() && self.failure.is_none() && self.received_bytes == 0
+    }
+
     /// Reads the next non-empty body block.
     ///
     /// None means a successful end of body. After a failure, subsquent calls
