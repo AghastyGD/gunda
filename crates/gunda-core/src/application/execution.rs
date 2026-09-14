@@ -5,6 +5,8 @@ use crate::download::{
     ResourceDescriptor,
 };
 
+use super::DownloadEvent;
+
 /// Input for a single execution attempt
 pub struct ExecutionInput {
     pub id: DownloadId,
@@ -46,5 +48,11 @@ pub trait StagedTransfer: Send + Sized {
 pub struct ExecutionOutput {
     pub destination: ResolvedDestination,
     pub written_bytes: u64,
+    pub cleanup_pending: bool,
+}
+
+/// Terminal result of an execution coordinated by the manager
+pub struct ExecutionReport {
+    pub event: DownloadEvent,
     pub cleanup_pending: bool,
 }
