@@ -11,9 +11,6 @@ use crate::body::HttpBody;
 use crate::error::{HttpError, map_request_error};
 
 /// Metadata reported by a successful HTTP response.
-///
-/// HEAD metadata is advisory. A subsequent GET validates its own response.
-/// This type intentionally does not implement Debug.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpInspection {
     content_length: Option<u64>,

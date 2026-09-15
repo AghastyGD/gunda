@@ -524,6 +524,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "gunda-core",
+ "percent-encoding",
  "reqwest",
  "tempfile",
  "tokio",
@@ -535,6 +536,7 @@ name = "gunda-storage"
 version = "0.1.0"
 dependencies = [
  "gunda-core",
+ "gunda-http",
  "sqlx",
  "tempfile",
  "time",

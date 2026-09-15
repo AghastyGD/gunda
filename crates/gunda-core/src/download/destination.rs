@@ -46,7 +46,7 @@ impl DownloadDestination {
     }
 }
 
-/// Final destination selected after inspection and conflict resolution.
+///  Concrete output path selected for a download.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDestination {
     final_path: PathBuf,

@@ -7,7 +7,6 @@ use crate::{HttpError, HttpInspection};
 /// Incremental HTTP response body.
 ///
 /// Received bytes are transport observations, not durable file checkpoints.
-/// This type intentionally does not implement debug.
 pub struct HttpBody {
     response: Option<Response>,
     metadata: HttpInspection,
@@ -41,6 +40,14 @@ impl HttpBody {
     #[must_use]
     pub fn is_finished(&self) -> bool {
         self.response.is_none() && self.failure.is_none()
+    }
+
+    /// Reports whether this body can start a complete transfer.
+    ///
+    /// Failed, exhausted, or partially consumed bodies cannot be reused.
+    #[must_use]
+    pub(crate) fn is_unconsumed(&self) -> bool {
+        self.response.is_some() && self.failure.is_none() && self.received_bytes == 0
     }
 
     /// Reads the next non-empty body block.

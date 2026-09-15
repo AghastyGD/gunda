@@ -7,7 +7,7 @@ use gunda_core::download::{DownloadId, RequestContext};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
-use crate::{HttpClient, HttpError, HttpInspection};
+use crate::{HttpBody, HttpClient, HttpError, HttpInspection};
 
 /// File operation that failed withour exposing the affected path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,7 @@ pub enum PartialDownloadError {
     },
 
     ByteCountOverflow,
+    InvalidBodyState,
 }
 
 impl fmt::Display for PartialDownloadError {
@@ -40,6 +41,9 @@ impl fmt::Display for PartialDownloadError {
             }
             Self::ByteCountOverflow => {
                 f.write_str("partial file byte count exceeds the supported range")
+            }
+            Self::InvalidBodyState => {
+                f.write_str("HTTP body is no longer available for a complete transfer")
             }
         }
     }
@@ -107,7 +111,23 @@ pub async fn download_to_partial(
     id: DownloadId,
     directory: &Path,
 ) -> Result<PartialDownload, PartialDownloadError> {
-    let mut body = client.open(request).await?; // TODO: should we check/create the partial before opening the GET?
+    let body = client.open(request).await?; // TODO: should we reserve the partial file before opening the GET?
+
+    write_body_to_partial(body, id, directory).await
+}
+
+/// Writes an already opened body into an exclusively created partial file.
+///
+/// The body must not have been consumed or failed.
+/// Existing files are never overwritten.
+pub(crate) async fn write_body_to_partial(
+    mut body: HttpBody,
+    id: DownloadId,
+    directory: &Path,
+) -> Result<PartialDownload, PartialDownloadError> {
+    if !body.is_unconsumed() {
+        return Err(PartialDownloadError::InvalidBodyState);
+    }
     let metadata = body.metadata().clone();
     let path = partial_path(directory, id);
 
