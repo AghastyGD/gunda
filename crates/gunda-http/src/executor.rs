@@ -4,9 +4,11 @@ use gunda_core::application::{
     DownloadExecutor, ExecutionInput, ExecutionOutput, PreparedTransfer, StagedTransfer,
 };
 use gunda_core::download::{
-    DownloadDestination, DownloadFailure, DownloadId, FailureKind, ResourceDescriptor, ResourceKind,
+    DownloadDestination, DownloadFailure, DownloadId, FailureKind, ResolvedDestination,
+    ResourceDescriptor, ResourceKind,
 };
 
+use crate::destination::plan_destination;
 use crate::partial::write_body_to_partial;
 use crate::{
     FinalizeError, HttpBody, HttpClient, HttpError, PartialDownload, PartialDownloadError,
@@ -30,6 +32,7 @@ pub struct HttpPreparedTransfer {
     body: HttpBody,
     id: DownloadId,
     destination: DownloadDestination,
+    planned_destination: ResolvedDestination,
 }
 
 /// A complete partial file awaiting publication.
@@ -48,12 +51,16 @@ impl DownloadExecutor for HttpExecutor {
             destination,
         } = input;
 
+        let (destination, planned_destination) =
+            plan_destination(id, request.url(), &destination).map_err(finalization_failure)?;
+
         let body = self.client.open(&request).await.map_err(http_failure)?;
 
         Ok(HttpPreparedTransfer {
             body,
             id,
             destination,
+            planned_destination,
         })
     }
 }
@@ -73,11 +80,16 @@ impl PreparedTransfer for HttpPreparedTransfer {
         self.body.metadata().content_length()
     }
 
+    fn planned_destination(&self) -> ResolvedDestination {
+        self.planned_destination.clone()
+    }
+
     async fn transfer(self) -> Result<Self::Staged, DownloadFailure> {
         let Self {
             body,
             id,
             destination,
+            ..
         } = self;
 
         let partial = write_body_to_partial(body, id, destination.directory())

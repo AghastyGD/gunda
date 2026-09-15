@@ -165,3 +165,73 @@ async fn finalization_conflict_preserves_both_files() {
 
     server.await.expect("server task must succeed");
 }
+
+#[tokio::test]
+async fn rename_handles_a_conflict_created_after_preparation() {
+    let directory = tempdir().expect("temporary directory must exist");
+
+    let (url, server) = serve_once(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: 5\r\n\
+         Connection: close\r\n\
+         \r\n\
+         hello",
+    )
+    .await;
+
+    let executor = HttpExecutor::new(HttpClient::new().expect("client must build"));
+
+    let mut execution = input(url, directory.path());
+    execution.destination = DownloadDestination::new(
+        directory.path().to_path_buf(),
+        None,
+        FileConflictPolicy::Rename,
+    );
+
+    let prepared = executor
+        .prepare(execution)
+        .await
+        .expect("preparation must succeed");
+
+    let planned = prepared.planned_destination();
+
+    assert_eq!(
+        planned.final_path(),
+        directory.path().join("file.bin").as_path(),
+    );
+    assert!(!planned.final_path().exists());
+
+    tokio::fs::write(planned.final_path(), b"existing")
+        .await
+        .expect("competing output must be created");
+
+    let staged = prepared.transfer().await.expect("transfer must succeed");
+
+    let output = staged
+        .finalize()
+        .await
+        .expect("rename must resolve the conflict");
+
+    assert_eq!(
+        output.destination.final_path(),
+        directory.path().join("file (1).bin").as_path(),
+    );
+
+    assert_eq!(
+        tokio::fs::read(planned.final_path())
+            .await
+            .expect("existing output must remain readable"),
+        b"existing",
+    );
+
+    assert_eq!(
+        tokio::fs::read(output.destination.final_path())
+            .await
+            .expect("published output must be readable"),
+        b"hello",
+    );
+
+    assert!(!partial_path(directory.path(), test_id()).exists());
+
+    server.await.expect("server task must succeed");
+}

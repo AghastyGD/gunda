@@ -210,7 +210,7 @@ fn file_error(error: io::Error) -> FinalizeError {
     FinalizeError::File(error.kind())
 }
 
-fn validate_filename(filename: &str) -> Result<(), FinalizeError> {
+pub(crate) fn validate_filename(filename: &str) -> Result<(), FinalizeError> {
     // Conservative application limit, leaving room for rename suffixes.
     if filename.is_empty()
         || filename.len() > 200

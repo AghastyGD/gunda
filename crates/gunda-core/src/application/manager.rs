@@ -179,8 +179,11 @@ where
         let initial_progress = DownloadProgress::new(0, total_bytes)
             .map_err(|_| invalid_repository_data("execution progress is invalid"))?;
 
-        job.set_resource(prepared.resource(), OffsetDateTime::now_utc());
-        job.update_progress(initial_progress, OffsetDateTime::now_utc());
+        let inspected_at = OffsetDateTime::now_utc();
+
+        job.set_resource(prepared.resource(), inspected_at);
+        job.update_progress(initial_progress, inspected_at);
+        job.resolve_destination(prepared.planned_destination(), inspected_at);
 
         execution_transition(&mut job, DownloadState::Downloading)?;
         job = self.commit_job(job).await?;
@@ -973,6 +976,10 @@ mod tests {
 
         fn total_bytes(&self) -> Option<u64> {
             Some(5)
+        }
+
+        fn planned_destination(&self) -> ResolvedDestination {
+            ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
         }
 
         async fn transfer(self) -> Result<Self::Staged, DownloadFailure> {

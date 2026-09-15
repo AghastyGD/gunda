@@ -524,6 +524,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "gunda-core",
+ "percent-encoding",
  "reqwest",
  "tempfile",
  "tokio",

@@ -124,6 +124,8 @@ async fn run_persistent_execution(reject_completed: bool) {
         .await
         .expect("repository must open");
 
+    require_planned_destination(&database_path).await;
+
     if reject_completed {
         reject_completion(&database_path).await;
     }
@@ -219,15 +221,13 @@ async fn run_persistent_execution(reject_completed: bool) {
         Some("application/octet-stream"),
     );
 
-    if !reject_completed {
-        assert_eq!(
-            expected
-                .resolved_destination()
-                .expect("final destination must exist")
-                .final_path(),
-            final_path.as_path(),
-        );
-    }
+    assert_eq!(
+        expected
+            .resolved_destination()
+            .expect("selected destination must exist")
+            .final_path(),
+        final_path.as_path(),
+    );
 
     manager.into_repository().close().await;
 
@@ -249,6 +249,36 @@ async fn run_persistent_execution(reject_completed: bool) {
     );
 
     manager.into_repository().close().await;
+}
+
+async fn require_planned_destination(database_path: &Path) {
+    let options = SqliteConnectOptions::new()
+        .filename(database_path)
+        .disable_statement_logging();
+
+    let mut connection = SqliteConnection::connect_with(&options)
+        .await
+        .expect("test connection must open");
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER require_planned_destination
+        BEFORE UPDATE ON downloads
+        WHEN NEW.state = 'downloading'
+             AND NEW.resolved_destination_path IS NULL
+        BEGIN
+            SELECT RAISE(ABORT, 'planned destination is required');
+        END
+        "#,
+    )
+    .execute(&mut connection)
+    .await
+    .expect("destination assertion trigger must be created");
+
+    connection
+        .close()
+        .await
+        .expect("test connection must close");
 }
 
 #[tokio::test]

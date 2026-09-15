@@ -32,6 +32,9 @@ pub trait PreparedTransfer: Send + Sized {
 
     fn total_bytes(&self) -> Option<u64>;
 
+    /// Returns the output path planned for this executino.
+    fn planned_destination(&self) -> ResolvedDestination;
+
     /// Consumes the prepared resource and writes its staging output.
     fn transfer(self) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send;
 }
