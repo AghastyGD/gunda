@@ -1,10 +1,14 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
+
+use tokio::time::{Instant, MissedTickBehavior};
 
 use time::OffsetDateTime;
 
 use super::{
     DownloadEvent, DownloadExecutor, DownloadManagerError, DownloadRepository, ExecutionInput,
     ExecutionReport, PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer,
+    TransferProgress,
 };
 
 use crate::{
@@ -123,7 +127,6 @@ where
     }
 
     /// Executes a qued download and persists each phase.
-    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
     pub async fn execute<E>(
         &mut self,
         id: DownloadId,
@@ -132,18 +135,37 @@ where
     where
         E: DownloadExecutor,
     {
-        self.execute_inner(id, executor).await.inspect_err(|error| {
-            report_management_error("manager.execute", error);
-        })
+        self.execute_with_progress(id, executor, |_| {}).await
     }
 
-    async fn execute_inner<E>(
+    /// Calls the observer after persisting changed progress; it must not block.
+    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
+    pub async fn execute_with_progress<E, F>(
         &mut self,
         id: DownloadId,
         executor: &E,
+        mut on_progress: F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
         E: DownloadExecutor,
+        F: FnMut(DownloadEvent) + Send,
+    {
+        self.execute_inner(id, executor, &mut on_progress)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.execute", error);
+            })
+    }
+
+    async fn execute_inner<E, F>(
+        &mut self,
+        id: DownloadId,
+        executor: &E,
+        on_progress: &mut F,
+    ) -> Result<ExecutionReport, DownloadManagerError>
+    where
+        E: DownloadExecutor,
+        F: FnMut(DownloadEvent) + Send,
     {
         let mut job = self
             .jobs
@@ -188,17 +210,58 @@ where
         execution_transition(&mut job, DownloadState::Downloading)?;
         job = self.commit_job(job).await?;
 
-        let staged = match prepared.transfer().await {
+        let (progress_sender, progress_receiver) = TransferProgress::channel();
+
+        let transfer = prepared.transfer_with_progress(progress_sender);
+        tokio::pin!(transfer);
+
+        let checkpoint_period = Duration::from_secs(1);
+        let mut checkpoints =
+            tokio::time::interval_at(Instant::now() + checkpoint_period, checkpoint_period);
+        checkpoints.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        let transfer_result = loop {
+            tokio::select! {
+                biased;
+
+                result = &mut transfer => break result,
+
+                _ = checkpoints.tick() => {
+                    let written_bytes = *progress_receiver.borrow();
+
+                    self.checkpoint_progress(
+                        &mut job,
+                        written_bytes,
+                        on_progress,
+                    )
+                    .await?;
+                }
+            }
+        };
+
+        let reported_bytes = *progress_receiver.borrow();
+        validated_execution_progress(&job, reported_bytes)?;
+
+        let staged = match transfer_result {
             Ok(staged) => staged,
             Err(failure) => {
+                self.checkpoint_progress(&mut job, reported_bytes, on_progress)
+                    .await?;
+
                 return self.record_execution_failure(id, failure).await;
             }
         };
 
         let written_bytes = staged.written_bytes();
 
-        let progress = DownloadProgress::new(written_bytes, total_bytes)
-            .map_err(|_| invalid_repository_data("executor returned invalid progress"))?;
+        if written_bytes < reported_bytes {
+            return Err(invalid_repository_data(
+                "executor returned fewer bytes than previously reported",
+            )
+            .into());
+        }
+
+        let progress = validated_execution_progress(&job, written_bytes)?;
 
         if let Some(total) = total_bytes
             && written_bytes != total
@@ -208,10 +271,19 @@ where
             );
         }
 
+        let progress_changed = progress != job.progress();
+
         job.update_progress(progress, OffsetDateTime::now_utc());
 
         execution_transition(&mut job, DownloadState::Finalizing)?;
         job = self.commit_job(job).await?;
+
+        if progress_changed {
+            on_progress(DownloadEvent::ProgressChanged {
+                id,
+                progress: job.progress(),
+            });
+        }
 
         let output = match staged.finalize().await {
             Ok(output) => output,
@@ -354,6 +426,34 @@ where
         Ok(persisted)
     }
 
+    async fn checkpoint_progress<F>(
+        &mut self,
+        job: &mut DownloadJob,
+        written_bytes: u64,
+        on_progress: &mut F,
+    ) -> Result<(), RepositoryError>
+    where
+        F: FnMut(DownloadEvent) + Send,
+    {
+        let progress = validated_execution_progress(job, written_bytes)?;
+
+        if progress == job.progress() {
+            return Ok(());
+        }
+
+        let mut candidate = job.clone();
+        candidate.update_progress(progress, OffsetDateTime::now_utc());
+
+        *job = self.commit_job(candidate).await?;
+
+        on_progress(DownloadEvent::ProgressChanged {
+            id: job.id(),
+            progress: job.progress(),
+        });
+
+        Ok(())
+    }
+
     /// Returns an immutable job snapshot owned by the manager.
     #[must_use]
     pub fn job(&self, id: DownloadId) -> Option<&DownloadJob> {
@@ -440,6 +540,17 @@ fn report_management_error(operation: &'static str, error: &DownloadManagerError
     }
 }
 
+fn validated_execution_progress(
+    job: &DownloadJob,
+    written_bytes: u64,
+) -> Result<DownloadProgress, RepositoryError> {
+    if written_bytes < job.progress().downloaded_bytes() {
+        return Err(invalid_repository_data("executor progress moved backwards"));
+    }
+
+    DownloadProgress::new(written_bytes, job.progress().total_bytes())
+        .map_err(|_| invalid_repository_data("executor returned invalid progress"))
+}
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -453,6 +564,7 @@ mod tests {
     use crate::application::{
         DownloadEvent, DownloadExecutor, DownloadManagerError, DownloadRepository, ExecutionInput,
         ExecutionOutput, PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer,
+        TransferProgress,
     };
     use crate::download::{
         DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin,
@@ -468,6 +580,7 @@ mod tests {
         fail_save: bool,
         save_calls: Arc<AtomicUsize>,
         fail_save_at: Option<DownloadState>,
+        fail_progress_save: bool,
     }
 
     impl FakeRepository {
@@ -482,6 +595,7 @@ mod tests {
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
+                fail_progress_save: false,
             }
         }
 
@@ -494,6 +608,7 @@ mod tests {
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
+                fail_progress_save: false,
             }
         }
 
@@ -506,6 +621,7 @@ mod tests {
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
+                fail_progress_save: false,
             }
         }
     }
@@ -563,7 +679,12 @@ mod tests {
         async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
             self.save_calls.fetch_add(1, Ordering::Relaxed);
 
-            if self.fail_save || self.fail_save_at == Some(job.state()) {
+            if self.fail_save
+                || self.fail_save_at == Some(job.state())
+                || (self.fail_progress_save
+                    && job.state() == DownloadState::Downloading
+                    && job.progress().downloaded_bytes() > 0)
+            {
                 return Err(RepositoryError::new(
                     RepositoryErrorKind::Unavailable,
                     "repository is unavailable",
@@ -982,7 +1103,10 @@ mod tests {
             ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
         }
 
-        async fn transfer(self) -> Result<Self::Staged, DownloadFailure> {
+        async fn transfer_with_progress(
+            self,
+            _progress: TransferProgress,
+        ) -> Result<Self::Staged, DownloadFailure> {
             self.enter("transfer", 2)?;
             Ok(self)
         }
@@ -1219,6 +1343,169 @@ mod tests {
                 .lock()
                 .expect("probe lock must not be poisoned")
                 .is_empty()
+        );
+    }
+
+    #[derive(Clone)]
+    struct ProgressProbe {
+        finalizations: Arc<AtomicUsize>,
+    }
+
+    impl DownloadExecutor for ProgressProbe {
+        type Prepared = Self;
+
+        async fn prepare(&self, _input: ExecutionInput) -> Result<Self::Prepared, DownloadFailure> {
+            Ok(self.clone())
+        }
+    }
+
+    impl PreparedTransfer for ProgressProbe {
+        type Staged = Self;
+
+        fn resource(&self) -> ResourceDescriptor {
+            ResourceDescriptor::new(ResourceKind::File, None, None)
+        }
+
+        fn total_bytes(&self) -> Option<u64> {
+            Some(5)
+        }
+
+        fn planned_destination(&self) -> ResolvedDestination {
+            ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
+        }
+
+        async fn transfer_with_progress(
+            self,
+            progress: TransferProgress,
+        ) -> Result<Self::Staged, DownloadFailure> {
+            progress.report_written(2);
+
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+            progress.report_written(5);
+
+            Ok(self)
+        }
+    }
+
+    impl StagedTransfer for ProgressProbe {
+        fn written_bytes(&self) -> u64 {
+            5
+        }
+
+        async fn finalize(self) -> Result<ExecutionOutput, DownloadFailure> {
+            self.finalizations.fetch_add(1, Ordering::Relaxed);
+
+            Ok(ExecutionOutput {
+                destination: ResolvedDestination::new(
+                    PathBuf::from("downloads").join("result.bin"),
+                ),
+                written_bytes: 5,
+                cleanup_pending: false,
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_notifications_follow_successful_checkpoints() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+
+        let saves = Arc::clone(&manager.repository.save_calls);
+        let finalizations = Arc::new(AtomicUsize::new(0));
+
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+        };
+
+        let mut observed = Vec::new();
+
+        let report = manager
+            .execute_with_progress(id, &executor, |event| {
+                let DownloadEvent::ProgressChanged {
+                    id: event_id,
+                    progress,
+                } = event
+                else {
+                    panic!("observer must receive progress");
+                };
+
+                assert_eq!(event_id, id);
+
+                observed.push((progress.downloaded_bytes(), saves.load(Ordering::Relaxed)));
+            })
+            .await
+            .expect("execution must succeed");
+
+        assert_eq!(observed, vec![(2, 3), (5, 4)]);
+        assert_eq!(saves.load(Ordering::Relaxed), 5);
+        assert_eq!(finalizations.load(Ordering::Relaxed), 1);
+
+        assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Completed);
+        assert_eq!(persisted.progress().downloaded_bytes(), 5);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn checkpoint_failure_emits_no_progress_and_prevents_publication() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+        manager.repository.fail_progress_save = true;
+
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+        };
+
+        let mut notifications = 0;
+
+        let result = manager
+            .execute_with_progress(id, &executor, |_| {
+                notifications += 1;
+            })
+            .await;
+
+        assert!(matches!(result, Err(DownloadManagerError::Repository(_)),));
+
+        assert_eq!(notifications, 0);
+        assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Downloading);
+        assert_eq!(persisted.progress().downloaded_bytes(), 0);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[test]
+    fn execution_progress_rejects_regression_and_bytes_above_total() {
+        let mut current = job(1);
+
+        current.update_progress(
+            crate::download::DownloadProgress::new(3, Some(5)).expect("progress must be valid"),
+            OffsetDateTime::now_utc(),
+        );
+
+        assert!(super::validated_execution_progress(&current, 2).is_err());
+        assert!(super::validated_execution_progress(&current, 6).is_err());
+
+        assert_eq!(
+            super::validated_execution_progress(&current, 4)
+                .expect("progress must be valid")
+                .downloaded_bytes(),
+            4,
         );
     }
 }

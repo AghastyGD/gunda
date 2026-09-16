@@ -3,6 +3,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use gunda_core::application::TransferProgress;
 use gunda_core::download::{DownloadId, RequestContext};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -113,7 +114,7 @@ pub async fn download_to_partial(
 ) -> Result<PartialDownload, PartialDownloadError> {
     let body = client.open(request).await?; // TODO: should we reserve the partial file before opening the GET?
 
-    write_body_to_partial(body, id, directory).await
+    write_body_to_partial(body, id, directory, TransferProgress::disabled()).await
 }
 
 /// Writes an already opened body into an exclusively created partial file.
@@ -124,6 +125,7 @@ pub(crate) async fn write_body_to_partial(
     mut body: HttpBody,
     id: DownloadId,
     directory: &Path,
+    progress: TransferProgress,
 ) -> Result<PartialDownload, PartialDownloadError> {
     if !body.is_unconsumed() {
         return Err(PartialDownloadError::InvalidBodyState);
@@ -159,6 +161,7 @@ pub(crate) async fn write_body_to_partial(
             .map_err(|error| file_error(FileOperation::Flush, error))?;
 
         written_bytes = next_written_bytes;
+        progress.report_written(written_bytes);
     }
 
     file.sync_all()

@@ -5,8 +5,7 @@ use crate::download::{
     ResourceDescriptor,
 };
 
-use super::DownloadEvent;
-
+use super::{DownloadEvent, TransferProgress};
 /// Input for a single execution attempt
 pub struct ExecutionInput {
     pub id: DownloadId,
@@ -35,8 +34,16 @@ pub trait PreparedTransfer: Send + Sized {
     /// Returns the output path planned for this executino.
     fn planned_destination(&self) -> ResolvedDestination;
 
-    /// Consumes the prepared resource and writes its staging output.
-    fn transfer(self) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send;
+    /// Writes staging output without progress observation.
+    fn transfer(self) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send {
+        self.transfer_with_progress(TransferProgress::disabled())
+    }
+
+    /// Writes staging output and reports cumulative written bytes.
+    fn transfer_with_progress(
+        self,
+        progress: TransferProgress,
+    ) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send;
 }
 
 /// Fully transferred stagin output that has not been published
