@@ -2,6 +2,7 @@ use std::io;
 
 use gunda_core::application::{
     DownloadExecutor, ExecutionInput, ExecutionOutput, PreparedTransfer, StagedTransfer,
+    TransferProgress,
 };
 use gunda_core::download::{
     DownloadDestination, DownloadFailure, DownloadId, FailureKind, ResolvedDestination,
@@ -84,7 +85,10 @@ impl PreparedTransfer for HttpPreparedTransfer {
         self.planned_destination.clone()
     }
 
-    async fn transfer(self) -> Result<Self::Staged, DownloadFailure> {
+    async fn transfer_with_progress(
+        self,
+        progress: TransferProgress,
+    ) -> Result<Self::Staged, DownloadFailure> {
         let Self {
             body,
             id,
@@ -92,7 +96,7 @@ impl PreparedTransfer for HttpPreparedTransfer {
             ..
         } = self;
 
-        let partial = write_body_to_partial(body, id, destination.directory())
+        let partial = write_body_to_partial(body, id, destination.directory(), progress)
             .await
             .map_err(partial_failure)?;
 

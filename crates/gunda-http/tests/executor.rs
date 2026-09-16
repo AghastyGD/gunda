@@ -3,7 +3,9 @@ mod common;
 use std::path::Path;
 
 use common::serve_once;
-use gunda_core::application::{DownloadExecutor, ExecutionInput, PreparedTransfer, StagedTransfer};
+use gunda_core::application::{
+    DownloadExecutor, ExecutionInput, PreparedTransfer, StagedTransfer, TransferProgress,
+};
 use gunda_core::download::{
     DownloadDestination, DownloadId, FailureKind, FileConflictPolicy, RequestContext, ResourceKind,
 };
@@ -232,6 +234,50 @@ async fn rename_handles_a_conflict_created_after_preparation() {
     );
 
     assert!(!partial_path(directory.path(), test_id()).exists());
+
+    server.await.expect("server task must succeed");
+}
+
+#[tokio::test]
+async fn transfer_reports_written_bytes_before_publication() {
+    let directory = tempdir().expect("temporary directory must exist");
+
+    let (url, server) = serve_once(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: 5\r\n\
+         Connection: close\r\n\
+         \r\n\
+         hello",
+    )
+    .await;
+
+    let executor = HttpExecutor::new(HttpClient::new().expect("client must build"));
+
+    let prepared = executor
+        .prepare(input(url, directory.path()))
+        .await
+        .expect("preparation must succeed");
+
+    let (progress, receiver) = TransferProgress::channel();
+
+    let staged = prepared
+        .transfer_with_progress(progress)
+        .await
+        .expect("transfer must succeed");
+
+    let reported_bytes = *receiver.borrow();
+
+    assert_eq!(reported_bytes, 5);
+    assert_eq!(reported_bytes, staged.written_bytes());
+
+    assert_eq!(
+        tokio::fs::read(partial_path(directory.path(), test_id()))
+            .await
+            .expect("partial must be readable"),
+        b"hello",
+    );
+
+    assert!(!directory.path().join("file.bin").exists());
 
     server.await.expect("server task must succeed");
 }

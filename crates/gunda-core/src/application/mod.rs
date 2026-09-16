@@ -4,6 +4,7 @@ mod event;
 mod execution;
 mod manager;
 mod repository;
+mod transfer_progress;
 
 pub use command::{DownloadCommand, DownloadCommandKind};
 pub use error::DownloadManagerError;
@@ -14,3 +15,4 @@ pub use execution::{
 };
 pub use manager::DownloadManager;
 pub use repository::{DownloadRepository, RepositoryError, RepositoryErrorKind};
+pub use transfer_progress::TransferProgress;
