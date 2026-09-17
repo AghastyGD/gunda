@@ -4,7 +4,8 @@ use std::path::Path;
 
 use common::serve_once;
 use gunda_core::application::{
-    DownloadExecutor, ExecutionInput, PreparedTransfer, StagedTransfer, TransferProgress,
+    DownloadCancellation, DownloadExecutor, ExecutionInput, PreparedTransfer, StagedTransfer,
+    TransferOutcome, TransferProgress,
 };
 use gunda_core::download::{
     DownloadDestination, DownloadId, FailureKind, FileConflictPolicy, RequestContext, ResourceKind,
@@ -67,10 +68,14 @@ async fn execution_reuses_the_opened_get_across_phases() {
     let received = server.await.expect("server task must succeed");
     assert!(received.starts_with("GET /file.bin HTTP/1.1\r\n"));
 
-    let staged = prepared
+    let outcome = prepared
         .transfer()
         .await
         .expect("transfer must use the existing response");
+
+    let TransferOutcome::Finished(staged) = outcome else {
+        panic!("transfer must finish without cancellation");
+    };
 
     assert_eq!(staged.written_bytes(), 5);
     assert!(staging.exists());
@@ -142,7 +147,14 @@ async fn finalization_conflict_preserves_both_files() {
         .await
         .expect("preparation must succeed");
 
-    let staged = prepared.transfer().await.expect("transfer must succeed");
+    let outcome = prepared
+        .transfer()
+        .await
+        .expect("transfer must use the existing response");
+
+    let TransferOutcome::Finished(staged) = outcome else {
+        panic!("transfer must finish without cancellation");
+    };
 
     let failure = match staged.finalize().await {
         Ok(_) => panic!("existing destination must prevent publication"),
@@ -207,7 +219,14 @@ async fn rename_handles_a_conflict_created_after_preparation() {
         .await
         .expect("competing output must be created");
 
-    let staged = prepared.transfer().await.expect("transfer must succeed");
+    let outcome = prepared
+        .transfer()
+        .await
+        .expect("transfer must use the existing response");
+
+    let TransferOutcome::Finished(staged) = outcome else {
+        panic!("transfer must finish without cancellation");
+    };
 
     let output = staged
         .finalize()
@@ -260,10 +279,14 @@ async fn transfer_reports_written_bytes_before_publication() {
 
     let (progress, receiver) = TransferProgress::channel();
 
-    let staged = prepared
+    let outcome = prepared
         .transfer_with_progress(progress)
         .await
         .expect("transfer must succeed");
+
+    let TransferOutcome::Finished(staged) = outcome else {
+        panic!("transfer must finish without cancellation");
+    };
 
     let reported_bytes = *receiver.borrow();
 
@@ -279,5 +302,119 @@ async fn transfer_reports_written_bytes_before_publication() {
 
     assert!(!directory.path().join("file.bin").exists());
 
+    server.await.expect("server task must succeed");
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_a_stalled_body_and_preserves_partial() {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    let directory = tempdir().expect("temporary directory must exist");
+
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("listener must bind");
+
+    let address = listener.local_addr().expect("address must exist");
+    let (release, released) = oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        timeout(Duration::from_secs(10), async move {
+            let (mut socket, _) = listener.accept().await.expect("client must connect");
+
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+
+            loop {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("request must be readable");
+
+                assert_ne!(read, 0);
+                request.extend_from_slice(&buffer[..read]);
+                assert!(request.len() <= 16 * 1024);
+
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Length: 10\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      hello",
+                )
+                .await
+                .expect("partial body must be sent");
+
+            released.await.expect("test must release server");
+        })
+        .await
+        .expect("server must finish within deadline");
+    });
+
+    let url = Url::parse(&format!("http://{address}/file.bin")).expect("URL must be valid");
+
+    let executor = HttpExecutor::new(HttpClient::new().expect("client must build"));
+
+    let prepared = executor
+        .prepare(input(url, directory.path()))
+        .await
+        .expect("preparation must succeed");
+
+    let cancellation = DownloadCancellation::new();
+    let handle = cancellation.clone();
+    let (progress, mut receiver) = TransferProgress::channel();
+
+    let outcome = timeout(Duration::from_secs(5), async {
+        let transfer = prepared.transfer_controlled(progress, cancellation);
+
+        let request_cancellation = async {
+            loop {
+                let written_bytes = *receiver.borrow_and_update();
+
+                if written_bytes >= 5 {
+                    break;
+                }
+
+                receiver
+                    .changed()
+                    .await
+                    .expect("writer must report progress");
+            }
+
+            handle.request();
+        };
+
+        let (result, ()) = tokio::join!(transfer, request_cancellation);
+        result.expect("cancellation must be an execution outcome")
+    })
+    .await
+    .expect("cancellation must not wait for the remaining body");
+
+    assert!(matches!(
+        outcome,
+        TransferOutcome::Cancelled { written_bytes: 5 }
+    ));
+
+    assert_eq!(
+        tokio::fs::read(partial_path(directory.path(), test_id()))
+            .await
+            .expect("partial must be readable"),
+        b"hello",
+    );
+
+    assert!(!directory.path().join("file.bin").exists());
+
+    release.send(()).expect("server must still be waiting");
     server.await.expect("server task must succeed");
 }

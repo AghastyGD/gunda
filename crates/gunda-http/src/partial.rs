@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use gunda_core::application::TransferProgress;
+use gunda_core::application::{DownloadCancellation, TransferOutcome, TransferProgress};
 use gunda_core::download::{DownloadId, RequestContext};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -111,10 +111,17 @@ pub async fn download_to_partial(
     request: &RequestContext,
     id: DownloadId,
     directory: &Path,
-) -> Result<PartialDownload, PartialDownloadError> {
+) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
     let body = client.open(request).await?; // TODO: should we reserve the partial file before opening the GET?
 
-    write_body_to_partial(body, id, directory, TransferProgress::disabled()).await
+    write_body_to_partial(
+        body,
+        id,
+        directory,
+        TransferProgress::disabled(),
+        DownloadCancellation::new(),
+    )
+    .await
 }
 
 /// Writes an already opened body into an exclusively created partial file.
@@ -126,10 +133,16 @@ pub(crate) async fn write_body_to_partial(
     id: DownloadId,
     directory: &Path,
     progress: TransferProgress,
-) -> Result<PartialDownload, PartialDownloadError> {
+    cancellation: DownloadCancellation,
+) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
     if !body.is_unconsumed() {
         return Err(PartialDownloadError::InvalidBodyState);
     }
+
+    if cancellation.is_requested() {
+        return Ok(TransferOutcome::Cancelled { written_bytes: 0 });
+    }
+
     let metadata = body.metadata().clone();
     let path = partial_path(directory, id);
 
@@ -142,7 +155,21 @@ pub(crate) async fn write_body_to_partial(
 
     let mut written_bytes = 0_u64;
 
-    while let Some(chunk) = body.next_chunk().await? {
+    loop {
+        let chunk = tokio::select! {
+            biased;
+
+            _ = cancellation.cancelled() => {
+                return Ok(TransferOutcome::Cancelled { written_bytes })
+            }
+
+            result = body.next_chunk() => result?,
+        };
+
+        let Some(chunk) = chunk else {
+            break;
+        };
+
         let size =
             u64::try_from(chunk.len()).map_err(|_| PartialDownloadError::ByteCountOverflow)?;
 
@@ -150,12 +177,11 @@ pub(crate) async fn write_body_to_partial(
             .checked_add(size)
             .ok_or(PartialDownloadError::ByteCountOverflow)?;
 
+        // Finish an accepted write before acknowledging cancellation
         file.write_all(&chunk)
             .await
             .map_err(|error| file_error(FileOperation::Write, error))?;
 
-        // Tokio file writes may still be pending after write_all returns.
-        // Flush waits for them before advancing our written-byte counter.
         file.flush()
             .await
             .map_err(|error| file_error(FileOperation::Flush, error))?;
@@ -164,18 +190,22 @@ pub(crate) async fn write_body_to_partial(
         progress.report_written(written_bytes);
     }
 
+    if cancellation.is_requested() {
+        return Ok(TransferOutcome::Cancelled { written_bytes });
+    }
+
     file.sync_all()
         .await
         .map_err(|error| file_error(FileOperation::Sync, error))?;
 
     drop(file);
 
-    Ok(PartialDownload {
+    Ok(TransferOutcome::Finished(PartialDownload {
         id,
         path,
         written_bytes,
         metadata,
-    })
+    }))
 }
 
 fn file_error(operation: FileOperation, error: io::Error) -> PartialDownloadError {

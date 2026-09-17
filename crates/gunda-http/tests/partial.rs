@@ -3,7 +3,10 @@ mod common;
 use std::io::ErrorKind;
 
 use common::serve_once;
-use gunda_core::download::{DownloadId, RequestContext};
+use gunda_core::{
+    application::TransferOutcome,
+    download::{DownloadId, RequestContext},
+};
 use gunda_http::{
     FileOperation, HttpClient, HttpError, PartialDownloadError, download_to_partial, partial_path,
 };
@@ -52,9 +55,13 @@ async fn successful_bodies_are_written_to_partial_files() {
         let client = HttpClient::new().expect("client must build");
         let request = RequestContext::new(url, Vec::new());
 
-        let partial = download_to_partial(&client, &request, test_id(), directory.path())
+        let outcome = download_to_partial(&client, &request, test_id(), directory.path())
             .await
             .expect("transfer must succeed");
+
+        let TransferOutcome::Finished(partial) = outcome else {
+            panic!("partial transfer must finish without cancellation");
+        };
 
         let expected_path = partial_path(directory.path(), test_id());
 
