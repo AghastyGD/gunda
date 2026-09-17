@@ -5,7 +5,7 @@ use crate::download::{
     ResourceDescriptor,
 };
 
-use super::{DownloadEvent, TransferProgress};
+use super::{DownloadCancellation, DownloadEvent, TransferProgress};
 /// Input for a single execution attempt
 pub struct ExecutionInput {
     pub id: DownloadId,
@@ -13,10 +13,17 @@ pub struct ExecutionInput {
     pub destination: DownloadDestination,
 }
 
+/// Outcome of writing an execution's staging file.
+pub enum TransferOutcome<T> {
+    Finished(T),
+    Cancelled { written_bytes: u64 },
+}
+
 /// Opens a resource and prepares it for transfer.
 pub trait DownloadExecutor: Send + Sync {
     type Prepared: PreparedTransfer;
 
+    /// Prepares a transfer; dropping this future must safely release its resources.
     fn prepare(
         &self,
         input: ExecutionInput,
@@ -35,7 +42,9 @@ pub trait PreparedTransfer: Send + Sized {
     fn planned_destination(&self) -> ResolvedDestination;
 
     /// Writes staging output without progress observation.
-    fn transfer(self) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send {
+    fn transfer(
+        self,
+    ) -> impl Future<Output = Result<TransferOutcome<Self::Staged>, DownloadFailure>> + Send {
         self.transfer_with_progress(TransferProgress::disabled())
     }
 
@@ -43,7 +52,15 @@ pub trait PreparedTransfer: Send + Sized {
     fn transfer_with_progress(
         self,
         progress: TransferProgress,
-    ) -> impl Future<Output = Result<Self::Staged, DownloadFailure>> + Send;
+    ) -> impl Future<Output = Result<TransferOutcome<Self::Staged>, DownloadFailure>> + Send {
+        self.transfer_controlled(progress, DownloadCancellation::new())
+    }
+
+    fn transfer_controlled(
+        self,
+        progress: TransferProgress,
+        cancellation: DownloadCancellation,
+    ) -> impl Future<Output = Result<TransferOutcome<Self::Staged>, DownloadFailure>> + Send;
 }
 
 /// Fully transferred stagin output that has not been published

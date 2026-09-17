@@ -6,9 +6,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use time::OffsetDateTime;
 
 use super::{
-    DownloadEvent, DownloadExecutor, DownloadManagerError, DownloadRepository, ExecutionInput,
-    ExecutionReport, PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer,
-    TransferProgress,
+    DownloadCancellation, DownloadEvent, DownloadExecutor, DownloadManagerError,
+    DownloadRepository, ExecutionInput, ExecutionReport, PreparedTransfer, RepositoryError,
+    RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
 };
 
 use crate::{
@@ -139,28 +139,44 @@ where
     }
 
     /// Calls the observer after persisting changed progress; it must not block.
-    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
     pub async fn execute_with_progress<E, F>(
         &mut self,
         id: DownloadId,
         executor: &E,
+        on_progress: F,
+    ) -> Result<ExecutionReport, DownloadManagerError>
+    where
+        E: DownloadExecutor,
+        F: FnMut(DownloadEvent) + Send,
+    {
+        self.execute_controlled(id, executor, DownloadCancellation::new(), on_progress)
+            .await
+    }
+
+    /// Executes a job with progress observation and cooperative cancellation.
+    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
+    pub async fn execute_controlled<E, F>(
+        &mut self,
+        id: DownloadId,
+        executor: &E,
+        cancellation: DownloadCancellation,
         mut on_progress: F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
         E: DownloadExecutor,
         F: FnMut(DownloadEvent) + Send,
     {
-        self.execute_inner(id, executor, &mut on_progress)
+        self.execute_inner(id, executor, &cancellation, &mut on_progress)
             .await
             .inspect_err(|error| {
                 report_management_error("manager.execute", error);
             })
     }
-
     async fn execute_inner<E, F>(
         &mut self,
         id: DownloadId,
         executor: &E,
+        cancellation: &DownloadCancellation,
         on_progress: &mut F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
@@ -180,6 +196,12 @@ where
             });
         }
 
+        if cancellation.is_requested() {
+            return self
+                .record_execution_cancellation(job, None, on_progress)
+                .await;
+        }
+
         execution_transition(&mut job, DownloadState::Inspecting)?;
         job = self.commit_job(job).await?;
 
@@ -189,9 +211,21 @@ where
             destination: job.destination().clone(),
         };
 
-        let prepared = match executor.prepare(input).await {
-            Ok(prepared) => prepared,
-            Err(failure) => {
+        let preparation = tokio::select! {
+            biased;
+
+            _ = cancellation.cancelled() => None,
+            result = executor.prepare(input) => Some(result),
+        };
+
+        let prepared = match preparation {
+            None => {
+                return self
+                    .record_execution_cancellation(job, None, on_progress)
+                    .await;
+            }
+            Some(Ok(prepared)) => prepared,
+            Some(Err(failure)) => {
                 return self.record_execution_failure(id, failure).await;
             }
         };
@@ -207,12 +241,18 @@ where
         job.update_progress(initial_progress, inspected_at);
         job.resolve_destination(prepared.planned_destination(), inspected_at);
 
+        if cancellation.is_requested() {
+            return self
+                .record_execution_cancellation(job, None, on_progress)
+                .await;
+        }
+
         execution_transition(&mut job, DownloadState::Downloading)?;
         job = self.commit_job(job).await?;
 
         let (progress_sender, progress_receiver) = TransferProgress::channel();
 
-        let transfer = prepared.transfer_with_progress(progress_sender);
+        let transfer = prepared.transfer_controlled(progress_sender, cancellation.clone());
         tokio::pin!(transfer);
 
         let checkpoint_period = Duration::from_secs(1);
@@ -243,7 +283,21 @@ where
         validated_execution_progress(&job, reported_bytes)?;
 
         let staged = match transfer_result {
-            Ok(staged) => staged,
+            Ok(TransferOutcome::Finished(staged)) => staged,
+
+            Ok(TransferOutcome::Cancelled { written_bytes }) => {
+                if !cancellation.is_requested() || written_bytes < reported_bytes {
+                    return Err(invalid_repository_data(
+                        "executor returned inconsistent cancellation",
+                    )
+                    .into());
+                }
+
+                return self
+                    .record_execution_cancellation(job, Some(written_bytes), on_progress)
+                    .await;
+            }
+
             Err(failure) => {
                 self.checkpoint_progress(&mut job, reported_bytes, on_progress)
                     .await?;
@@ -251,7 +305,6 @@ where
                 return self.record_execution_failure(id, failure).await;
             }
         };
-
         let written_bytes = staged.written_bytes();
 
         if written_bytes < reported_bytes {
@@ -269,6 +322,12 @@ where
             return Err(
                 invalid_repository_data("executor returned an incomplete staged transfer").into(),
             );
+        }
+
+        if cancellation.is_requested() {
+            return self
+                .record_execution_cancellation(job, Some(written_bytes), on_progress)
+                .await;
         }
 
         let progress_changed = progress != job.progress();
@@ -454,6 +513,51 @@ where
         Ok(())
     }
 
+    async fn record_execution_cancellation<F>(
+        &mut self,
+        mut job: DownloadJob,
+        written_bytes: Option<u64>,
+        on_progress: &mut F,
+    ) -> Result<ExecutionReport, DownloadManagerError>
+    where
+        F: FnMut(DownloadEvent) + Send,
+    {
+        let id = job.id();
+        let previous = job.state();
+
+        let persisted_progress = self
+            .jobs
+            .get(&id)
+            .ok_or(DownloadManagerError::NotFound { id })?
+            .progress();
+
+        if let Some(written_bytes) = written_bytes {
+            let progress = validated_execution_progress(&job, written_bytes)?;
+            job.update_progress(progress, OffsetDateTime::now_utc());
+        }
+
+        execution_transition(&mut job, DownloadState::Cancelled)?;
+        let persisted = self.commit_job(job).await?;
+
+        if persisted.progress() != persisted_progress {
+            on_progress(DownloadEvent::ProgressChanged {
+                id,
+                progress: persisted.progress(),
+            });
+        }
+
+        tracing::info!("download execution cancelled");
+
+        Ok(ExecutionReport {
+            event: DownloadEvent::StateChanged {
+                id,
+                previous,
+                current: DownloadState::Cancelled,
+            },
+            cleanup_pending: false,
+        })
+    }
+
     /// Returns an immutable job snapshot owned by the manager.
     #[must_use]
     pub fn job(&self, id: DownloadId) -> Option<&DownloadJob> {
@@ -562,9 +666,9 @@ mod tests {
 
     use super::DownloadManager;
     use crate::application::{
-        DownloadEvent, DownloadExecutor, DownloadManagerError, DownloadRepository, ExecutionInput,
-        ExecutionOutput, PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer,
-        TransferProgress,
+        DownloadCancellation, DownloadEvent, DownloadExecutor, DownloadManagerError,
+        DownloadRepository, ExecutionInput, ExecutionOutput, PreparedTransfer, RepositoryError,
+        RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
     };
     use crate::download::{
         DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin,
@@ -1103,12 +1207,13 @@ mod tests {
             ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
         }
 
-        async fn transfer_with_progress(
+        async fn transfer_controlled(
             self,
             _progress: TransferProgress,
-        ) -> Result<Self::Staged, DownloadFailure> {
+            _cancellation: DownloadCancellation,
+        ) -> Result<TransferOutcome<Self::Staged>, DownloadFailure> {
             self.enter("transfer", 2)?;
-            Ok(self)
+            Ok(TransferOutcome::Finished(self))
         }
     }
 
@@ -1374,17 +1479,28 @@ mod tests {
             ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
         }
 
-        async fn transfer_with_progress(
+        async fn transfer_controlled(
             self,
             progress: TransferProgress,
-        ) -> Result<Self::Staged, DownloadFailure> {
+            cancellation: DownloadCancellation,
+        ) -> Result<TransferOutcome<Self::Staged>, DownloadFailure> {
             progress.report_written(2);
 
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            tokio::select! {
+                biased;
+
+                _ = cancellation.cancelled() => {
+                    return Ok(TransferOutcome::Cancelled {
+                        written_bytes: 2,
+                    });
+                }
+
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+            }
 
             progress.report_written(5);
 
-            Ok(self)
+            Ok(TransferOutcome::Finished(self))
         }
     }
 
@@ -1506,6 +1622,163 @@ mod tests {
                 .expect("progress must be valid")
                 .downloaded_bytes(),
             4,
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_execution_does_not_call_executor() {
+        let (mut manager, executor, id) = execution_fixture(None, None).await;
+
+        let cancellation = DownloadCancellation::new();
+        cancellation.request();
+
+        let report = manager
+            .execute_controlled(id, &executor, cancellation, |_| {})
+            .await
+            .expect("cancellation must persist");
+
+        assert!(matches!(
+            report.event,
+            DownloadEvent::StateChanged {
+                previous: DownloadState::Queued,
+                current: DownloadState::Cancelled,
+                ..
+            }
+        ));
+
+        assert!(
+            executor
+                .calls
+                .lock()
+                .expect("probe lock must not be poisoned")
+                .is_empty()
+        );
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Cancelled);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_cancellation_preserves_progress_without_publication() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+        };
+
+        let cancellation = DownloadCancellation::new();
+        let handle = cancellation.clone();
+
+        let report = manager
+            .execute_controlled(id, &executor, cancellation, |event| {
+                if let DownloadEvent::ProgressChanged { progress, .. } = event
+                    && progress.downloaded_bytes() == 2
+                {
+                    handle.request();
+                }
+            })
+            .await
+            .expect("cancellation must persist");
+
+        assert!(matches!(
+            report.event,
+            DownloadEvent::StateChanged {
+                previous: DownloadState::Downloading,
+                current: DownloadState::Cancelled,
+                ..
+            }
+        ));
+
+        assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Cancelled);
+        assert_eq!(persisted.progress().downloaded_bytes(), 2);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_persistence_failure_does_not_publish_output() {
+        let (mut manager, _, id) = execution_fixture(Some(DownloadState::Cancelled), None).await;
+
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+        };
+
+        let cancellation = DownloadCancellation::new();
+        let handle = cancellation.clone();
+
+        let result = manager
+            .execute_controlled(id, &executor, cancellation, |event| {
+                if let DownloadEvent::ProgressChanged { progress, .. } = event
+                    && progress.downloaded_bytes() == 2
+                {
+                    handle.request();
+                }
+            })
+            .await;
+
+        assert!(matches!(result, Err(DownloadManagerError::Repository(_))));
+
+        assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+
+        assert_eq!(persisted.state(), DownloadState::Downloading);
+        assert_eq!(persisted.progress().downloaded_bytes(), 2);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_after_finalization_boundary_does_not_cancel_output() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+        };
+
+        let cancellation = DownloadCancellation::new();
+        let handle = cancellation.clone();
+
+        let report = manager
+            .execute_controlled(id, &executor, cancellation, |event| {
+                if let DownloadEvent::ProgressChanged { progress, .. } = event
+                    && progress.downloaded_bytes() == 5
+                {
+                    handle.request();
+                }
+            })
+            .await
+            .expect("finalization must finish");
+
+        assert!(handle.is_requested());
+        assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+        assert_eq!(finalizations.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            manager.job(id).expect("job must exist").state(),
+            DownloadState::Completed,
         );
     }
 }

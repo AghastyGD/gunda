@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 
 use common::serve_once;
+use gunda_core::application::TransferOutcome;
 use gunda_core::download::{DownloadDestination, DownloadId, FileConflictPolicy, RequestContext};
 use gunda_http::{
     FinalizeError, HttpClient, PartialDownload, download_to_partial, finalize_download,
@@ -28,9 +29,13 @@ async fn prepare_partial(directory: &Path) -> PartialDownload {
     let client = HttpClient::new().expect("client must build");
     let request = RequestContext::new(url, Vec::new());
 
-    let partial = download_to_partial(&client, &request, test_id(), directory)
+    let outcome = download_to_partial(&client, &request, test_id(), directory)
         .await
         .expect("partial transfer must succeed");
+
+    let TransferOutcome::Finished(partial) = outcome else {
+        panic!("partial transfer must finish without cancellation");
+    };
 
     server.await.expect("server task must succeed");
 
