@@ -34,7 +34,7 @@
     clearFeedback();
 
     if (!url.trim()) {
-      error = "Enter a file URL.";
+      error = "Enter a URL.";
       return;
     }
 
@@ -53,7 +53,7 @@
       error =
         typeof cause === "string"
           ? cause
-          : "Could not validate the download URL.";
+          : "Could not validate the URL.";
     } finally {
       busy = false;
     }
@@ -66,18 +66,12 @@
 
 <div class="downloads-page">
   <header class="page-header">
-    <div>
-      <h1>Downloads</h1>
-      <p>Direct HTTP and HTTPS downloads.</p>
-    </div>
-
-    <span class="status-badge">M1</span>
+    <h1>Downloads</h1>
   </header>
 
   <section class="new-download" aria-labelledby="new-download-heading">
     <div class="section-heading">
       <h2 id="new-download-heading">New download</h2>
-      <span>HTTP / HTTPS</span>
     </div>
 
     <form onsubmit={validateInput}>

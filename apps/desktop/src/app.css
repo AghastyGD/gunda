@@ -6,32 +6,32 @@
   color-scheme: dark;
 
   /* Surfaces */
-  --bg: #111211;
-  --sidebar: #151615;
-  --surface: #191a19;
-  --surface-hover: #202120;
-  --input: #161716;
+  --bg: #111111;
+  --sidebar: #151515;
+  --surface: #191919;
+  --surface-hover: #202020;
+  --input: #161616;
 
   /* Borders */
-  --border: #2d2f2d;
-  --border-strong: #3d403d;
+  --border: #2b2b2b;
+  --border-strong: #3a3a3a;
 
   /* Text */
-  --text: #e7e5e0;
-  --text-secondary: #aaa8a2;
-  --text-muted: #74736e;
-  --text-faint: #5c5c58;
+  --text: #e8e8e8;
+  --text-secondary: #aaaaaa;
+  --text-muted: #747474;
+  --text-faint: #5a5a5a;
 
-  /* Gunda accent */
-  --accent: #d4a04f;
-  --accent-hover: #e0ad59;
-  --accent-soft: #33291a;
-  --accent-border: #66502d;
-  --accent-text: #1d170d;
+  /* Main interaction */
+  --accent: #d4d4d4;
+  --accent-hover: #eeeeee;
+  --accent-soft: #242424;
+  --accent-border: #494949;
+  --accent-text: #141414;
 
   /* Semantic */
-  --danger: #d87972;
-  --success: #82a978;
+  --danger: #d47777;
+  --success: #7fa37a;
 
   color: var(--text);
   background: var(--bg);
@@ -64,9 +64,7 @@ button {
   color: inherit;
 }
 
-/* --------------------------------------------------
-   App shell
--------------------------------------------------- */
+/* App shell */
 
 .app-shell {
   display: grid;
@@ -146,7 +144,7 @@ button {
 .new-link[aria-current="page"] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
-  color: #e4ba72;
+  color: var(--text);
 }
 
 .development-label {
@@ -164,9 +162,7 @@ button {
   overflow: auto;
 }
 
-/* --------------------------------------------------
-   Downloads page
--------------------------------------------------- */
+/* Downloads page */
 
 .downloads-page {
   width: 100%;
@@ -200,21 +196,7 @@ button {
   font-size: 0.87rem;
 }
 
-.status-badge {
-  padding: 3px 7px;
-
-  border: 1px solid var(--border-strong);
-  border-radius: 4px;
-
-  color: var(--text-muted);
-
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.68rem;
-}
-
-/* --------------------------------------------------
-   New download
--------------------------------------------------- */
+/* New download */
 
 .new-download {
   padding: 24px 0 28px;
@@ -248,9 +230,7 @@ button {
   font-size: 0.75rem;
 }
 
-/* --------------------------------------------------
-   Form
--------------------------------------------------- */
+/* Form */
 
 form {
   max-width: 760px;
@@ -290,16 +270,16 @@ input {
 }
 
 input:hover:not(:disabled) {
-  border-color: #50524f;
+  border-color: #505050;
 }
 
 input:focus {
-  border-color: #8e6b36;
-  background: #191a18;
+  border-color: #747474;
+  background: #191919;
 }
 
 input::placeholder {
-  color: #666762;
+  color: #666666;
 }
 
 input[readonly] {
@@ -312,9 +292,7 @@ input[readonly] {
   gap: 8px;
 }
 
-/* --------------------------------------------------
-   Buttons
--------------------------------------------------- */
+/* Buttons */
 
 .button {
   min-height: 36px;
@@ -336,12 +314,12 @@ input[readonly] {
 
 .secondary {
   border-color: var(--border-strong);
-  background: #1b1c1b;
+  background: #1b1b1b;
   color: var(--text-secondary);
 }
 
 .secondary:hover:not(:disabled) {
-  border-color: #50524f;
+  border-color: #505050;
   background: var(--surface-hover);
   color: var(--text);
 }
@@ -363,9 +341,7 @@ input:disabled {
   opacity: 0.55;
 }
 
-/* --------------------------------------------------
-   Feedback
--------------------------------------------------- */
+/* Feedback */
 
 .form-footer {
   display: flex;
@@ -395,9 +371,7 @@ input:disabled {
   color: var(--success);
 }
 
-/* --------------------------------------------------
-   Transfers
--------------------------------------------------- */
+/* Transfers */
 
 .downloads-list {
   padding-top: 24px;
@@ -414,8 +388,8 @@ input:disabled {
 
   padding: 18px 2px;
 
-  border-top: 1px solid #262826;
-  border-bottom: 1px solid #262826;
+  border-top: 1px solid #262626;
+  border-bottom: 1px solid #262626;
 }
 
 .empty-state p {
@@ -430,20 +404,16 @@ input:disabled {
   font-size: 0.78rem;
 }
 
-/* --------------------------------------------------
-   Focus
--------------------------------------------------- */
+/* Focus */
 
 button:focus-visible,
 input:focus-visible,
 a:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid #9a9a9a;
   outline-offset: 2px;
 }
 
-/* --------------------------------------------------
-   Smaller windows
--------------------------------------------------- */
+/* Smaller windows */
 
 @media (max-width: 800px) {
   .app-shell {
