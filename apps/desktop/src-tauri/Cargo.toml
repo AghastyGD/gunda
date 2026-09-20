@@ -1,0 +1,25 @@
+[package]
+name = "gunda-desktop"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "gunda_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+url.workspace = true
+gunda-core = { path = "../../../crates/gunda-core" }
+gunda-storage = { path = "../../../crates/gunda-storage" }
+gunda-http = { path = "../../../crates/gunda-http" }
+
+serde = { version = "1", features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }
