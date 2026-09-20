@@ -1443,9 +1443,14 @@ dependencies = [
 name = "gunda-desktop"
 version = "0.1.0"
 dependencies = [
+ "gunda-core",
+ "gunda-http",
+ "gunda-storage",
+ "serde",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
+ "tokio",
  "url",
 ]
 

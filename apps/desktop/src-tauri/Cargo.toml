@@ -17,3 +17,9 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 url.workspace = true
+gunda-core = { path = "../../../crates/gunda-core" }
+gunda-storage = { path = "../../../crates/gunda-storage" }
+gunda-http = { path = "../../../crates/gunda-http" }
+
+serde = { version = "1", features = ["derive"] }
+tokio = { workspace = true, features = ["sync"] }

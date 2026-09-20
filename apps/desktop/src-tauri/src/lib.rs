@@ -1,3 +1,10 @@
+mod downloads;
+
+use gunda_core::application::DownloadManager;
+use gunda_http::{HttpClient, HttpExecutor};
+use gunda_storage::SqliteDownloadRepository;
+use tauri::Manager;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -5,9 +12,11 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 use url::Url;
 
-#[derive(Default)]
 struct DesktopState {
-  destination: Mutex<Option<PathBuf>>,
+    destination: Mutex<Option<PathBuf>>,
+    manager: tokio::sync::Mutex<DownloadManager<SqliteDownloadRepository>>,
+    executor: HttpExecutor,
+    active: Mutex<Option<downloads::ActiveDownload>>,
 }
 
 #[tauri::command]
@@ -62,7 +71,7 @@ fn validate_download_input(
   Ok(())
 }
 
-fn validate_http_url(value: &str) -> Result<(), &'static str> {
+fn validate_http_url(value: &str) -> Result<Url, &'static str> {
   let url = Url::parse(value.trim())
     .map_err(|_| "Enter a valid URL.")?;
 
@@ -74,18 +83,60 @@ fn validate_http_url(value: &str) -> Result<(), &'static str> {
     return Err("URLs containing a username or password are not supported.");
   }
 
-  Ok(())
+  Ok(url)
 
 }
 
 pub fn run() {
   tauri::Builder::default()
     .plugin(tauri_plugin_dialog::init())
-    .manage(DesktopState::default())
-    .invoke_handler(tauri::generate_handler!{
+    .setup(|app| {
+      let data_dir = app.path().app_local_data_dir()?;
+
+      std::fs::create_dir_all(&data_dir)
+        .map_err(|_| std::io::Error::other(
+          "Could not create the application data directory.",
+        ))?;
+
+      let db_path = data_dir.join("gunda.sqlite3");
+
+      let state = tauri::async_runtime::block_on(async {
+        let repository = SqliteDownloadRepository::open(db_path)
+          .await
+          .map_err(|_| std::io::Error::other(
+            "Could not open the download database.",
+          ))?;
+
+        let manager = DownloadManager::start(repository)
+          .await
+          .map_err(|_| std::io::Error::other(
+            "Could not load saved downloads.",
+          ))?;
+
+        let client = HttpClient::new()
+          .map_err(|_| std::io::Error::other(
+            "Could not initialize the HTTP client.",
+          ))?;
+
+        Ok::<_, std::io::Error>(DesktopState {
+          destination: Mutex::new(None),
+          manager: tokio::sync::Mutex::new(manager),
+          executor: HttpExecutor::new(client),
+          active: Mutex::new(None)
+        }) 
+
+      })?;
+
+      app.manage(state);
+      Ok(())
+    })
+    .invoke_handler(tauri::generate_handler![
       choose_directory,
       validate_download_input,
-    })
+      downloads::list_downloads,
+      downloads::start_download,
+      downloads::cancel_download,
+    ])
     .run(tauri::generate_context!())
     .expect("failed to run Gunda")
 }
