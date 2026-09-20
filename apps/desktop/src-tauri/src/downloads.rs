@@ -1,11 +1,9 @@
 use std::sync::Mutex;
 
-use gunda_core::application::{
-    DownloadCancellation, DownloadEvent, DownloadManagerError,
-};
+use gunda_core::application::{DownloadCancellation, DownloadEvent, DownloadManagerError};
 use gunda_core::download::{
-    DownloadDestination, DownloadId, DownloadJob, DownloadOrigin,
-    DownloadState, FileConflictPolicy, NewDownload, RequestContext,
+    DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
+    FileConflictPolicy, NewDownload, RequestContext,
 };
 use serde::Serialize;
 use tauri::State;
@@ -19,7 +17,7 @@ pub(crate) struct ActiveDownload {
 }
 
 struct ActiveGuard<'a> {
-    slot: &'a Mutex<Option<ActiveDownload>>
+    slot: &'a Mutex<Option<ActiveDownload>>,
 }
 
 impl Drop for ActiveGuard<'_> {
@@ -52,9 +50,7 @@ impl DownloadView {
 
         let output_path = if job.state() == DownloadState::Completed {
             job.resolved_destination()
-                .map(|destination| {
-                    destination.final_path().to_string_lossy().into_owned()
-                })
+                .map(|destination| destination.final_path().to_string_lossy().into_owned())
         } else {
             None
         };
@@ -86,7 +82,7 @@ pub(crate) enum DownloadUpdate {
         id: String,
         written_bytes: String,
         total_bytes: Option<String>,
-    }
+    },
 }
 
 #[derive(Serialize)]
@@ -129,12 +125,8 @@ pub(crate) async fn start_download(
 
     let created = manager
         .create(NewDownload::new(
-            RequestContext::new(url, Vec::new()), 
-            DownloadDestination::new(
-                directory,
-                None, 
-                FileConflictPolicy::Rename,
-            ), 
+            RequestContext::new(url, Vec::new()),
+            DownloadDestination::new(directory, None, FileConflictPolicy::Rename),
             DownloadOrigin::Desktop,
         ))
         .await
@@ -164,11 +156,13 @@ pub(crate) async fn start_download(
         .map(DownloadView::from_job)
         .ok_or_else(|| "The created download is unavailable.".to_owned())?;
 
-    if updates.send(DownloadUpdate::Started { job: initial }).is_err() {
-        manager
-            .cancel(id)
-            .await
-            .map_err(|_| "Could not confirm cancellation after losing the UI connection.".to_owned())?;
+    if updates
+        .send(DownloadUpdate::Started { job: initial })
+        .is_err()
+    {
+        manager.cancel(id).await.map_err(|_| {
+            "Could not confirm cancellation after losing the UI connection.".to_owned()
+        })?;
 
         return Err("The download UI is no longer available.".to_owned());
     }
@@ -176,24 +170,19 @@ pub(crate) async fn start_download(
     let observer_cancellation = cancellation.clone();
 
     let result = manager
-        .execute_controlled(
-            id,
-            &state.executor,
-            cancellation,
-            |event| {
-                if let DownloadEvent::ProgressChanged { id, progress } = event {
-                    let update = DownloadUpdate::Progress { 
-                        id: id.value().to_string(),
-                        written_bytes: progress.downloaded_bytes().to_string(),
-                        total_bytes: progress.total_bytes().map(|total| total.to_string()), 
-                    };
+        .execute_controlled(id, &state.executor, cancellation, |event| {
+            if let DownloadEvent::ProgressChanged { id, progress } = event {
+                let update = DownloadUpdate::Progress {
+                    id: id.value().to_string(),
+                    written_bytes: progress.downloaded_bytes().to_string(),
+                    total_bytes: progress.total_bytes().map(|total| total.to_string()),
+                };
 
-                    if updates.send(update).is_err() {
-                        observer_cancellation.request();
-                    }
+                if updates.send(update).is_err() {
+                    observer_cancellation.request();
                 }
-            },
-        )
+            }
+        })
         .await;
 
     let mut view = manager
@@ -218,13 +207,8 @@ pub(crate) async fn start_download(
             }
         }
 
-        Err(DownloadManagerError::CompletionNotPersisted { 
-            destination,
-            ..
-        }) => {
-            view.output_path = Some(
-                destination.final_path().to_string_lossy().into_owned(),
-            );
+        Err(DownloadManagerError::CompletionNotPersisted { destination, .. }) => {
+            view.output_path = Some(destination.final_path().to_string_lossy().into_owned());
 
             Some(
                 "The file was saved, but completion could not be recorded. \
@@ -236,24 +220,16 @@ pub(crate) async fn start_download(
         Err(error) => Some(error.to_string()),
     };
 
-    Ok(ExecutionResponse { 
-        job: view, 
-        notice,
-    })
-
+    Ok(ExecutionResponse { job: view, notice })
 }
 
 #[tauri::command]
-pub(crate) fn cancel_download(
-    id: String,
-    state: State<'_, DesktopState>,
-) -> Result<bool, String> {
-    let value = id 
+pub(crate) fn cancel_download(id: String, state: State<'_, DesktopState>) -> Result<bool, String> {
+    let value = id
         .parse::<i64>()
         .map_err(|_| "Invalid download ID.".to_owned())?;
 
-    let id = DownloadId::new(value)
-        .map_err(|_| "Invalid donwload ID".to_owned())?;
+    let id = DownloadId::new(value).map_err(|_| "Invalid donwload ID".to_owned())?;
 
     let active = state
         .active
