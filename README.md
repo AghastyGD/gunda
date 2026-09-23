@@ -2,39 +2,88 @@
 
 > download manager for the stubborn
 
-Gunda is a cross-platform download manager developed Linux-first, focused on reliable file downloads and native support for modern web streaming protocols.
+Gunda is a cross-platform download manager developed Linux-first, with a Rust
+engine and a Tauri + SvelteKit desktop interface. Reliable file downloads come
+first; native support for web streaming protocols is on the roadmap.
 
 ## Project status
 
-Gunda is in early development and is not yet usable as a download manager.
+The desktop is an early development preview with support for direct HTTP and HTTPS downloads.
 
-The Rust workspace currently provides:
+You can:
 
-- A download domain model with lifecycle rules, request context, destinations,
-  resource metadata, progress, failures, and application command and event types.
-- SQLite persistence for creating, finding, and listing initial queued jobs.
-- A download manager that loads persisted jobs at startup, exposes read-only
-  snapshots, and persists new jobs before adding them to its runtime registry.
-- Structured tracing for manager and storage operations, with tests guarding
-  against sensitive data appearing in diagnostics.
+- Paste a link and choose a destination through the native folder picker.
+- Download files with streamed writes and live byte progress.
+- Cancel the active download.
+- View completed downloads, output paths, and failures.
+- Reopen the application and load download records from SQLite.
 
-Network transfers, persistent lifecycle updates, interrupted-download recovery,
-and executable clients are not implemented yet.
+Only one download can run at a time. Downloads currently run inside the desktop process, so Gunda must remain open while a transfer is active. Coordinated shutdown, resume, and interrupted-download recovery are not available yet, and cancelled or interrupted downloads may leave partial files in the destination directory.
 
-## Build
+Links must currently point directly to a file. Redirects, automatic retries, browser integration, HLS, and DASH are not supported yet.
 
-Install a current stable Rust toolchain, then run:
+The planned daemon architecture will eventually separate download execution from the desktop, allowing transfers to continue independently of the desktop window.
+
+## Run the desktop
+
+Install:
+
+- A current stable Rust toolchain.
+- Node.js 24 and pnpm 11.3.0, matching the CI setup.
+- The [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your
+  operating system, including the native development libraries on Linux or the
+  C++ build tools and WebView2 on Windows.
+
+From the repository root:
 
 ```console
-cargo build --workspace --all-features
-cargo test --workspace --all-features
+cd apps/desktop
+pnpm install --frozen-lockfile
+pnpm tauri dev
 ```
 
-The workspace currently contains libraries, not a runnable application.
+This starts the frontend development server and opens the native application.
+Running `pnpm dev` alone starts only the frontend; downloading and folder
+selection require the Tauri application.
+
+To build the desktop without generating installers, run from `apps/desktop`:
+
+```console
+pnpm tauri build --no-bundle
+```
+
+The Tauri build command also builds the frontend.
+
+## Development
+
+From the repository root:
+
+```console
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo build --workspace --all-features --locked
+```
+
+The workspace includes the desktop, so these checks also require Tauri's native
+development dependencies. To check the frontend, run from `apps/desktop`:
+
+```console
+pnpm check
+pnpm build
+```
 
 CI builds and tests the workspace on Linux and Windows. Formatting and Clippy
-checks run on Linux. See [Contributing](CONTRIBUTING.md) for the complete local
-validation commands.
+checks run on Linux; frontend checks and desktop builds run on both platforms.
+These checks do not replace testing the graphical application on each platform.
+
+### Repository layout
+
+- `apps/desktop/`: Tauri application and SvelteKit interface.
+- `crates/gunda-core/`: download domain, lifecycle, and application manager.
+- `crates/gunda-http/`: direct HTTP transfers and file finalization.
+- `crates/gunda-storage/`: SQLite persistence and migrations.
+- `docs/`: architecture, design documents, and decisions.
 
 ## Documentation
 
