@@ -1,193 +1,201 @@
-# Architecture Overview
+# Architecture
 
-Status: Accepted architecture with current implementation notes
+Gunda is split into a small set of Rust crates and client applications.
 
-## Current state
+The core owns download state and lifecycle rules. Storage, protocol implementations, and presentation code live outside the core and connect through explicit application boundaries.
 
-The Rust workspace contains:
+The goal is to keep the download engine independent from any particular UI or client.
 
-- `gunda-core`, providing the download domain, lifecycle rules, application
-  command and event types, the repository contract, and a download manager;
-- `gunda-storage`, providing SQLite migrations and transactional creation,
-  lookup, and listing of initial queued jobs through SQLx.
+## Components
 
-The manager loads persisted jobs before startup succeeds, exposes read-only
-snapshots, and persists newly created jobs before inserting them into its
-runtime registry.
+### `gunda-core`
 
-Manager and storage operations emit structured tracing with explicitly selected
-safe fields. Libraries do not configure a global subscriber.
+Owns the download domain and application-level behavior.
 
-Protocol engines, executable clients, persistent lifecycle updates, scheduling,
-and interrupted-download recovery are not implemented yet.
+This includes:
 
-The remaining sections describe accepted responsibilities and boundaries.
-Planned behavior must not be interpreted as an existing capability.
+* download jobs and lifecycle states
+* commands and events
+* progress and failure models
+* repository interfaces
+* download manager orchestration
+* execution and cancellation contracts
 
-## Component ownership
+The core does not depend on Tauri, Svelte, SQLx, SQLite, or protocol-specific implementations.
 
-Components have the following responsibilities and implementation status:
+### `gunda-storage`
 
-| Component | Responsibility | Status |
-| --- | --- | --- |
-| `gunda-core` | Download domain, lifecycle rules, command and event types, repository contract, and application orchestration | Initial domain and manager implemented; execution orchestration remains planned |
-| `gunda-storage` | SQLite schema, migrations, and implementation of the core repository contract | Initial queued-job creation, lookup, and listing implemented |
-| `gunda-http` | Shared HTTP transport and the direct HTTP file engine | Planned |
-| Desktop application | Tauri composition root and Svelte presentation client | Planned |
+Provides durable storage using SQLite.
 
-The first implementation may run the application layer inside the desktop
-process. This is a deployment choice, not permission to couple the core to
-Tauri.
+It implements the repository contracts defined by `gunda-core` and is responsible for:
 
-HLS, browser integration, a daemon, a CLI, DASH, and Chromium support are future
-work. Their directories and crates should be created only when their
-responsibilities are being implemented.
+* migrations
+* serialization and validation of persisted state
+* loading downloads at startup
+* persisting lifecycle changes, progress, failures, and resolved metadata
 
-## Dependency rules
+SQLite stores application state, but it is not the authority for bytes already written to disk.
 
-The core owns domain and application policy. It must not depend on Tauri,
-Svelte, browser APIs, SQL, a database library, or protocol-specific manifest
-models.
+### `gunda-http`
 
-Storage and protocol crates implement interfaces required by the core. A
-composition root selects concrete adapters and supplies them to the application
-layer. Presentation clients send commands and observe snapshots or events. They
-do not receive mutable access to downloader internals.
+Implements the current direct HTTP download path.
 
-The accepted dependency direction, including planned components, is:
+It owns HTTP-specific behavior such as:
 
-```text
-desktop composition root
-    |---> gunda-core
-    |---> gunda-storage ---> gunda-core interfaces
-    `---> gunda-http -----> gunda-core interfaces
-```
+* request execution
+* response inspection
+* streamed response bodies
+* HTTP validation
+* partial file writing
+* transfer progress
+* final file publication
 
-A future HLS engine may reuse the HTTP transport. It must not reuse the direct
-file engine's download algorithm or put playlist and segment types into the
-core.
+HTTP errors are converted into domain-level failures before they reach the rest of the application.
 
-## Download flow
+Future protocol engines may reuse the shared HTTP transport without depending on the direct-file transfer algorithm itself.
 
-The implemented creation flow is:
+### Desktop
 
-1. The caller supplies a new download to the manager.
-2. The manager requests creation through the repository contract.
-3. The SQLite adapter commits the job and its public request headers.
-4. The manager adds the persisted job to its runtime registry.
-5. The manager returns a `Created` event to the caller.
+The Tauri desktop application is currently the composition root.
 
-A failed repository operation does not add a job to the manager. Returning an
-event does not imply an event bus or subscription mechanism exists.
+It connects:
 
-At startup, the manager loads the repository snapshot before returning a usable
-instance. Its current registry is ordered by download ID; this is not a
-scheduling policy.
+* `gunda-core`
+* `gunda-storage`
+* `gunda-http`
+* the Svelte desktop interface
 
-The planned execution flow extends these foundations:
+Tauri commands and events form the boundary between the Rust application layer and the frontend.
+
+The frontend owns presentation and local UI state. Download lifecycle decisions remain in Rust.
+
+## Dependency direction
+
+The main dependency direction is:
 
 ```text
-client command
-     |
-     v
-download manager ---> persistence interface ---> SQLite adapter
-     |
-     v
-engine interface ---> HTTP or future streaming engine
-     |
-     v
-filesystem and network adapters
+desktop
+   |
+   +----> gunda-core
+   |
+   +----> gunda-storage ----> gunda-core
+   |
+   `----> gunda-http -------> gunda-core
 ```
 
-Engines will own protocol behavior: inspection, transfer execution, progress,
-outcomes, and protocol-specific resume information. They must not change
-persistent jobs directly.
+Infrastructure depends on the core contracts, not the other way around.
 
-The manager will validate lifecycle transitions, persist their results, and
-publish application events. These execution paths are not implemented yet.
+The core should remain usable without knowing whether the caller is the desktop, a CLI, a browser integration, or another client.
 
-The exact Rust engine trait and registration mechanism remain open until direct
-HTTP and HLS requirements provide enough evidence for a stable interface.
+## Download lifecycle
 
-## Durable and runtime state
+`DownloadJob` is the main download aggregate.
 
-`DownloadJob` is the primary aggregate. Its domain model includes request and
-destination intent, origin, optional resolved resource and destination
-information, lifecycle state, progress checkpoints, failures, and timestamps.
+It contains the durable information needed to describe a download, including its request, origin, destination, resolved resource information, state, progress, failures, and timestamps.
 
-The current SQLite adapter persists only the initial queued-job representation.
-Persisting subsequent lifecycle changes, inspection results, resolved
-destinations, failures, and progress checkpoints requires additional repository
-operations and schema changes.
+The download manager owns application-level lifecycle changes.
 
-SQLite is the durable store, but a stored checkpoint is not proof that bytes
-exist on disk. Future recovery must reconcile database state with protocol
-metadata and partial output.
+Protocol engines perform transfer-specific work, but they do not directly mutate persisted download jobs.
 
-Transfer speed, ETA, worker handles, open files, in-flight requests, and emitted
-events belong to runtime state as execution is introduced. Events are
-notifications, not an event-sourced durable model.
+A simplified execution path looks like this:
 
-See [Download lifecycle](../design/download-lifecycle.md) and
-[Persistence and recovery](../design/persistence-and-recovery.md).
+```text
+client
+  |
+  v
+download manager
+  |
+  +----> persistence
+  |
+  v
+download executor
+  |
+  +----> network
+  |
+  `----> filesystem
+```
 
-## Planned protocol boundaries
+The manager coordinates state transitions around execution and persists the resulting state.
 
-Direct HTTP files, HLS, and future DASH resources are separate engines behind an
-application-facing boundary. Low-level HTTP behavior such as request headers,
-redirects, byte ranges, and streamed bodies belongs in a reusable transport.
-Scheduling a direct file and scheduling HLS segments are separate algorithms.
+See [Download lifecycle](../design/download-lifecycle.md).
 
-The initial implementation should establish correct single-stream HTTP downloads
-before adding range acceleration. HLS work begins after the engine boundary has
-been exercised by direct HTTP. DASH does not receive a design until those
-interfaces have been tested by HLS.
+## Persistence and filesystem state
 
-## Planned client and process boundaries
+SQLite stores Gunda's durable application state.
 
-The desktop application is a client of the application layer. A future browser
-extension is a sensor and browser-facing UI: it may observe candidate requests
-and provide request context, but native code remains authoritative for protocol
-parsing, persistence, scheduling, transfer, and files.
+Downloaded bytes live on the filesystem.
 
-A future native messaging host is a narrow bridge, not another download manager.
-A daemon may later own active jobs so that transfers outlive a desktop window.
-The current design preserves that option through commands, events, and adapter
-interfaces. It does not define the daemon IPC protocol in advance.
+These two sources can disagree after interruption or failure, so persisted progress should not be treated as proof that the same number of bytes can safely be resumed from disk.
+
+Recovery and resume must reconcile both sides before continuing a transfer.
+
+Partial downloads are written separately from final files and are only published as completed files after successful finalization.
+
+See [Persistence and recovery](../design/persistence-and-recovery.md).
+
+## Clients
+
+The desktop is the first client of Gunda, but it is not intended to be the only way downloads enter the application.
+
+A download may eventually originate from:
+
+```text
+Desktop ───────────┐
+Browser extension ─┼──> Gunda
+CLI ───────────────┤
+Other clients ─────┘
+```
+
+The desktop should therefore primarily act as a place to view, inspect, and manage downloads known by Gunda rather than assuming every download starts with a pasted URL.
+
+Browser extensions are expected to discover resources during normal browser navigation and pass useful context to Gunda.
+
+The native application remains responsible for persistence, protocol handling, transfer execution, and filesystem access.
+
+## Protocols
+
+Direct HTTP is the first implemented download path.
+
+HLS and DASH are separate protocol concerns and should remain outside the core domain.
+
+A streaming engine may reuse shared networking infrastructure, but playlist parsing, segment scheduling, stream selection, and protocol-specific recovery belong to that engine.
+
+This keeps the core focused on application-level download behavior instead of protocol details.
+
+## Process model
+
+Downloads currently execute inside the desktop process.
+
+A future daemon may take ownership of active jobs so transfers can continue independently of the desktop window.
+
+The current architecture keeps this possible by separating clients from the core application and execution boundaries rather than coupling download behavior directly to the UI.
+
+The daemon protocol itself does not need to be defined before that work begins.
 
 ## Security boundaries
 
-Network responses, redirects, remote filenames, manifests, browser-supplied
-headers, destination paths, native messages, and future local IPC requests cross
-trust boundaries.
+Network input, remote filenames, request context, destination paths, browser-provided data, and future local IPC messages should be treated as untrusted.
 
-Implementation must preserve these constraints:
+Important constraints include:
 
-- Sensitive headers such as `Cookie` and `Authorization` are classified and are
-  never written to logs, errors, telemetry, or ordinary UI events in plaintext.
-- Browser credentials are not persisted until a separate credential-storage
-  design is accepted. The persistence mechanism is currently unresolved.
-- Remote filenames are sanitized and cannot escape the selected destination.
-- Existing destination files are not overwritten without an explicit conflict
-  policy. Incomplete output does not replace a final file.
-- Manifest parsing and scheduling apply explicit resource limits once streaming
-  protocol work begins.
-- Native messaging and local IPC expose only the minimum required local
-  interface. Authentication and authorization details remain open until those
-  components are designed.
-- If an external program is introduced for finalization, arguments are passed
-  directly. Remote input is never interpolated into a shell command.
-- Supporting authenticated requests and standard encrypted streams does not
-  include circumventing DRM systems.
+* sensitive headers and credentials must not appear in logs or ordinary UI events
+* sensitive browser request context must not be persisted without an appropriate storage design
+* remote filenames must not escape the selected destination
+* partial output must not unexpectedly replace completed files
+* existing files must follow an explicit conflict policy
+* remote input must never be interpolated into shell commands
+* future browser and local IPC interfaces should expose only what they need
 
-These constraints apply as each component is implemented. Current protections
-include rejection of browser-originated jobs and explicitly sensitive headers
-by the SQLite adapter, plus restricted diagnostic fields. Network, filesystem
-finalization, and client-boundary protections remain requirements for future
-components.
+Supporting authenticated requests or encrypted media transport does not imply support for DRM circumvention.
 
-## Decisions
+See [SECURITY.md](../../SECURITY.md).
 
-- [ADR 0001: Use SQLite for durable job state](../adr/0001-sqlite-for-durable-job-state.md)
-- [ADR 0002: Keep the core independent of client frameworks](../adr/0002-framework-independent-core.md)
-- [ADR 0003: Implement native protocol engines over shared HTTP transport](../adr/0003-native-protocol-engines.md)
+## Architectural decisions
+
+Major decisions whose rationale should survive beyond the code are recorded in [`docs/adr/`](../adr/).
+
+Current ADRs cover:
+
+* SQLite for durable download state
+* keeping the core independent of client frameworks
+* native protocol engines over shared HTTP transport

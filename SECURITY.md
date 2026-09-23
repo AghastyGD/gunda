@@ -1,45 +1,37 @@
 # Security Policy
 
-## Project status
-
-Gunda has no released or supported version yet. The current repository is a
-bootstrap binary and does not implement downloads, browser integration, local
-IPC, or credential storage.
-
-Security reports about the repository and its dependencies are still welcome.
+Gunda is still under active development, but security reports are welcome.
 
 ## Reporting a vulnerability
 
-Do not include exploit details, credentials, private URLs, cookies, tokens, or
-other sensitive data in a public issue.
+Please don't report security vulnerabilities in a public issue.
 
-Use GitHub's
-[private vulnerability reporting form](https://github.com/AghastyGD/gunda/security/advisories/new)
-if it is available. If GitHub does not offer the form, open a public issue that
-asks the maintainer to establish private contact and contains no sensitive
-details.
+Use GitHub's [Security Advisory](https://github.com/AghastyGD/gunda/security/advisories/new) to report the problem privately.
 
-Include enough non-secret information to reproduce and assess the problem:
+Include whatever is useful to understand and reproduce the issue, such as:
 
-- the affected commit or version;
-- the affected component;
-- the expected and observed behavior;
-- reproduction steps or a minimal proof of concept;
-- the likely impact;
-- any known mitigation.
+- the affected component
+- reproduction steps
+- expected and observed behavior
+- possible impact
+- a minimal proof of concept, if appropriate
 
-The project does not currently promise a response or disclosure timeline. A
-timeline will be added when the maintainer can support one consistently.
+Please don't include credentials, cookies, tokens, private URLs, or other unrelated sensitive information.
+
+If the problem cannot be reported through GitHub Security Advisories, open a public issue asking for a private contact method without including details of the vulnerability.
 
 ## Scope
 
-Relevant reports include unsafe handling of network input, filenames or paths,
-credential disclosure, unintended file overwrite, manifest resource exhaustion,
-native messaging or local IPC exposure, and unsafe external process invocation.
+Security issues in Gunda may include things such as:
 
-Gunda will not implement DRM circumvention. Reports that require defeating
-Widevine, PlayReady, FairPlay, or another DRM system are outside the intended
-product boundary.
+- unsafe handling of remote filenames or paths
+- unintended file overwrite
+- sensitive request data being exposed or logged
+- unsafe handling of network input
+- browser or local IPC boundaries
+- unsafe external process execution
 
-The accepted trust boundaries and non-negotiable security constraints are
-documented in the [architecture overview](docs/architecture/overview.md#security-boundaries).
+Gunda does not aim to bypass DRM systems such as Widevine, PlayReady, or FairPlay.
+
+More details about the project's security boundaries are documented in
+[the architecture overview](docs/architecture/overview.md#security-boundaries).
