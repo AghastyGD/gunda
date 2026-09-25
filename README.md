@@ -2,7 +2,7 @@
 
 > download manager for the stubborn
 
-Gunda is a cross-platform download manager developed Linux-first, with a Rust engine and a Tauri + SvelteKit desktop interface.
+Gunda is a cross-platform download manager written in Rust and developed Linux-first.
 
 I'm building it around reliable downloads first, with browser integration and native support for streaming protocols such as HLS and DASH planned as the project grows.
 
