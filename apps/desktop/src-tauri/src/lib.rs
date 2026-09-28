@@ -2,7 +2,7 @@ mod downloads;
 
 use gunda_core::application::DownloadManager;
 use gunda_http::{HttpClient, HttpExecutor};
-use gunda_storage::SqliteDownloadRepository;
+use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
 use tauri::Manager;
 
 use std::path::PathBuf;
@@ -90,6 +90,8 @@ pub fn run() {
                 std::io::Error::other("Could not create the application data directory.")
             })?;
 
+            let runtime_lease = RuntimeLease::acquire(data_dir.join("gunda.runtime.lock"))?;
+
             let db_path = data_dir.join("gunda.sqlite3");
 
             let state = tauri::async_runtime::block_on(async {
@@ -112,6 +114,7 @@ pub fn run() {
                 })
             })?;
 
+            app.manage(runtime_lease);
             app.manage(state);
             Ok(())
         })
