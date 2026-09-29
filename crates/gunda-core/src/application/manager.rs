@@ -31,7 +31,9 @@ impl<R> DownloadManager<R>
 where
     R: DownloadRepository,
 {
-    /// Loads durable application state before accepting client operations.
+    /// Loads jobs and persists interrupted execution states before accepting commands.
+    ///
+    /// The caller must hold exclusive ownership of the runtime's data directory.
     #[tracing::instrument(name = "manager.start", skip_all)]
     pub async fn start(repository: R) -> Result<Self, RepositoryError> {
         let result = async {
@@ -48,9 +50,46 @@ where
                 }
             }
 
-            tracing::info!(jobs_loaded = jobs.len(), "download manager started");
+            let mut manager = Self { repository, jobs };
 
-            Ok(Self { repository, jobs })
+            let interrupted_jobs: Vec<_> = manager
+                .jobs
+                .values()
+                .filter(|job| job.state().requires_recovery_after_restart())
+                .cloned()
+                .collect();
+
+            let interrupted_count = interrupted_jobs.len();
+            let recovered_at = OffsetDateTime::now_utc();
+
+            for mut job in interrupted_jobs {
+                let previous = job.state();
+                let updated_at = recovered_at.max(job.updated_at());
+
+                job.transition_to(DownloadState::Interrupted, updated_at)
+                    .map_err(|_| {
+                        invalid_repository_data(
+                            "persisted execution state cannot become interrupted",
+                        )
+                    })?;
+
+                let persisted = manager.commit_job(job).await?;
+
+                tracing::info!(
+                    download_id = persisted.id().value(),
+                    previous = ?previous,
+                    current = ?DownloadState::Interrupted,
+                    "interrupted execution recorded",
+                );
+            }
+
+            tracing::info!(
+                jobs_loaded = manager.jobs.len(),
+                jobs_interrupted = interrupted_count,
+                "download manager started",
+            );
+
+            Ok(manager)
         }
         .await;
 
@@ -1105,9 +1144,11 @@ mod tests {
             .expect("download transition must succeed");
 
         let repository = FakeRepository::with_jobs(vec![active.clone()]);
-        let mut manager = DownloadManager::start(repository)
-            .await
-            .expect("manager must start");
+
+        let mut manager = DownloadManager {
+            repository,
+            jobs: std::collections::BTreeMap::from([(id, active.clone())]),
+        };
 
         assert!(matches!(
             manager.pause(id).await,
@@ -1779,6 +1820,133 @@ mod tests {
         assert_eq!(
             manager.job(id).expect("job must exist").state(),
             DownloadState::Completed,
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_persists_interrupted_execution_states() {
+        for state in [
+            DownloadState::Inspecting,
+            DownloadState::Downloading,
+            DownloadState::Finalizing,
+        ] {
+            let mut snapshot = job(1).snapshot();
+            snapshot.state = state;
+
+            let original = DownloadJob::restore(snapshot);
+            let id = original.id();
+
+            let repository = FakeRepository::with_jobs(vec![original.clone()]);
+            let manager = DownloadManager::start(repository)
+                .await
+                .expect("startup recovery must succeed");
+
+            let recovered = manager.job(id).expect("job must exist");
+
+            assert_eq!(recovered.state(), DownloadState::Interrupted);
+            assert!(recovered.updated_at() >= original.updated_at());
+
+            let mut expected = original.snapshot();
+            expected.state = DownloadState::Interrupted;
+            expected.updated_at = recovered.updated_at();
+
+            assert!(recovered.snapshot() == expected);
+
+            let persisted = manager
+                .repository
+                .find_by_id(id)
+                .await
+                .expect("lookup must succeed")
+                .expect("persisted job must exist");
+
+            assert!(persisted == *recovered);
+            assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1,);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_preserves_non_running_states_without_writes() {
+        for state in [
+            DownloadState::Queued,
+            DownloadState::Paused,
+            DownloadState::Completed,
+            DownloadState::Failed,
+            DownloadState::Cancelled,
+            DownloadState::Interrupted,
+        ] {
+            let mut snapshot = job(1).snapshot();
+            snapshot.state = state;
+
+            let original = DownloadJob::restore(snapshot);
+            let id = original.id();
+
+            let repository = FakeRepository::with_jobs(vec![original.clone()]);
+            let manager = DownloadManager::start(repository)
+                .await
+                .expect("manager must start");
+
+            assert!(manager.job(id) == Some(&original));
+            assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_persistence_failure_prevents_startup() {
+        let mut snapshot = job(1).snapshot();
+        snapshot.state = DownloadState::Downloading;
+
+        let mut repository = FakeRepository::with_jobs(vec![DownloadJob::restore(snapshot)]);
+        repository.fail_save = true;
+
+        let error = match DownloadManager::start(repository).await {
+            Ok(_) => panic!("failed recovery must prevent startup"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), RepositoryErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn repeated_startup_does_not_rewrite_interrupted_jobs() {
+        let mut snapshot = job(1).snapshot();
+        snapshot.state = DownloadState::Downloading;
+
+        let repository = FakeRepository::with_jobs(vec![DownloadJob::restore(snapshot)]);
+
+        let manager = DownloadManager::start(repository)
+            .await
+            .expect("first startup must succeed");
+
+        let expected: Vec<_> = manager.jobs().cloned().collect();
+        let repository = manager.into_repository();
+
+        assert_eq!(repository.save_calls.load(Ordering::Relaxed), 1);
+
+        let manager = DownloadManager::start(repository)
+            .await
+            .expect("second startup must succeed");
+
+        assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1,);
+    }
+
+    #[tokio::test]
+    async fn recovery_timestamp_does_not_move_backwards() {
+        let future = OffsetDateTime::now_utc() + time::Duration::days(1);
+        let mut snapshot = job(1).snapshot();
+        snapshot.state = DownloadState::Downloading;
+        snapshot.updated_at = future;
+
+        let original = DownloadJob::restore(snapshot);
+        let id = original.id();
+
+        let manager = DownloadManager::start(FakeRepository::with_jobs(vec![original]))
+            .await
+            .expect("startup must succeed");
+
+        assert_eq!(
+            manager.job(id).expect("job must exist").updated_at(),
+            future,
         );
     }
 }
