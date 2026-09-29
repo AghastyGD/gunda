@@ -5,6 +5,7 @@ mod error;
 mod executor;
 mod finalize;
 mod partial;
+mod recovery;
 
 pub use body::HttpBody;
 pub use client::{HttpClient, HttpInspection};
@@ -13,4 +14,8 @@ pub use executor::{HttpExecutor, HttpPreparedTransfer, HttpStagedTransfer};
 pub use finalize::{FinalizeError, FinalizeFailure, FinalizedDownload, finalize_download};
 pub use partial::{
     FileOperation, PartialDownload, PartialDownloadError, download_to_partial, partial_path,
+};
+pub use recovery::{
+    CheckpointComparison, HttpRecoveryInspection, LocalFileState, RecoveryInspectionError,
+    inspect_local_recovery,
 };
