@@ -239,7 +239,18 @@ async fn run_persistent_execution(reject_completed: bool) {
         .await
         .expect("manager must restart");
 
-    assert!(manager.job(id) == Some(&expected));
+    let restored = manager.job(id).expect("restored job must exist");
+
+    if reject_completed {
+        let mut recovered = expected.snapshot();
+        recovered.state = DownloadState::Interrupted;
+        recovered.updated_at = restored.updated_at();
+
+        assert!(restored.snapshot() == recovered);
+        assert!(restored.updated_at() >= expected.updated_at());
+    } else {
+        assert!(restored == &expected);
+    }
 
     assert_eq!(
         tokio::fs::read(&final_path)

@@ -6,7 +6,9 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use url::Url;
 
-pub async fn serve_once(response: &'static str) -> (Url, JoinHandle<String>) {
+pub async fn serve_once(response: &str) -> (Url, JoinHandle<String>) {
+    let response = response.to_owned();
+
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("local listener must bind");
