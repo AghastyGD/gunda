@@ -1,4 +1,6 @@
-use crate::HttpError;
+use bytes::Bytes;
+
+use crate::{HttpBody, HttpError, HttpInspection};
 
 /// Validated byte interval returned in a partial HTTP response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,42 @@ impl ContentRange {
     #[must_use]
     pub const fn body_length(&self) -> u64 {
         self.end - self.start + 1
+    }
+}
+
+/// Streams the remaining bytes of a validated HTTP range response.
+pub struct HttpRangeBody {
+    body: HttpBody,
+    range: ContentRange,
+}
+
+impl HttpRangeBody {
+    pub(crate) fn new(body: HttpBody, range: ContentRange) -> Self {
+        Self { body, range }
+    }
+
+    #[must_use]
+    pub const fn range(&self) -> ContentRange {
+        self.range
+    }
+
+    #[must_use]
+    pub fn metadata(&self) -> &HttpInspection {
+        self.body.metadata()
+    }
+
+    #[must_use]
+    pub fn received_bytes(&self) -> u64 {
+        self.body.received_bytes()
+    }
+
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.body.is_finished()
+    }
+
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpError> {
+        self.body.next_chunk().await
     }
 }
 

@@ -2,16 +2,17 @@ use std::time::Duration;
 
 use gunda_core::download::RequestContext;
 use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, HeaderName,
-    HeaderValue,
+    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
+    HeaderMap, HeaderName, HeaderValue, IF_RANGE, RANGE,
 };
 use reqwest::{Client, StatusCode};
 
 use crate::body::HttpBody;
 use crate::error::{HttpError, map_request_error};
+use crate::range::{ContentRange, HttpRangeBody};
 use crate::validator::StrongEntityTag;
 
-/// Metadata reported by a successful HTTP response.
+/// Response metadata and expected body length.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpInspection {
     content_length: Option<u64>,
@@ -101,6 +102,84 @@ impl HttpClient {
 
         Ok(HttpBody::new(response, metadata))
     }
+
+    /// Opens the remanining bytes of a representation using a strong validator.
+    pub async fn open_range(
+        &self,
+        request: &RequestContext,
+        start: u64,
+        total: u64,
+        validator: &StrongEntityTag,
+    ) -> Result<HttpRangeBody, HttpError> {
+        validate_url(request)?;
+
+        if start == 0 || start >= total {
+            return Err(HttpError::InvalidRequest);
+        }
+
+        let mut headers = request_headers(request)?;
+
+        let range_value = HeaderValue::from_str(&format!("bytes={start}-"))
+            .map_err(|_| HttpError::InvalidRequest)?;
+
+        let mut validator_value =
+            HeaderValue::from_bytes(validator.as_bytes()).map_err(|_| HttpError::InvalidRequest)?;
+
+        validator_value.set_sensitive(true);
+
+        headers.insert(RANGE, range_value);
+        headers.insert(IF_RANGE, validator_value);
+
+        let response = self
+            .client
+            .get(request.url().clone())
+            .headers(headers)
+            .send()
+            .await
+            .map_err(map_request_error)?;
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
+        }
+
+        let response_headers = response.headers();
+
+        let range = single_header(response_headers, CONTENT_RANGE)?
+            .ok_or(HttpError::InvalidMetadata)
+            .and_then(ContentRange::parse)?;
+
+        if range.start() != start || range.total() != total || range.end() != total - 1 {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        let mut metadata = inspect_headers(response_headers)?;
+
+        if metadata
+            .content_length
+            .is_some_and(|length| length != range.body_length())
+        {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        if metadata.content_type.as_deref().is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type
+                    .trim()
+                    .eq_ignore_ascii_case("multipart/byteranges")
+            })
+        }) {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        if response_headers.contains_key(ETAG) && metadata.strong_etag.as_ref() != Some(validator) {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        // Content-Range also establishes the expected length for chunked bodies.
+        metadata.content_length = Some(range.body_length());
+
+        Ok(HttpRangeBody::new(HttpBody::new(response, metadata), range))
+    }
 }
 
 fn inspect_response(response: &reqwest::Response) -> Result<HttpInspection, HttpError> {
@@ -110,11 +189,14 @@ fn inspect_response(response: &reqwest::Response) -> Result<HttpInspection, Http
 
     let headers = response.headers();
 
-    // Partial responses are not supported by this full-resource request path.
-    if headers.contains_key(reqwest::header::CONTENT_RANGE) {
+    if headers.contains_key(CONTENT_RANGE) {
         return Err(HttpError::InvalidMetadata);
     }
 
+    inspect_headers(headers)
+}
+
+fn inspect_headers(headers: &HeaderMap) -> Result<HttpInspection, HttpError> {
     if let Some(encoding) = single_header(headers, CONTENT_ENCODING)?
         && !encoding.trim().eq_ignore_ascii_case("identity")
     {
