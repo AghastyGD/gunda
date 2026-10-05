@@ -6,6 +6,7 @@ mod executor;
 mod finalize;
 mod partial;
 mod recovery;
+mod validator;
 
 pub use body::HttpBody;
 pub use client::{HttpClient, HttpInspection};
@@ -19,3 +20,4 @@ pub use recovery::{
     CheckpointComparison, HttpRecoveryInspection, LocalFileState, RecoveryInspectionError,
     inspect_local_recovery,
 };
+pub use validator::{InvalidStrongEntityTag, StrongEntityTag};

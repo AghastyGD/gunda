@@ -2,19 +2,21 @@ use std::time::Duration;
 
 use gunda_core::download::RequestContext;
 use reqwest::header::{
-    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderName,
+    ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, ETAG, HeaderMap, HeaderName,
     HeaderValue,
 };
 use reqwest::{Client, StatusCode};
 
 use crate::body::HttpBody;
 use crate::error::{HttpError, map_request_error};
+use crate::validator::StrongEntityTag;
 
 /// Metadata reported by a successful HTTP response.
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpInspection {
     content_length: Option<u64>,
     content_type: Option<String>,
+    strong_etag: Option<StrongEntityTag>,
 }
 
 impl HttpInspection {
@@ -26,6 +28,11 @@ impl HttpInspection {
     #[must_use]
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
+    }
+
+    #[must_use]
+    pub fn strong_etag(&self) -> Option<&StrongEntityTag> {
+        self.strong_etag.as_ref()
     }
 }
 
@@ -131,6 +138,7 @@ fn inspect_response(response: &reqwest::Response) -> Result<HttpInspection, Http
     Ok(HttpInspection {
         content_length,
         content_type,
+        strong_etag: response_strong_etag(headers),
     })
 }
 
@@ -209,4 +217,15 @@ fn single_header(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>, 
         .to_str()
         .map(Some)
         .map_err(|_| HttpError::InvalidMetadata)
+}
+
+fn response_strong_etag(headers: &HeaderMap) -> Option<StrongEntityTag> {
+    let mut values = headers.get_all(ETAG).iter();
+    let value = values.next()?;
+
+    if values.next().is_some() {
+        return None;
+    }
+
+    StrongEntityTag::parse(value.as_bytes()).ok()
 }

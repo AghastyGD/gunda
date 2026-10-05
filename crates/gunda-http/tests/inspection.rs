@@ -305,3 +305,111 @@ async fn unsolicited_partial_response_is_rejected() {
 
     server.await.expect("server task must succeed");
 }
+
+#[tokio::test]
+async fn head_preserves_a_strong_entity_tag() {
+    let (url, server) = serve_once(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: 5\r\n\
+         ETag: \"version-81\"\r\n\
+         Connection: close\r\n\
+         \r\n",
+    )
+    .await;
+
+    let client = HttpClient::new().expect("client must build");
+    let request = RequestContext::new(url, Vec::new());
+
+    let inspection = client
+        .inspect(&request)
+        .await
+        .expect("HEAD inspection must succeed");
+
+    assert_eq!(
+        inspection
+            .strong_etag()
+            .expect("strong tag must be present")
+            .as_bytes(),
+        b"\"version-81\"",
+    );
+
+    let received = server.await.expect("server task must succeed");
+    assert!(received.starts_with("HEAD /file.bin HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
+async fn get_preserves_its_entity_tag_and_body() {
+    let (url, server) = serve_once(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: 5\r\n\
+         ETag: \"version-81\"\r\n\
+         Connection: close\r\n\
+         \r\n\
+         hello",
+    )
+    .await;
+
+    let client = HttpClient::new().expect("client must build");
+    let request = RequestContext::new(url, Vec::new());
+
+    let mut body = client.open(&request).await.expect("GET must open");
+
+    assert_eq!(
+        body.metadata()
+            .strong_etag()
+            .expect("strong tag must be present")
+            .as_bytes(),
+        b"\"version-81\"",
+    );
+
+    let mut received = Vec::new();
+
+    while let Some(chunk) = body.next_chunk().await.expect("body must be readable") {
+        received.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(received, b"hello");
+    assert!(body.is_finished());
+
+    server.await.expect("server task must succeed");
+}
+
+#[tokio::test]
+async fn unusable_entity_tags_do_not_prevent_full_downloads() {
+    for headers in [
+        "",
+        "ETag: W/\"version-81\"\r\n",
+        "ETag: unquoted-value\r\n",
+        "ETag: \"one\"\r\nETag: \"two\"\r\n",
+        "ETag: \"one\", \"two\"\r\n",
+    ] {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: 5\r\n\
+             {headers}\
+             Connection: close\r\n\
+             \r\n\
+             hello"
+        );
+
+        let (url, server) = serve_once(&response).await;
+
+        let client = HttpClient::new().expect("client must build");
+        let request = RequestContext::new(url, Vec::new());
+
+        let mut body = client.open(&request).await.expect("GET must open");
+
+        assert!(body.metadata().strong_etag().is_none());
+
+        let mut received = Vec::new();
+
+        while let Some(chunk) = body.next_chunk().await.expect("body must be readable") {
+            received.extend_from_slice(&chunk);
+        }
+
+        assert_eq!(received, b"hello");
+        assert!(body.is_finished());
+
+        server.await.expect("server task must succeed");
+    }
+}
