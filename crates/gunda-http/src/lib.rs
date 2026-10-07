@@ -7,6 +7,7 @@ mod finalize;
 mod partial;
 mod range;
 mod recovery;
+mod resume_state;
 mod validator;
 
 pub use body::HttpBody;
@@ -22,4 +23,5 @@ pub use recovery::{
     CheckpointComparison, HttpRecoveryInspection, LocalFileState, RecoveryInspectionError,
     inspect_local_recovery,
 };
+pub use resume_state::{HttpResumeState, HttpResumeStore, InvalidHttpResumeState};
 pub use validator::{InvalidStrongEntityTag, StrongEntityTag};
