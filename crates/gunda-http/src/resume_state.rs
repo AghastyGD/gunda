@@ -71,7 +71,7 @@ pub trait HttpResumeStore: Send + Sync {
     fn find(
         &self,
         id: DownloadId,
-    ) -> impl Future<Output = Result<HttpResumeState, RepositoryError>> + Send;
+    ) -> impl Future<Output = Result<Option<HttpResumeState>, RepositoryError>> + Send;
 
     /// Advances a checkpoint after the caller synchronizes the partial file.
     fn save_checkpoint(

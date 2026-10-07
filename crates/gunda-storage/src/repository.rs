@@ -78,6 +78,11 @@ impl SqliteDownloadRepository {
         self.pool.close().await;
         tracing::debug!("download database closed");
     }
+
+    #[must_use]
+    pub fn http_resume_store(&self) -> crate::SqliteHttpResumeStore {
+        crate::SqliteHttpResumeStore::new(self.pool.clone())
+    }
 }
 
 impl DownloadRepository for SqliteDownloadRepository {
