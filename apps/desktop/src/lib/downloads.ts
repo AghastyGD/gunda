@@ -70,6 +70,10 @@ export function formatBytes(value: string): string {
 }
 
 export function percentage(job: DownloadView): number | null {
+  if (job.state === "completed") {
+    return 100;
+  }
+
   if (job.total_bytes === null) {
     return null;
   }
@@ -79,17 +83,29 @@ export function percentage(job: DownloadView): number | null {
     return null;
   }
 
-  if (job.state === "completed") {
-    return 100;
-  }
-
   const written = BigInt(job.written_bytes);
   const tenths = (written * 1000n) / total;
   return Number(tenths > 1000n ? 1000n : tenths) / 10;
 }
 
+export function totalBytes(job: DownloadView): string | null {
+  return job.total_bytes ?? (job.state === "completed" ? job.written_bytes : null);
+}
+
 export function stateLabel(state: DownloadState): string {
-  return state.charAt(0).toUpperCase() + state.slice(1);
+  const labels: Record<DownloadState, string> = {
+    queued: "Waiting",
+    inspecting: "Preparing",
+    downloading: "Downloading",
+    paused: "Paused",
+    finalizing: "Finishing",
+    completed: "Completed",
+    failed: "Failed",
+    cancelled: "Cancelled",
+    interrupted: "Interrupted",
+  };
+
+  return labels[state];
 }
 
 export function formatAddedTime(value: string): string {

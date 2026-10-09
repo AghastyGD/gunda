@@ -9,6 +9,7 @@
     formatBytes,
     percentage,
     stateLabel,
+    totalBytes,
     type DownloadFilter,
     type DownloadUpdate,
     type DownloadView,
@@ -42,13 +43,20 @@
   let error = $state("");
   let message = $state("");
   let dialogError = $state("");
+  let transferError = $state("");
+  let transferNotice = $state("");
+  let transferId = $state<string | null>(null);
 
   let addButton: HTMLButtonElement;
   let addDialog: HTMLDialogElement;
   let urlInput: HTMLInputElement;
+  let transferDialog: HTMLDialogElement;
 
   const busy = $derived(submitting || choosing);
   const selected = $derived(downloads.find((job) => job.id === selectedId) ?? null);
+  const transfer = $derived(downloads.find((job) => job.id === transferId) ?? null);
+  const transferPercent = $derived(transfer ? percentage(transfer) : null);
+  const transferRunning = $derived(transfer !== null && transfer.id === activeId);
   const visibleDownloads = $derived(downloads.filter((job) => matchesFilter(job, filter)));
   const activeCount = $derived(downloads.filter(isActive).length);
 
@@ -82,7 +90,7 @@
     }
 
     if (["inspecting", "downloading", "finalizing"].includes(job.state)) {
-      return "Needs recovery";
+      return "Interrupted";
     }
 
     return stateLabel(job.state);
@@ -91,6 +99,14 @@
   function clearFeedback() {
     error = "";
     message = "";
+  }
+
+  function completionNotice(result: ExecutionResponse): string {
+    if (result.job.state === "cancelled") {
+      return "Download cancelled.";
+    }
+
+    return result.notice ?? "";
   }
 
   function upsertDownload(job: DownloadView) {
@@ -127,6 +143,29 @@
 
   function returnAddFocus() {
     addButton?.focus();
+  }
+
+  function returnTransferFocus() {
+    if (transferId) {
+      document.querySelector<HTMLElement>(`[data-download-id="${transferId}"]`)?.focus();
+    }
+  }
+
+  function openTransferDialog(id: string) {
+    transferId = id;
+    transferError = "";
+    transferNotice = "";
+    requestAnimationFrame(() => {
+      if (!transferDialog.open) {
+        transferDialog.showModal();
+      }
+    });
+  }
+
+  function hideTransferDialog() {
+    if (transferDialog.open) {
+      transferDialog.close();
+    }
   }
 
   async function loadDownloads() {
@@ -166,6 +205,7 @@
         activeId = update.job.id;
         selectedId = update.job.id;
         upsertDownload(update.job);
+        openTransferDialog(update.job.id);
         if (addDialog.open) {
           addDialog.close();
         }
@@ -207,14 +247,16 @@
     try {
       const result = await invoke<ExecutionResponse>("start_download", { url, updates });
       upsertDownload(result.job);
-      message = result.notice ?? "";
+      message = completionNotice(result);
+      transferNotice = completionNotice(result);
       url = "";
     } catch (cause) {
-      const text = errorMessage(cause, "Could not execute the download.");
+      const text = errorMessage(cause, "Couldn't start the download.");
       if (addDialog.open) {
         dialogError = text;
       } else {
         error = text;
+        transferError = text;
       }
     } finally {
       submitting = false;
@@ -237,7 +279,8 @@
         cancellationRequested = requested;
       }
     } catch (cause) {
-      error = errorMessage(cause, "Could not request cancellation.");
+      error = errorMessage(cause, "Could not cancel the download.");
+      transferError = error;
     } finally {
       cancelling = false;
     }
@@ -258,9 +301,11 @@
         updates,
       });
       upsertDownload(result.job);
-      message = result.notice ?? "";
+      message = completionNotice(result);
+      transferNotice = completionNotice(result);
     } catch (cause) {
-      error = errorMessage(cause, "Could not resume the download.");
+      error = errorMessage(cause, "Couldn't resume the download.");
+      transferError = error;
     } finally {
       submitting = false;
       activeId = null;
@@ -372,9 +417,11 @@
               <tbody>
                 {#each visibleDownloads as job (job.id)}
                   {@const percent = percentage(job)}
+                  {@const total = totalBytes(job)}
                   <tr
                     class:selected={selectedId === job.id}
                     class:completed={job.state === "completed"}
+                    data-download-id={job.id}
                     tabindex="0"
                     aria-selected={selectedId === job.id}
                     onclick={() => selectDownload(job.id)}
@@ -387,15 +434,13 @@
                     <td><span class={`status status-${job.id === activeId ? "active" : job.state}`}><span></span>{statusLabel(job)}</span></td>
                     <td class="progress-cell">
                       <div class="size-line">
-                        <span>{formatBytes(job.written_bytes)}{job.total_bytes ? ` / ${formatBytes(job.total_bytes)}` : " / Unknown"}</span>
+                        <span>{#if total}{formatBytes(job.written_bytes)} / {formatBytes(total)}{:else}{formatBytes(job.written_bytes)} downloaded{/if}</span>
                         {#if percent !== null}<span>{percent.toFixed(1)}%</span>{/if}
                       </div>
                       {#if percent !== null}
                         <div class="progress-track" role="progressbar" aria-label={`Progress for ${job.name}`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent}>
                           <span style={`width: ${percent}%`}></span>
                         </div>
-                      {:else if job.id === activeId}
-                        <div class="progress-track indeterminate" role="progressbar" aria-label={`Progress for ${job.name}; total size unknown`}><span></span></div>
                       {/if}
                     </td>
                     <td class="source-cell" title={job.source}>{job.source}</td>
@@ -410,6 +455,7 @@
 
       {#if selected && inspectorVisible}
         {@const selectedPercent = percentage(selected)}
+        {@const selectedTotal = totalBytes(selected)}
         <aside class="inspector" aria-labelledby="inspector-heading">
           <header class="inspector-header">
             <div>
@@ -422,7 +468,7 @@
           <div class="inspector-body">
             <div class="inspector-summary">
               <span class={`status status-${selected.id === activeId ? "active" : selected.state}`}><span></span>{statusLabel(selected)}</span>
-              <span>{formatBytes(selected.written_bytes)}{selected.total_bytes ? ` of ${formatBytes(selected.total_bytes)}` : " downloaded"}</span>
+              <span>{#if selectedTotal}{formatBytes(selected.written_bytes)} of {formatBytes(selectedTotal)}{:else}{formatBytes(selected.written_bytes)} downloaded{/if}</span>
               {#if selectedPercent !== null}<span>{selectedPercent.toFixed(1)}%</span>{/if}
             </div>
 
@@ -443,7 +489,7 @@
 
             {#if selected.error}
               <div class="failure-details" role="alert">
-                <strong>Failure information</strong>
+                <strong>Why it stopped</strong>
                 <p>{selected.error}</p>
               </div>
             {/if}
@@ -487,4 +533,58 @@
       <button type="submit" class="button primary" disabled={busy}>{submitting ? "Starting…" : "Download"}</button>
     </footer>
   </form>
+</dialog>
+
+<dialog
+  bind:this={transferDialog}
+  class="download-dialog transfer-dialog"
+  aria-labelledby="transfer-heading"
+  onclose={returnTransferFocus}
+  oncancel={() => {}}
+>
+  {#if transfer}
+    {@const transferTotal = totalBytes(transfer)}
+    <header class="dialog-header">
+      <div class="transfer-title">
+        <h2 id="transfer-heading">{transferRunning ? "Downloading" : stateLabel(transfer.state)}</h2>
+        <span title={transfer.name}>{transfer.name}</span>
+      </div>
+      <button type="button" class="icon-button" aria-label="Hide transfer window" onclick={hideTransferDialog}><Icon name="close" /></button>
+    </header>
+
+    <div class="transfer-dialog-body">
+      <div class="transfer-metrics">
+        <span>{#if transferTotal}{formatBytes(transfer.written_bytes)} of {formatBytes(transferTotal)}{:else}{formatBytes(transfer.written_bytes)} downloaded{/if}</span>
+        {#if transferPercent !== null}<strong>{transferPercent.toFixed(1)}%</strong>{/if}
+      </div>
+      {#if transferPercent !== null}
+        <div class="progress-track large" role="progressbar" aria-label={`Progress for ${transfer.name}`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={transferPercent}>
+          <span style={`width: ${transferPercent}%`}></span>
+        </div>
+      {:else if transferRunning}
+        <p class="unknown-progress" role="status">The total size will be shown when the download finishes.</p>
+      {/if}
+
+      {#if transferError}
+        <div class="failure-details" role="alert"><strong>Could not continue</strong><p>{transferError}</p></div>
+      {:else if transfer.error}
+        <div class="failure-details" role="alert"><strong>Download failed</strong><p>{transfer.error}</p></div>
+      {:else if transferNotice}
+        <p class="transfer-notice" role="status">{transferNotice}</p>
+      {:else if !transferRunning}
+        <p class="transfer-notice" role="status">{stateLabel(transfer.state)}.</p>
+      {/if}
+    </div>
+
+    <footer class="dialog-footer">
+      {#if transferRunning}
+        <button type="button" class="button secondary" onclick={hideTransferDialog}>Hide</button>
+        <button type="button" class="button primary danger-button" onclick={cancelDownload} disabled={cancelling || cancellationRequested}>
+          {cancellationRequested || cancelling ? "Cancelling…" : "Cancel download"}
+        </button>
+      {:else}
+        <button type="button" class="button primary" onclick={hideTransferDialog}>Done</button>
+      {/if}
+    </footer>
+  {/if}
 </dialog>

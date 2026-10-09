@@ -305,7 +305,6 @@ tr:focus-visible {
 .size-line span:last-child { color: var(--text-muted); }
 .progress-track { width: 100%; height: 5px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 2px; background: var(--input); }
 .progress-track > span { display: block; height: 100%; background: var(--accent); }
-.progress-track.indeterminate > span { width: 38%; background: var(--accent); }
 .progress-track.large { height: 7px; }
 
 .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; min-height: 150px; padding: 24px; color: var(--text-muted); text-align: center; }
@@ -350,6 +349,18 @@ input[readonly] { color: var(--text-secondary); }
 .dialog-feedback p { margin: 0; font-size: 12px; }
 .error { color: var(--danger); }
 .dialog-footer { display: flex; justify-content: flex-end; gap: 7px; padding: 10px 15px; border-top: 1px solid var(--border); background: var(--surface-subtle); }
+.transfer-dialog { width: min(480px, calc(100vw - 32px)); }
+.transfer-title { min-width: 0; }
+.transfer-title span { display: block; max-width: 390px; margin-top: 4px; overflow: hidden; color: var(--text-secondary); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-dialog-body { padding: 16px 15px 13px; }
+.transfer-metrics { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; color: var(--text-secondary); font-size: 12px; font-variant-numeric: tabular-nums; }
+.transfer-metrics strong { color: var(--text); font-size: 13px; }
+.transfer-dialog .progress-track { height: 10px; border-radius: 2px; }
+.transfer-dialog .progress-track > span { background: var(--accent); }
+.transfer-notice { margin: 12px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.4; }
+.unknown-progress { margin: 10px 0 0; color: var(--text-muted); font-size: 11px; }
+.danger-button { border-color: var(--danger) !important; background: var(--danger) !important; color: #fff !important; }
+.danger-button:hover:not(:disabled) { filter: brightness(.92); }
 
 .button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 33px; padding: 6px 12px; border: 1px solid transparent; border-radius: 4px; cursor: pointer; font-size: 12px; font-weight: 600; }
 .button.secondary { border-color: var(--border-strong); background: var(--surface); color: var(--text-secondary); }

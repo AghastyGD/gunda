@@ -2,8 +2,8 @@ use std::sync::Mutex;
 
 use gunda_core::application::{DownloadCancellation, DownloadEvent, DownloadManagerError};
 use gunda_core::download::{
-    DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
-    FileConflictPolicy, NewDownload, RequestContext,
+    DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
+    FailureKind, FileConflictPolicy, NewDownload, RequestContext,
 };
 use serde::Serialize;
 use tauri::State;
@@ -62,9 +62,11 @@ impl DownloadView {
             None
         };
 
-        let error = job
-            .last_failure()
-            .map(|failure| failure.message().to_owned());
+        let error = if job.state() == DownloadState::Failed {
+            job.last_failure().map(friendly_failure).map(str::to_owned)
+        } else {
+            None
+        };
         let added_via = match job.origin() {
             DownloadOrigin::Desktop => "Desktop",
             DownloadOrigin::Cli => "CLI",
@@ -91,6 +93,21 @@ impl DownloadView {
                 DownloadState::Paused | DownloadState::Interrupted
             ),
         }
+    }
+}
+
+fn friendly_failure(failure: &DownloadFailure) -> &'static str {
+    match failure.kind() {
+        FailureKind::Network => "Connection problem. Check your internet connection and try again.",
+        FailureKind::Authentication => "The server requires authorization for this download.",
+        FailureKind::RemoteRejected => "The server refused the download.",
+        FailureKind::InvalidResponse => "The server returned an unexpected response.",
+        FailureKind::UnsupportedResource => "This type of download is not supported.",
+        FailureKind::PermissionDenied => "Gunda cannot save the file in this location.",
+        FailureKind::DiskFull => "There is not enough space to save this file.",
+        FailureKind::Integrity => "The downloaded file could not be verified.",
+        FailureKind::Storage => "Gunda could not save the downloaded file.",
+        FailureKind::Internal => "The download stopped unexpectedly.",
     }
 }
 
@@ -195,7 +212,7 @@ async fn execute_download(
         let mut active = state
             .active
             .lock()
-            .map_err(|_| "Could not register the active download.".to_owned())?;
+            .map_err(|_| "Couldn't start the download.".to_owned())?;
 
         *active = Some(ActiveDownload {
             id,
@@ -244,12 +261,12 @@ async fn execute_download(
     let mut view = manager
         .job(id)
         .map(DownloadView::from_job)
-        .ok_or_else(|| "The executed download is unavailable.".to_owned())?;
+        .ok_or_else(|| "This download is no longer available.".to_owned())?;
 
     let notice = match result {
         Ok(report) => {
             if report.cleanup_pending {
-                Some("The file was saved, but its staging link could not be removed.".to_owned())
+                Some("Download completed.".to_owned())
             } else if matches!(
                 report.event,
                 DownloadEvent::StateChanged {
@@ -257,7 +274,7 @@ async fn execute_download(
                     ..
                 }
             ) {
-                Some("Download cancelled. Any existing partial file was kept.".to_owned())
+                Some("Download cancelled.".to_owned())
             } else {
                 None
             }
@@ -267,13 +284,13 @@ async fn execute_download(
             view.output_path = Some(destination.final_path().to_string_lossy().into_owned());
 
             Some(
-                "The file was saved, but completion could not be recorded. \
-                Check the output before starting another download."
+                "The file was saved, but its status may be out of date. \
+                Check the destination before trying again."
                     .to_owned(),
             )
         }
 
-        Err(error) => Some(error.to_string()),
+        Err(_) => Some("The download could not be completed. Try again.".to_owned()),
     };
 
     Ok(ExecutionResponse { job: view, notice })
@@ -286,7 +303,7 @@ pub(crate) fn cancel_download(id: String, state: State<'_, DesktopState>) -> Res
     let active = state
         .active
         .lock()
-        .map_err(|_| "Could not access the active download.".to_owned())?;
+        .map_err(|_| "Could not cancel the download.".to_owned())?;
 
     let Some(active) = active.as_ref().filter(|active| active.id == id) else {
         return Ok(false);
@@ -306,7 +323,18 @@ fn parse_download_id(value: &str) -> Result<DownloadId, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::source_label;
+    use super::{friendly_failure, source_label};
+    use gunda_core::download::{DownloadFailure, FailureKind};
+
+    #[test]
+    fn failure_message_uses_plain_user_language() {
+        let failure = DownloadFailure::new(FailureKind::Network, "HTTP transport failed", true);
+
+        assert_eq!(
+            friendly_failure(&failure),
+            "Connection problem. Check your internet connection and try again."
+        );
+    }
 
     #[test]
     fn source_label_omits_sensitive_url_details() {
