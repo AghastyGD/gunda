@@ -37,8 +37,13 @@ pub(crate) struct DownloadView {
     state: String,
     written_bytes: String,
     total_bytes: Option<String>,
+    source: String,
+    added_via: String,
+    created_at: String,
+    content_type: Option<String>,
     output_path: Option<String>,
     error: Option<String>,
+    can_resume: bool,
 }
 
 impl DownloadView {
@@ -57,21 +62,40 @@ impl DownloadView {
             None
         };
 
+        let error = job
+            .last_failure()
+            .map(|failure| failure.message().to_owned());
+        let added_via = match job.origin() {
+            DownloadOrigin::Desktop => "Desktop",
+            DownloadOrigin::Cli => "CLI",
+            DownloadOrigin::Browser { .. } => "Browser",
+        };
+
         Self {
             id: job.id().value().to_string(),
             name,
             state: format!("{:?}", job.state()).to_ascii_lowercase(),
             written_bytes: job.progress().downloaded_bytes().to_string(),
             total_bytes: job.progress().total_bytes().map(|total| total.to_string()),
+            source: source_label(job.request().url()),
+            added_via: added_via.to_owned(),
+            created_at: job.created_at().unix_timestamp().to_string(),
+            content_type: job
+                .resource()
+                .and_then(|resource| resource.content_type())
+                .map(str::to_owned),
             output_path,
-            error: if job.state() == DownloadState::Failed {
-                job.last_failure()
-                    .map(|failure| format!("Download failed ({:?}).", failure.kind()))
-            } else {
-                None
-            },
+            error,
+            can_resume: matches!(
+                job.state(),
+                DownloadState::Paused | DownloadState::Interrupted
+            ),
         }
     }
+}
+
+fn source_label(url: &url::Url) -> String {
+    url.origin().ascii_serialization()
 }
 
 #[derive(Serialize)]
@@ -278,4 +302,19 @@ fn parse_download_id(value: &str) -> Result<DownloadId, String> {
         .map_err(|_| "Invalid download ID.".to_owned())?;
 
     DownloadId::new(value).map_err(|_| "Invalid download ID.".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_label;
+
+    #[test]
+    fn source_label_omits_sensitive_url_details() {
+        let url = url::Url::parse(
+            "https://user:password@downloads.example.test/private/file.zip?token=secret",
+        )
+        .expect("test URL must be valid");
+
+        assert_eq!(source_label(&url), "https://downloads.example.test");
+    }
 }

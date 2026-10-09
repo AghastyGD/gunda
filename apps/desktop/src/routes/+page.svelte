@@ -2,17 +2,35 @@
   import { onMount } from "svelte";
   import { Channel, invoke } from "@tauri-apps/api/core";
 
+  import Icon from "$lib/Icon.svelte";
+  import ThemeControl from "$lib/ThemeControl.svelte";
   import {
+    formatAddedTime,
     formatBytes,
     percentage,
+    stateLabel,
+    type DownloadFilter,
     type DownloadUpdate,
     type DownloadView,
     type ExecutionResponse,
   } from "$lib/downloads";
 
+  const filters: Array<{
+    id: DownloadFilter;
+    label: string;
+    icon: "all" | "incomplete" | "completed";
+  }> = [
+    { id: "all", label: "All downloads", icon: "all" },
+    { id: "incomplete", label: "Incomplete", icon: "incomplete" },
+    { id: "completed", label: "Completed", icon: "completed" },
+  ];
+
   let url = $state("");
   let directory = $state("");
   let downloads = $state<DownloadView[]>([]);
+  let filter = $state<DownloadFilter>("all");
+  let selectedId = $state<string | null>(null);
+  let inspectorVisible = $state(true);
 
   let loading = $state(true);
   let submitting = $state(false);
@@ -23,8 +41,16 @@
   let activeId = $state<string | null>(null);
   let error = $state("");
   let message = $state("");
+  let dialogError = $state("");
 
-  const busy = $derived(loading || submitting || choosing);
+  let addButton: HTMLButtonElement;
+  let addDialog: HTMLDialogElement;
+  let urlInput: HTMLInputElement;
+
+  const busy = $derived(submitting || choosing);
+  const selected = $derived(downloads.find((job) => job.id === selectedId) ?? null);
+  const visibleDownloads = $derived(downloads.filter((job) => matchesFilter(job, filter)));
+  const activeCount = $derived(downloads.filter(isActive).length);
 
   onMount(() => {
     void loadDownloads();
@@ -34,6 +60,34 @@
     return typeof cause === "string" ? cause : fallback;
   }
 
+  function isActive(job: DownloadView): boolean {
+    return job.id === activeId || ["inspecting", "downloading", "finalizing"].includes(job.state);
+  }
+
+  function matchesFilter(job: DownloadView, value: DownloadFilter): boolean {
+    return value === "all" || (value === "incomplete" ? job.state !== "completed" : job.state === value);
+  }
+
+  function countFor(value: DownloadFilter): number {
+    return value === "all"
+      ? downloads.length
+      : value === "incomplete"
+        ? downloads.filter((job) => job.state !== "completed").length
+        : downloads.filter((job) => job.state === value).length;
+  }
+
+  function statusLabel(job: DownloadView): string {
+    if (job.id === activeId) {
+      return cancellationRequested ? "Cancelling" : "Downloading";
+    }
+
+    if (["inspecting", "downloading", "finalizing"].includes(job.state)) {
+      return "Needs recovery";
+    }
+
+    return stateLabel(job.state);
+  }
+
   function clearFeedback() {
     error = "";
     message = "";
@@ -41,15 +95,44 @@
 
   function upsertDownload(job: DownloadView) {
     const exists = downloads.some((current) => current.id === job.id);
-
     downloads = exists
       ? downloads.map((current) => current.id === job.id ? job : current)
       : [job, ...downloads];
   }
 
+  function selectDownload(id: string) {
+    selectedId = id;
+    inspectorVisible = true;
+  }
+
+  function inspectFromKeyboard(event: KeyboardEvent, id: string) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      selectDownload(id);
+    }
+  }
+
+  function openAddDialog() {
+    clearFeedback();
+    dialogError = "";
+    addDialog.showModal();
+    requestAnimationFrame(() => urlInput.focus());
+  }
+
+  function closeAddDialog() {
+    if (!submitting) {
+      addDialog.close();
+    }
+  }
+
+  function returnAddFocus() {
+    addButton?.focus();
+  }
+
   async function loadDownloads() {
     try {
       downloads = await invoke<DownloadView[]>("list_downloads");
+      selectedId = downloads[0]?.id ?? null;
     } catch (cause) {
       error = errorMessage(cause, "Could not load saved downloads.");
     } finally {
@@ -60,78 +143,80 @@
   async function chooseDirectory() {
     if (busy) return;
 
-    clearFeedback();
+    dialogError = "";
     choosing = true;
 
     try {
-      const selected = await invoke<string | null>("choose_directory");
-
-      if (selected !== null) {
-        directory = selected;
+      const selectedDirectory = await invoke<string | null>("choose_directory");
+      if (selectedDirectory !== null) {
+        directory = selectedDirectory;
       }
     } catch (cause) {
-      error = errorMessage(cause, "Could not choose the destination folder.");
+      dialogError = errorMessage(cause, "Could not choose the destination folder.");
     } finally {
       choosing = false;
     }
   }
 
-  async function startDownload(event: SubmitEvent) {
-    event.preventDefault();
-
-    if (busy) return;
-
-    clearFeedback();
-
-    if (!url.trim()) {
-      error = "Enter a file URL.";
-      return;
-    }
-
-    if (!directory) {
-      error = "Choose where the file should be saved.";
-      return;
-    }
-
-    submitting = true;
-    cancellationRequested = false;
-
-    let acceptingUpdates = true;
+  function createUpdatesChannel(): Channel<DownloadUpdate> {
     const updates = new Channel<DownloadUpdate>();
 
     updates.onmessage = (update) => {
-      if (!acceptingUpdates) return;
-
       if (update.type === "started") {
         activeId = update.job.id;
+        selectedId = update.job.id;
         upsertDownload(update.job);
+        if (addDialog.open) {
+          addDialog.close();
+        }
         return;
       }
 
       downloads = downloads.map((job) =>
         job.id === update.id
-          ? {
-              ...job,
-              written_bytes: update.written_bytes,
-              total_bytes: update.total_bytes,
-            }
+          ? { ...job, written_bytes: update.written_bytes, total_bytes: update.total_bytes }
           : job,
       );
     };
 
-    try {
-      const result = await invoke<ExecutionResponse>("start_download", {
-        url,
-        updates,
-      });
+    return updates;
+  }
 
-      acceptingUpdates = false;
+  async function startDownload(event: SubmitEvent) {
+    event.preventDefault();
+    if (busy) return;
+
+    clearFeedback();
+    dialogError = "";
+
+    if (!url.trim()) {
+      dialogError = "Enter a file URL.";
+      urlInput.focus();
+      return;
+    }
+
+    if (!directory) {
+      dialogError = "Choose where the file should be saved.";
+      return;
+    }
+
+    submitting = true;
+    cancellationRequested = false;
+    const updates = createUpdatesChannel();
+
+    try {
+      const result = await invoke<ExecutionResponse>("start_download", { url, updates });
       upsertDownload(result.job);
       message = result.notice ?? "";
+      url = "";
     } catch (cause) {
-      error = errorMessage(cause, "Could not execute the download.");
+      const text = errorMessage(cause, "Could not execute the download.");
+      if (addDialog.open) {
+        dialogError = text;
+      } else {
+        error = text;
+      }
     } finally {
-      acceptingUpdates = false;
       submitting = false;
       activeId = null;
       cancelling = false;
@@ -141,14 +226,13 @@
 
   async function cancelDownload() {
     const id = activeId;
-
     if (id === null || cancelling || cancellationRequested) return;
 
+    clearFeedback();
     cancelling = true;
 
     try {
       const requested = await invoke<boolean>("cancel_download", { id });
-
       if (activeId === id) {
         cancellationRequested = requested;
       }
@@ -159,66 +243,30 @@
     }
   }
 
-  async function resumeDownload(id: string) {
-    if (busy) return;
+  async function resumeSelected() {
+    const job = selected;
+    if (job === null || !job.can_resume || busy) return;
 
     clearFeedback();
     submitting = true;
     cancellationRequested = false;
-
-    let acceptingUpdates = true;
-    const updates = new Channel<DownloadUpdate>();
-
-    updates.onmessage = (update) => {
-      if (!acceptingUpdates) return;
-
-      if (update.type === "started") {
-        activeId = update.job.id;
-        upsertDownload(update.job);
-        return;
-      }
-
-      downloads = downloads.map((job) =>
-        job.id === update.id
-          ? {
-              ...job,
-              written_bytes: update.written_bytes,
-              total_bytes: update.total_bytes,
-            }
-          : job,
-      );
-    };
+    const updates = createUpdatesChannel();
 
     try {
       const result = await invoke<ExecutionResponse>("resume_download", {
-        id,
+        id: job.id,
         updates,
       });
-
-      acceptingUpdates = false;
       upsertDownload(result.job);
       message = result.notice ?? "";
     } catch (cause) {
       error = errorMessage(cause, "Could not resume the download.");
     } finally {
-      acceptingUpdates = false;
       submitting = false;
       activeId = null;
       cancelling = false;
       cancellationRequested = false;
     }
-  }
-
-  function statusLabel(job: DownloadView): string {
-    if (job.id === activeId) {
-      return cancellationRequested ? "Cancelling…" : "Running";
-    }
-
-    if (["inspecting", "downloading", "finalizing"].includes(job.state)) {
-      return "Needs recovery";
-    }
-
-    return job.state.charAt(0).toUpperCase() + job.state.slice(1);
   }
 </script>
 
@@ -226,157 +274,217 @@
   <title>Downloads — Gunda</title>
 </svelte:head>
 
-<div class="downloads-page">
-  <header class="page-header">
-    <h1>Downloads</h1>
-  </header>
+<div class="app-shell">
+  <aside class="sidebar" aria-label="Download filters">
+    <div class="sidebar-cap" aria-hidden="true"></div>
 
-  <section class="new-download" aria-labelledby="new-download-heading">
-    <div class="section-heading">
-      <h2 id="new-download-heading">New download</h2>
+    <nav class="filter-list" aria-label="Filter downloads">
+      {#each filters as item}
+        <button
+          type="button"
+          class:current={filter === item.id}
+          aria-pressed={filter === item.id}
+          onclick={() => filter = item.id}
+        >
+          <Icon name={item.icon} size={15} />
+          <span>{item.label}</span>
+          <span class="filter-count">{countFor(item.id)}</span>
+        </button>
+      {/each}
+    </nav>
+
+    <div class="sidebar-footer">
+      <ThemeControl />
     </div>
+  </aside>
 
-    <form onsubmit={startDownload}>
-      <div class="field">
-        <label for="download-url">URL</label>
-
-        <input
-          id="download-url"
-          type="text"
-          inputmode="url"
-          autocomplete="off"
-          spellcheck="false"
-          placeholder="https://example.com/file.zip"
-          bind:value={url}
-          oninput={clearFeedback}
-          disabled={busy}
-        />
-      </div>
-
-      <div class="field">
-        <label for="download-directory">Destination</label>
-
-        <div class="directory-row">
-          <input
-            id="download-directory"
-            type="text"
-            value={directory}
-            placeholder="Choose a folder"
-            readonly
-          />
-
-          <button
-            type="button"
-            class="button secondary"
-            onclick={chooseDirectory}
-            disabled={busy}
-          >
-          {choosing ? "Opening…" : "Browse"}
-          </button>
-        </div>
-      </div>
-
-      <div class="form-footer">
-        <div class="feedback" aria-live="polite">
-          {#if error}
-            <p class="error">{error}</p>
-          {:else if message}
-            <p class="success">{message}</p>
-          {/if}
-        </div>
-
-        <button class="button primary" type="submit" disabled={busy}>
-          {submitting ? "Downloading…" : "Download"}
+  <main class="workspace">
+    <header class="toolbar" aria-label="Download actions">
+      <div class="toolbar-primary">
+        <button bind:this={addButton} type="button" class="toolbar-button accent" onclick={openAddDialog} disabled={busy}>
+          <Icon name="add" />
+          <span>Add download</span>
+        </button>
+        <span class="toolbar-divider"></span>
+        <button type="button" class="toolbar-button" onclick={resumeSelected} disabled={!selected?.can_resume || busy}>
+          <Icon name="resume" />
+          <span>Resume</span>
+        </button>
+        <button type="button" class="toolbar-button" onclick={cancelDownload} disabled={activeId === null || cancelling || cancellationRequested}>
+          <Icon name="cancel" />
+          <span>{cancellationRequested ? "Cancelling" : "Cancel"}</span>
+        </button>
+        <span class="toolbar-divider"></span>
+        <button type="button" class="toolbar-button" onclick={() => inspectorVisible = true} disabled={selected === null || inspectorVisible}>
+          <Icon name="details" />
+          <span>Inspect</span>
         </button>
       </div>
-    </form>
-  </section>
+      <span class="toolbar-summary">{downloads.length} downloads</span>
+    </header>
 
-  <section class="downloads-list" aria-labelledby="downloads-heading">
-  <div class="list-header">
-    <h2 id="downloads-heading">Transfers</h2>
-    <span>{downloads.length} items</span>
-  </div>
+    {#if error || message}
+      <div class:error={error} class:notice={!error} class="app-feedback" role={error ? "alert" : "status"}>
+        <span>{error || message}</span>
+        <button type="button" aria-label="Dismiss message" onclick={clearFeedback}><Icon name="close" size={14} /></button>
+      </div>
+    {/if}
 
-  {#if loading}
-    <div class="empty-state">
-      <p>Loading downloads…</p>
-    </div>
-  {:else if downloads.length === 0}
-    <div class="empty-state">
-      <p>No downloads yet.</p>
-      <span>New transfers will appear here.</span>
-    </div>
-  {:else}
-    <div class="transfer-items">
-      {#each downloads as job (job.id)}
-        {@const percent = percentage(job)}
-
-        <article class="transfer-item">
-          <div class="transfer-heading">
-            <strong>{job.name}</strong>
-            <span>{statusLabel(job)}</span>
+    <div class="content-layout" class:without-inspector={!selected || !inspectorVisible}>
+      <section class="downloads-panel" aria-labelledby="downloads-heading">
+        <div class="panel-heading">
+          <div>
+            <h1 id="downloads-heading">{filters.find((item) => item.id === filter)?.label}</h1>
+            <p>{visibleDownloads.length} {visibleDownloads.length === 1 ? "item" : "items"}</p>
           </div>
+        </div>
 
-          {#if percent !== null}
-            <progress
-              max="100"
-              value={percent}
-              aria-label={`Progress for ${job.name}`}
-            ></progress>
-          {:else if job.id === activeId}
-            <progress
-              aria-label={`Progress for ${job.name}`}
-            ></progress>
-          {/if}
+        {#if loading}
+          <div class="empty-state" aria-live="polite">
+            <Icon name="download" size={22} />
+            <strong>Loading downloads…</strong>
+          </div>
+        {:else if downloads.length === 0}
+          <div class="empty-state">
+            <Icon name="download" size={24} />
+            <strong>No downloads yet</strong>
+            <span>Add a URL to start your first transfer.</span>
+            <button type="button" class="button primary" onclick={openAddDialog}>Add download</button>
+          </div>
+        {:else if visibleDownloads.length === 0}
+          <div class="empty-state">
+            <Icon name="all" size={22} />
+            <strong>No {filters.find((item) => item.id === filter)?.label.toLowerCase()}</strong>
+            <span>Choose another filter to see your downloads.</span>
+          </div>
+        {:else}
+          <div class="table-scroll">
+            <table class="downloads-table">
+              <thead>
+                <tr>
+                  <th scope="col">Name</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Progress</th>
+                  <th scope="col">Source</th>
+                  <th scope="col">Added</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each visibleDownloads as job (job.id)}
+                  {@const percent = percentage(job)}
+                  <tr
+                    class:selected={selectedId === job.id}
+                    class:completed={job.state === "completed"}
+                    tabindex="0"
+                    aria-selected={selectedId === job.id}
+                    onclick={() => selectDownload(job.id)}
+                    onkeydown={(event) => inspectFromKeyboard(event, job.id)}
+                  >
+                    <td class="name-cell" title={job.name}>
+                      <span class="file-icon"><Icon name="download" size={14} /></span>
+                      <span title={job.name}>{job.name}</span>
+                    </td>
+                    <td><span class={`status status-${job.id === activeId ? "active" : job.state}`}><span></span>{statusLabel(job)}</span></td>
+                    <td class="progress-cell">
+                      <div class="size-line">
+                        <span>{formatBytes(job.written_bytes)}{job.total_bytes ? ` / ${formatBytes(job.total_bytes)}` : " / Unknown"}</span>
+                        {#if percent !== null}<span>{percent.toFixed(1)}%</span>{/if}
+                      </div>
+                      {#if percent !== null}
+                        <div class="progress-track" role="progressbar" aria-label={`Progress for ${job.name}`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent}>
+                          <span style={`width: ${percent}%`}></span>
+                        </div>
+                      {:else if job.id === activeId}
+                        <div class="progress-track indeterminate" role="progressbar" aria-label={`Progress for ${job.name}; total size unknown`}><span></span></div>
+                      {/if}
+                    </td>
+                    <td class="source-cell" title={job.source}>{job.source}</td>
+                    <td class="added-cell" title={formatAddedTime(job.created_at)}>{formatAddedTime(job.created_at)}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
 
-          <div class="transfer-details">
-            <span>
-              {formatBytes(job.written_bytes)}
-              {#if job.total_bytes !== null}
-                / {formatBytes(job.total_bytes)}
-              {/if}
-            </span>
+      {#if selected && inspectorVisible}
+        {@const selectedPercent = percentage(selected)}
+        <aside class="inspector" aria-labelledby="inspector-heading">
+          <header class="inspector-header">
+            <div>
+              <h2 id="inspector-heading">Details</h2>
+              <span class="inspector-name">{selected.name}</span>
+            </div>
+            <button type="button" class="icon-button" aria-label="Close details" onclick={() => inspectorVisible = false}><Icon name="close" /></button>
+          </header>
 
-            {#if percent !== null}
-              <span>{percent.toFixed(1)}%</span>
+          <div class="inspector-body">
+            <div class="inspector-summary">
+              <span class={`status status-${selected.id === activeId ? "active" : selected.state}`}><span></span>{statusLabel(selected)}</span>
+              <span>{formatBytes(selected.written_bytes)}{selected.total_bytes ? ` of ${formatBytes(selected.total_bytes)}` : " downloaded"}</span>
+              {#if selectedPercent !== null}<span>{selectedPercent.toFixed(1)}%</span>{/if}
+            </div>
+
+            {#if selectedPercent !== null}
+              <div class="progress-track large" role="progressbar" aria-label={`Progress for ${selected.name}`} aria-valuemin="0" aria-valuemax="100" aria-valuenow={selectedPercent}>
+                <span style={`width: ${selectedPercent}%`}></span>
+              </div>
+            {/if}
+
+            <dl class="metadata-grid">
+              <div><dt>File name</dt><dd title={selected.name}>{selected.name}</dd></div>
+              <div><dt>Source</dt><dd title={selected.source}>{selected.source}</dd></div>
+              <div><dt>Added</dt><dd title={formatAddedTime(selected.created_at)}>{formatAddedTime(selected.created_at)}</dd></div>
+              <div><dt>Added via</dt><dd title={selected.added_via}>{selected.added_via}</dd></div>
+              {#if selected.content_type}<div><dt>Content type</dt><dd title={selected.content_type}>{selected.content_type}</dd></div>{/if}
+              {#if selected.output_path}<div class="wide"><dt>Saved to</dt><dd title={selected.output_path}>{selected.output_path}</dd></div>{/if}
+            </dl>
+
+            {#if selected.error}
+              <div class="failure-details" role="alert">
+                <strong>Failure information</strong>
+                <p>{selected.error}</p>
+              </div>
             {/if}
           </div>
-
-          {#if job.error}
-            <p class="error">{job.error}</p>
-          {/if}
-
-          {#if job.output_path}
-            <p class="output-path">Output: {job.output_path}</p>
-          {/if}
-
-          {#if job.id === activeId}
-            <button
-              type="button"
-              class="button secondary"
-              onclick={cancelDownload}
-              disabled={cancelling || cancellationRequested}
-            >
-              {cancellationRequested ? "Cancellation requested" : "Cancel"}
-            </button>
-          {:else if job.state === "interrupted"}
-            <button
-              type="button"
-              class="button secondary"
-              onclick={() => resumeDownload(job.id)}
-              disabled={busy}
-            >
-              Resume
-            </button>
-          {/if}
-        </article>
-      {/each}
+        </aside>
+      {/if}
     </div>
-  {/if}
 
-  <p class="runtime-note">
-    Keep Gunda open while a download is running.
-  </p>
-</section>
+    <footer class="status-bar">
+      <span>{downloads.length} downloads ({activeCount} active)</span>
+      <span>{activeId ? "Transfer in progress" : "Ready"}</span>
+    </footer>
+  </main>
 </div>
+
+<dialog bind:this={addDialog} class="download-dialog" onclose={returnAddFocus} oncancel={(event) => submitting && event.preventDefault()}>
+  <form onsubmit={startDownload}>
+    <header class="dialog-header">
+      <h2>Add download</h2>
+      <button type="button" class="icon-button" aria-label="Close add download dialog" onclick={closeAddDialog} disabled={submitting}><Icon name="close" /></button>
+    </header>
+
+    <div class="dialog-body">
+      <label for="download-url">File URL</label>
+      <input bind:this={urlInput} id="download-url" type="url" inputmode="url" autocomplete="off" spellcheck="false" placeholder="https://example.com/file.zip" bind:value={url} oninput={() => dialogError = ""} disabled={busy} />
+
+      <label for="download-directory">Destination folder</label>
+      <div class="directory-row">
+        <input id="download-directory" type="text" value={directory} placeholder="Choose a folder" readonly aria-describedby="destination-help" />
+        <button type="button" class="button secondary" onclick={chooseDirectory} disabled={busy}><Icon name="folder" size={15} />{choosing ? "Opening…" : "Browse"}</button>
+      </div>
+      <p id="destination-help" class="field-help">Gunda will choose a safe file name and will not overwrite an existing file.</p>
+
+      <div class="dialog-feedback" aria-live="polite">
+        {#if dialogError}<p class="error">{dialogError}</p>{/if}
+      </div>
+    </div>
+
+    <footer class="dialog-footer">
+      <button type="button" class="button secondary" onclick={closeAddDialog} disabled={submitting}>Cancel</button>
+      <button type="submit" class="button primary" disabled={busy}>{submitting ? "Starting…" : "Download"}</button>
+    </footer>
+  </form>
+</dialog>
