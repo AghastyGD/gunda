@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,7 +10,7 @@ use gunda_core::application::{DownloadCancellation, TransferOutcome, TransferPro
 use gunda_core::download::{DownloadId, RequestContext};
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::HttpResumeState;
 use crate::resume_state::ResumePersistence;
@@ -23,6 +23,7 @@ pub enum FileOperation {
     Open,
     Write,
     Flush,
+    Seek,
     Sync,
     Truncate,
 }
@@ -277,9 +278,8 @@ pub(crate) async fn resume_body_to_partial(
     }
 
     let path = partial_path(directory, id);
-    let file = OpenOptions::new()
+    let mut file = OpenOptions::new()
         .write(true)
-        .append(true)
         .open(&path)
         .await
         .map_err(|error| file_error(FileOperation::Open, error))?;
@@ -302,6 +302,10 @@ pub(crate) async fn resume_body_to_partial(
             .await
             .map_err(|error| file_error(FileOperation::Sync, error))?;
     }
+
+    file.seek(SeekFrom::Start(written_bytes))
+        .await
+        .map_err(|error| file_error(FileOperation::Seek, error))?;
 
     stream_to_partial(StreamContext {
         body,
