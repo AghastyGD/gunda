@@ -85,6 +85,10 @@ impl HttpRangeBody {
         self.body.is_finished()
     }
 
+    pub(crate) fn is_unconsumed(&self) -> bool {
+        self.body.is_unconsumed()
+    }
+
     pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpError> {
         self.body.next_chunk().await
     }

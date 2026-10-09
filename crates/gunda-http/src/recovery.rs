@@ -57,6 +57,16 @@ pub enum RecoveryInspectionError {
     UnsupportedResource,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeFileError {
+    MissingPartial,
+    PartialTooShort,
+    UnsafePartial,
+    PartialUnavailable(io::ErrorKind),
+    OutputExists,
+    OutputUnavailable(io::ErrorKind),
+}
+
 impl fmt::Display for RecoveryInspectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -104,7 +114,31 @@ pub async fn inspect_local_recovery(
     })
 }
 
-async fn inspect_path(path: &Path) -> LocalFileState {
+pub(crate) async fn inspect_resume_candidate(
+    partial_path: &Path,
+    planned_output: Option<&Path>,
+    durable_bytes: u64,
+) -> Result<u64, ResumeFileError> {
+    if let Some(path) = planned_output {
+        match inspect_path(path).await {
+            LocalFileState::Missing => {}
+            LocalFileState::Unavailable { kind } => {
+                return Err(ResumeFileError::OutputUnavailable(kind));
+            }
+            _ => return Err(ResumeFileError::OutputExists),
+        }
+    }
+
+    match inspect_path(partial_path).await {
+        LocalFileState::RegularFile { bytes } if bytes >= durable_bytes => Ok(bytes),
+        LocalFileState::RegularFile { .. } => Err(ResumeFileError::PartialTooShort),
+        LocalFileState::Missing => Err(ResumeFileError::MissingPartial),
+        LocalFileState::Unavailable { kind } => Err(ResumeFileError::PartialUnavailable(kind)),
+        LocalFileState::Symlink | LocalFileState::Other => Err(ResumeFileError::UnsafePartial),
+    }
+}
+
+pub(crate) async fn inspect_path(path: &Path) -> LocalFileState {
     match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => {
             let file_type = metadata.file_type();

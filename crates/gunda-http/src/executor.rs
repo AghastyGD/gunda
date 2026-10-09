@@ -12,11 +12,14 @@ use gunda_core::download::{
 
 use crate::HttpResumeStore;
 use crate::destination::plan_destination;
-use crate::partial::write_body_to_partial_with_resume;
+use crate::partial::{
+    ResumeBody, ResumeTransfer, resume_body_to_partial, write_body_to_partial_with_resume,
+};
+use crate::recovery::{ResumeFileError, inspect_resume_candidate};
 use crate::resume_state::ResumePersistence;
 use crate::{
-    FinalizeError, HttpBody, HttpClient, HttpError, PartialDownload, PartialDownloadError,
-    finalize_download,
+    FinalizeError, HttpBody, HttpClient, HttpError, HttpInspection, HttpResumeState,
+    PartialDownload, PartialDownloadError, finalize_download, partial_path,
 };
 
 /// Executes a direct HTTP resource as a file.
@@ -48,11 +51,22 @@ impl HttpExecutor {
 
 /// An opened GET response that has not been written to staging.
 pub struct HttpPreparedTransfer {
-    body: HttpBody,
+    body: HttpPreparedBody,
+    metadata: HttpInspection,
+    resource: ResourceDescriptor,
+    starting_bytes: u64,
     id: DownloadId,
     destination: DownloadDestination,
     planned_destination: ResolvedDestination,
     resume_store: Option<Arc<dyn ResumePersistence>>,
+}
+
+enum HttpPreparedBody {
+    Fresh(HttpBody),
+    Resumed {
+        body: ResumeBody,
+        state: HttpResumeState,
+    },
 }
 
 /// A complete partial file awaiting publication.
@@ -69,15 +83,141 @@ impl DownloadExecutor for HttpExecutor {
             id,
             request,
             destination,
+            progress,
+            resource,
+            resolved_destination,
         } = input;
 
-        let (destination, planned_destination) =
+        let (destination, default_destination) =
             plan_destination(id, request.url(), &destination).map_err(finalization_failure)?;
 
-        let body = self.client.open(&request).await.map_err(http_failure)?;
+        let Some(store) = self.resume_store.as_ref() else {
+            let body = self.client.open(&request).await.map_err(http_failure)?;
+            let metadata = body.metadata().clone();
+            let resource = http_resource(resource.as_ref(), &metadata)?;
+
+            return Ok(HttpPreparedTransfer {
+                body: HttpPreparedBody::Fresh(body),
+                metadata,
+                resource,
+                starting_bytes: 0,
+                id,
+                destination,
+                planned_destination: default_destination,
+                resume_store: None,
+            });
+        };
+
+        let resume_state = store
+            .find_state(id)
+            .await
+            .map_err(|_| storage_failure("could not load HTTP resume state"))?;
+
+        let Some(resume_state) = resume_state else {
+            let body = self.client.open(&request).await.map_err(http_failure)?;
+            let metadata = body.metadata().clone();
+            let resource = http_resource(resource.as_ref(), &metadata)?;
+
+            return Ok(HttpPreparedTransfer {
+                body: HttpPreparedBody::Fresh(body),
+                metadata,
+                resource,
+                starting_bytes: 0,
+                id,
+                destination,
+                planned_destination: default_destination,
+                resume_store: self.resume_store.clone(),
+            });
+        };
+
+        if progress.total_bytes() != Some(resume_state.total_bytes()) {
+            return Err(recovery_integrity(
+                "saved download size does not match HTTP resume state",
+            ));
+        }
+
+        if resource
+            .as_ref()
+            .is_some_and(|resource| resource.kind() != ResourceKind::File)
+        {
+            return Err(recovery_integrity(
+                "saved resource type is not resumable as a direct HTTP file",
+            ));
+        }
+
+        let planned_destination = resolved_destination.ok_or_else(|| {
+            recovery_integrity("interrupted HTTP download has no planned destination")
+        })?;
+
+        inspect_resume_candidate(
+            &partial_path(destination.directory(), id),
+            (resume_state.durable_bytes() == resume_state.total_bytes())
+                .then(|| planned_destination.final_path()),
+            resume_state.durable_bytes(),
+        )
+        .await
+        .map_err(resume_file_failure)?;
+
+        let (body, metadata) = if resume_state.durable_bytes() == resume_state.total_bytes() {
+            (
+                ResumeBody::Complete,
+                HttpInspection::resumed(
+                    resume_state.total_bytes(),
+                    resource
+                        .as_ref()
+                        .and_then(ResourceDescriptor::content_type)
+                        .map(str::to_owned),
+                    resume_state.strong_etag().clone(),
+                ),
+            )
+        } else if resume_state.durable_bytes() == 0 {
+            let body = self.client.open(&request).await.map_err(http_failure)?;
+
+            if body.metadata().content_length() != Some(resume_state.total_bytes())
+                || body.metadata().strong_etag() != Some(resume_state.strong_etag())
+            {
+                return Err(recovery_integrity(
+                    "remote resource no longer matches HTTP resume state",
+                ));
+            }
+
+            let metadata = body.metadata().clone();
+            (ResumeBody::Full(body), metadata)
+        } else {
+            let range = self
+                .client
+                .open_range(
+                    &request,
+                    resume_state.durable_bytes(),
+                    resume_state.total_bytes(),
+                    resume_state.strong_etag(),
+                )
+                .await
+                .map_err(resume_http_failure)?;
+
+            let metadata = HttpInspection::resumed(
+                resume_state.total_bytes(),
+                range
+                    .metadata()
+                    .content_type()
+                    .or_else(|| resource.as_ref().and_then(ResourceDescriptor::content_type))
+                    .map(str::to_owned),
+                resume_state.strong_etag().clone(),
+            );
+
+            (ResumeBody::Range(range), metadata)
+        };
+
+        let resource = http_resource(resource.as_ref(), &metadata)?;
 
         Ok(HttpPreparedTransfer {
-            body,
+            body: HttpPreparedBody::Resumed {
+                body,
+                state: resume_state.clone(),
+            },
+            metadata,
+            resource,
+            starting_bytes: resume_state.durable_bytes(),
             id,
             destination,
             planned_destination,
@@ -90,15 +230,15 @@ impl PreparedTransfer for HttpPreparedTransfer {
     type Staged = HttpStagedTransfer;
 
     fn resource(&self) -> ResourceDescriptor {
-        ResourceDescriptor::new(
-            ResourceKind::File,
-            None,
-            self.body.metadata().content_type().map(str::to_owned),
-        )
+        self.resource.clone()
     }
 
     fn total_bytes(&self) -> Option<u64> {
-        self.body.metadata().content_length()
+        self.metadata.content_length()
+    }
+
+    fn starting_bytes(&self) -> u64 {
+        self.starting_bytes
     }
 
     fn planned_destination(&self) -> ResolvedDestination {
@@ -112,21 +252,45 @@ impl PreparedTransfer for HttpPreparedTransfer {
     ) -> Result<TransferOutcome<Self::Staged>, DownloadFailure> {
         let Self {
             body,
+            metadata,
             id,
             destination,
             resume_store,
             ..
         } = self;
 
-        let outcome = write_body_to_partial_with_resume(
-            body,
-            id,
-            destination.directory(),
-            progress,
-            cancellation,
-            resume_store,
-        )
-        .await
+        let outcome = match body {
+            HttpPreparedBody::Fresh(body) => {
+                write_body_to_partial_with_resume(
+                    body,
+                    id,
+                    destination.directory(),
+                    progress,
+                    cancellation,
+                    resume_store,
+                )
+                .await
+            }
+            HttpPreparedBody::Resumed { body, state } => {
+                let store = resume_store.ok_or_else(|| {
+                    storage_failure("HTTP resume state has no persistence adapter")
+                })?;
+
+                resume_body_to_partial(
+                    ResumeTransfer {
+                        body,
+                        metadata,
+                        state,
+                    },
+                    id,
+                    destination.directory(),
+                    progress,
+                    cancellation,
+                    store,
+                )
+                .await
+            }
+        }
         .map_err(partial_failure)?;
 
         Ok(match outcome {
@@ -218,6 +382,66 @@ fn http_failure(error: HttpError) -> DownloadFailure {
     DownloadFailure::new(kind, message, retryable)
 }
 
+fn resume_http_failure(error: HttpError) -> DownloadFailure {
+    match error {
+        HttpError::UnexpectedStatus(200 | 412 | 416) => {
+            recovery_integrity("remote resource could not satisfy the saved HTTP checkpoint")
+        }
+        error => http_failure(error),
+    }
+}
+
+fn http_resource(
+    previous: Option<&ResourceDescriptor>,
+    metadata: &HttpInspection,
+) -> Result<ResourceDescriptor, DownloadFailure> {
+    if previous.is_some_and(|resource| resource.kind() != ResourceKind::File) {
+        return Err(recovery_integrity(
+            "saved resource type is not a direct HTTP file",
+        ));
+    }
+
+    Ok(ResourceDescriptor::new(
+        ResourceKind::File,
+        previous
+            .and_then(ResourceDescriptor::display_name)
+            .map(str::to_owned),
+        metadata.content_type().map(str::to_owned).or_else(|| {
+            previous
+                .and_then(ResourceDescriptor::content_type)
+                .map(str::to_owned)
+        }),
+    ))
+}
+
+fn resume_file_failure(error: ResumeFileError) -> DownloadFailure {
+    match error {
+        ResumeFileError::PartialUnavailable(kind) | ResumeFileError::OutputUnavailable(kind) => {
+            filesystem_failure(kind)
+        }
+        ResumeFileError::MissingPartial => recovery_integrity("saved HTTP partial file is missing"),
+        ResumeFileError::PartialTooShort => {
+            recovery_integrity("saved HTTP partial file is shorter than its durable checkpoint")
+        }
+        ResumeFileError::UnsafePartial => {
+            recovery_integrity("saved HTTP partial path is not a regular file")
+        }
+        ResumeFileError::OutputExists => DownloadFailure::new(
+            FailureKind::Storage,
+            "planned output already exists during HTTP recovery",
+            false,
+        ),
+    }
+}
+
+fn recovery_integrity(message: &'static str) -> DownloadFailure {
+    DownloadFailure::new(FailureKind::Integrity, message, false)
+}
+
+fn storage_failure(message: &'static str) -> DownloadFailure {
+    DownloadFailure::new(FailureKind::Storage, message, false)
+}
+
 fn partial_failure(error: PartialDownloadError) -> DownloadFailure {
     match error {
         PartialDownloadError::Http(error) => http_failure(error),
@@ -235,6 +459,10 @@ fn partial_failure(error: PartialDownloadError) -> DownloadFailure {
             "resource size exceeds the supported range",
             false,
         ),
+
+        PartialDownloadError::InvalidPartial => {
+            recovery_integrity("partial file no longer matches its durable HTTP checkpoint")
+        }
 
         PartialDownloadError::ResumeStore(_) => DownloadFailure::new(
             FailureKind::Storage,

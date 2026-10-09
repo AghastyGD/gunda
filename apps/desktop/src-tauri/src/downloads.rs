@@ -9,6 +9,8 @@ use serde::Serialize;
 use tauri::State;
 use tauri::ipc::Channel;
 
+use gunda_storage::SqliteDownloadRepository;
+
 use super::DesktopState;
 
 pub(crate) struct ActiveDownload {
@@ -130,9 +132,39 @@ pub(crate) async fn start_download(
             DownloadOrigin::Desktop,
         ))
         .await
-        .map_err(|_| "Could not sabe the new download.".to_owned())?;
+        .map_err(|_| "Could not save the new download.".to_owned())?;
 
     let id = created.download_id();
+
+    execute_download(&mut manager, id, updates, &state).await
+}
+
+#[tauri::command]
+pub(crate) async fn resume_download(
+    id: String,
+    updates: Channel<DownloadUpdate>,
+    state: State<'_, DesktopState>,
+) -> Result<ExecutionResponse, String> {
+    let id = parse_download_id(&id)?;
+    let mut manager = state
+        .manager
+        .try_lock()
+        .map_err(|_| "Another download is already running.".to_owned())?;
+
+    manager
+        .resume(id)
+        .await
+        .map_err(|_| "This download cannot be resumed.".to_owned())?;
+
+    execute_download(&mut manager, id, updates, &state).await
+}
+
+async fn execute_download(
+    manager: &mut gunda_core::application::DownloadManager<SqliteDownloadRepository>,
+    id: DownloadId,
+    updates: Channel<DownloadUpdate>,
+    state: &DesktopState,
+) -> Result<ExecutionResponse, String> {
     let cancellation = DownloadCancellation::new();
 
     {
@@ -225,11 +257,7 @@ pub(crate) async fn start_download(
 
 #[tauri::command]
 pub(crate) fn cancel_download(id: String, state: State<'_, DesktopState>) -> Result<bool, String> {
-    let value = id
-        .parse::<i64>()
-        .map_err(|_| "Invalid download ID.".to_owned())?;
-
-    let id = DownloadId::new(value).map_err(|_| "Invalid donwload ID".to_owned())?;
+    let id = parse_download_id(&id)?;
 
     let active = state
         .active
@@ -242,4 +270,12 @@ pub(crate) fn cancel_download(id: String, state: State<'_, DesktopState>) -> Res
 
     active.cancellation.request();
     Ok(true)
+}
+
+fn parse_download_id(value: &str) -> Result<DownloadId, String> {
+    let value = value
+        .parse::<i64>()
+        .map_err(|_| "Invalid download ID.".to_owned())?;
+
+    DownloadId::new(value).map_err(|_| "Invalid download ID.".to_owned())
 }

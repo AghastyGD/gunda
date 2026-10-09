@@ -125,6 +125,7 @@ pub fn run() {
             validate_download_input,
             downloads::list_downloads,
             downloads::start_download,
+            downloads::resume_download,
             downloads::cancel_download,
         ])
         .run(tauri::generate_context!())

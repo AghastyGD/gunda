@@ -14,15 +14,17 @@ use tokio::io::AsyncWriteExt;
 
 use crate::HttpResumeState;
 use crate::resume_state::ResumePersistence;
-use crate::{HttpBody, HttpClient, HttpError, HttpInspection};
+use crate::{HttpBody, HttpClient, HttpError, HttpInspection, HttpRangeBody};
 
 /// File operation that failed withour exposing the affected path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOperation {
     Create,
+    Open,
     Write,
     Flush,
     Sync,
+    Truncate,
 }
 
 /// Failure while transferring HTTP content into a partial file.
@@ -37,6 +39,7 @@ pub enum PartialDownloadError {
 
     ByteCountOverflow,
     InvalidBodyState,
+    InvalidPartial,
     ResumeStore(RepositoryErrorKind),
 }
 
@@ -52,6 +55,9 @@ impl fmt::Display for PartialDownloadError {
             }
             Self::InvalidBodyState => {
                 f.write_str("HTTP body is no longer available for a complete transfer")
+            }
+            Self::InvalidPartial => {
+                f.write_str("partial file does not match the durable HTTP checkpoint")
             }
             Self::ResumeStore(kind) => {
                 write!(f, "HTTP resume storage failed: {kind:?}")
@@ -148,7 +154,7 @@ pub(crate) async fn write_body_to_partial(
     write_body_to_partial_with_resume(body, id, directory, progress, cancellation, None).await
 }
 pub(crate) async fn write_body_to_partial_with_resume(
-    mut body: HttpBody,
+    body: HttpBody,
     id: DownloadId,
     directory: &Path,
     progress: TransferProgress,
@@ -182,7 +188,7 @@ pub(crate) async fn write_body_to_partial_with_resume(
     let metadata = body.metadata().clone();
     let path = partial_path(directory, id);
 
-    let mut file = OpenOptions::new()
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
@@ -213,8 +219,159 @@ pub(crate) async fn write_body_to_partial_with_resume(
         resume_state = Some(persisted);
     }
 
-    let mut written_bytes = 0_u64;
-    let mut last_checkpoint_bytes = 0_u64;
+    stream_to_partial(StreamContext {
+        body: TransferBody::Full(body),
+        file,
+        path,
+        metadata,
+        id,
+        progress,
+        cancellation,
+        resume_store,
+        resume_state,
+        written_bytes: 0,
+    })
+    .await
+}
+
+pub(crate) enum ResumeBody {
+    Full(HttpBody),
+    Range(HttpRangeBody),
+    Complete,
+}
+
+pub(crate) struct ResumeTransfer {
+    pub(crate) body: ResumeBody,
+    pub(crate) metadata: HttpInspection,
+    pub(crate) state: HttpResumeState,
+}
+
+pub(crate) async fn resume_body_to_partial(
+    transfer: ResumeTransfer,
+    id: DownloadId,
+    directory: &Path,
+    progress: TransferProgress,
+    cancellation: DownloadCancellation,
+    resume_store: Arc<dyn ResumePersistence>,
+) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
+    let ResumeTransfer {
+        body,
+        metadata,
+        state: resume_state,
+    } = transfer;
+
+    let body = match body {
+        ResumeBody::Full(body) => TransferBody::Full(body),
+        ResumeBody::Range(body) => TransferBody::Range(body),
+        ResumeBody::Complete => TransferBody::Complete,
+    };
+
+    if !body.is_unconsumed() {
+        return Err(PartialDownloadError::InvalidBodyState);
+    }
+
+    let written_bytes = resume_state.durable_bytes();
+
+    if cancellation.is_requested() {
+        return Ok(TransferOutcome::Cancelled { written_bytes });
+    }
+
+    let path = partial_path(directory, id);
+    let file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|error| file_error(FileOperation::Open, error))?;
+
+    let file_metadata = file
+        .metadata()
+        .await
+        .map_err(|error| file_error(FileOperation::Open, error))?;
+
+    if !file_metadata.is_file() || file_metadata.len() < written_bytes {
+        return Err(PartialDownloadError::InvalidPartial);
+    }
+
+    if file_metadata.len() != written_bytes {
+        file.set_len(written_bytes)
+            .await
+            .map_err(|error| file_error(FileOperation::Truncate, error))?;
+
+        file.sync_all()
+            .await
+            .map_err(|error| file_error(FileOperation::Sync, error))?;
+    }
+
+    stream_to_partial(StreamContext {
+        body,
+        file,
+        path,
+        metadata,
+        id,
+        progress,
+        cancellation,
+        resume_store: Some(resume_store),
+        resume_state: Some(resume_state),
+        written_bytes,
+    })
+    .await
+}
+
+enum TransferBody {
+    Full(HttpBody),
+    Range(HttpRangeBody),
+    Complete,
+}
+
+impl TransferBody {
+    fn is_unconsumed(&self) -> bool {
+        match self {
+            Self::Full(body) => body.is_unconsumed(),
+            Self::Range(body) => body.is_unconsumed(),
+            Self::Complete => true,
+        }
+    }
+
+    async fn next_chunk(&mut self) -> Result<Option<bytes::Bytes>, HttpError> {
+        match self {
+            Self::Full(body) => body.next_chunk().await,
+            Self::Range(body) => body.next_chunk().await,
+            Self::Complete => Ok(None),
+        }
+    }
+}
+
+struct StreamContext {
+    body: TransferBody,
+    file: File,
+    path: PathBuf,
+    metadata: HttpInspection,
+    id: DownloadId,
+    progress: TransferProgress,
+    cancellation: DownloadCancellation,
+    resume_store: Option<Arc<dyn ResumePersistence>>,
+    resume_state: Option<HttpResumeState>,
+    written_bytes: u64,
+}
+
+async fn stream_to_partial(
+    context: StreamContext,
+) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
+    let StreamContext {
+        mut body,
+        mut file,
+        path,
+        metadata,
+        id,
+        progress,
+        cancellation,
+        resume_store,
+        mut resume_state,
+        mut written_bytes,
+    } = context;
+
+    let mut last_checkpoint_bytes = written_bytes;
     let mut last_checkpoint_at = Instant::now();
 
     loop {

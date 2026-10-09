@@ -1,8 +1,8 @@
 use std::future::Future;
 
 use crate::download::{
-    DownloadDestination, DownloadFailure, DownloadId, RequestContext, ResolvedDestination,
-    ResourceDescriptor,
+    DownloadDestination, DownloadFailure, DownloadId, DownloadProgress, RequestContext,
+    ResolvedDestination, ResourceDescriptor,
 };
 
 use super::{DownloadCancellation, DownloadEvent, TransferProgress};
@@ -11,6 +11,9 @@ pub struct ExecutionInput {
     pub id: DownloadId,
     pub request: RequestContext,
     pub destination: DownloadDestination,
+    pub progress: DownloadProgress,
+    pub resource: Option<ResourceDescriptor>,
+    pub resolved_destination: Option<ResolvedDestination>,
 }
 
 /// Outcome of writing an execution's staging file.
@@ -37,6 +40,11 @@ pub trait PreparedTransfer: Send + Sized {
     fn resource(&self) -> ResourceDescriptor;
 
     fn total_bytes(&self) -> Option<u64>;
+
+    /// Returns the reconciled byte count already present in staging.
+    fn starting_bytes(&self) -> u64 {
+        0
+    }
 
     /// Returns the output path planned for this executino.
     fn planned_destination(&self) -> ResolvedDestination;

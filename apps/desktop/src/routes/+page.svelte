@@ -159,6 +159,56 @@
     }
   }
 
+  async function resumeDownload(id: string) {
+    if (busy) return;
+
+    clearFeedback();
+    submitting = true;
+    cancellationRequested = false;
+
+    let acceptingUpdates = true;
+    const updates = new Channel<DownloadUpdate>();
+
+    updates.onmessage = (update) => {
+      if (!acceptingUpdates) return;
+
+      if (update.type === "started") {
+        activeId = update.job.id;
+        upsertDownload(update.job);
+        return;
+      }
+
+      downloads = downloads.map((job) =>
+        job.id === update.id
+          ? {
+              ...job,
+              written_bytes: update.written_bytes,
+              total_bytes: update.total_bytes,
+            }
+          : job,
+      );
+    };
+
+    try {
+      const result = await invoke<ExecutionResponse>("resume_download", {
+        id,
+        updates,
+      });
+
+      acceptingUpdates = false;
+      upsertDownload(result.job);
+      message = result.notice ?? "";
+    } catch (cause) {
+      error = errorMessage(cause, "Could not resume the download.");
+    } finally {
+      acceptingUpdates = false;
+      submitting = false;
+      activeId = null;
+      cancelling = false;
+      cancellationRequested = false;
+    }
+  }
+
   function statusLabel(job: DownloadView): string {
     if (job.id === activeId) {
       return cancellationRequested ? "Cancelling…" : "Running";
@@ -309,6 +359,15 @@
               disabled={cancelling || cancellationRequested}
             >
               {cancellationRequested ? "Cancellation requested" : "Cancel"}
+            </button>
+          {:else if job.state === "interrupted"}
+            <button
+              type="button"
+              class="button secondary"
+              onclick={() => resumeDownload(job.id)}
+              disabled={busy}
+            >
+              Resume
             </button>
           {/if}
         </article>

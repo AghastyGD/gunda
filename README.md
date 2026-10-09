@@ -10,9 +10,9 @@ I'm building it around reliable downloads first, with browser integration and na
 
 Gunda is still under active development.
 
-The desktop can currently download files over HTTP/HTTPS, choose a destination, show live progress, cancel an active transfer, and keep download records in SQLite.
+The desktop can currently download files over HTTP/HTTPS, choose a destination, show live progress, cancel an active transfer, resume safely checkpointed downloads after a restart, and keep download records in SQLite.
 
-Only one download can run at a time. Resume, interrupted-download recovery, browser integration, HLS, and DASH are not available yet.
+Only one download can run at a time. Downloads without a strong HTTP validator cannot be resumed. Browser integration, HLS, and DASH are not available yet.
 
 ## Running the desktop
 

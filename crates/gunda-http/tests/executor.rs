@@ -8,7 +8,8 @@ use gunda_core::application::{
     TransferOutcome, TransferProgress,
 };
 use gunda_core::download::{
-    DownloadDestination, DownloadId, FailureKind, FileConflictPolicy, RequestContext, ResourceKind,
+    DownloadDestination, DownloadId, DownloadProgress, FailureKind, FileConflictPolicy,
+    RequestContext, ResourceKind,
 };
 use gunda_http::{HttpClient, HttpExecutor, partial_path};
 use tempfile::tempdir;
@@ -27,6 +28,9 @@ fn input(url: Url, directory: &Path) -> ExecutionInput {
             Some("file.bin".to_owned()),
             FileConflictPolicy::Fail,
         ),
+        progress: DownloadProgress::default(),
+        resource: None,
+        resolved_destination: None,
     }
 }
 

@@ -35,6 +35,18 @@ impl HttpInspection {
     pub fn strong_etag(&self) -> Option<&StrongEntityTag> {
         self.strong_etag.as_ref()
     }
+
+    pub(crate) fn resumed(
+        total_bytes: u64,
+        content_type: Option<String>,
+        strong_etag: StrongEntityTag,
+    ) -> Self {
+        Self {
+            content_length: Some(total_bytes),
+            content_type,
+            strong_etag: Some(strong_etag),
+        }
+    }
 }
 
 /// Reusable HTTP client with explicit request policy.

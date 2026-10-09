@@ -140,7 +140,7 @@ where
             })
     }
 
-    /// Returns a paused job to the queue.
+    /// Returns a paused or interrupted job to the queue.
     ///
     /// This changes scheduling eligibility; it does not start a transfer.
     #[tracing::instrument(name = "manager.resume", skip_all, fields(download_id = id.value()))]
@@ -248,6 +248,9 @@ where
             id,
             request: job.request().clone(),
             destination: job.destination().clone(),
+            progress: job.progress(),
+            resource: job.resource().cloned(),
+            resolved_destination: job.resolved_destination().cloned(),
         };
 
         let preparation = tokio::select! {
@@ -270,8 +273,9 @@ where
         };
 
         let total_bytes = prepared.total_bytes();
+        let starting_bytes = prepared.starting_bytes();
 
-        let initial_progress = DownloadProgress::new(0, total_bytes)
+        let initial_progress = DownloadProgress::new(starting_bytes, total_bytes)
             .map_err(|_| invalid_repository_data("execution progress is invalid"))?;
 
         let inspected_at = OffsetDateTime::now_utc();
@@ -290,6 +294,7 @@ where
         job = self.commit_job(job).await?;
 
         let (progress_sender, progress_receiver) = TransferProgress::channel();
+        progress_sender.report_written(starting_bytes);
 
         let transfer = prepared.transfer_controlled(progress_sender, cancellation.clone());
         tokio::pin!(transfer);
@@ -479,7 +484,9 @@ where
 
         let next = match (command, previous) {
             (DownloadCommandKind::Pause, DownloadState::Queued) => DownloadState::Paused,
-            (DownloadCommandKind::Resume, DownloadState::Paused) => DownloadState::Queued,
+            (DownloadCommandKind::Resume, DownloadState::Paused | DownloadState::Interrupted) => {
+                DownloadState::Queued
+            }
             (DownloadCommandKind::Cancel, DownloadState::Queued | DownloadState::Paused) => {
                 DownloadState::Cancelled
             }
@@ -1078,6 +1085,40 @@ mod tests {
         assert!(manager.job(id) == Some(&persisted));
 
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 3,);
+    }
+
+    #[tokio::test]
+    async fn interrupted_job_can_be_returned_to_the_queue() {
+        let mut original = job(1);
+        let id = original.id();
+        original
+            .transition_to(DownloadState::Inspecting, OffsetDateTime::now_utc())
+            .expect("inspection transition must succeed");
+
+        let repository = FakeRepository::with_jobs(vec![original]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        assert_eq!(
+            manager.job(id).expect("job must exist").state(),
+            DownloadState::Interrupted
+        );
+
+        let event = manager.resume(id).await.expect("resume must succeed");
+
+        assert!(
+            event
+                == DownloadEvent::StateChanged {
+                    id,
+                    previous: DownloadState::Interrupted,
+                    current: DownloadState::Queued,
+                }
+        );
+        assert_eq!(
+            manager.job(id).expect("job must exist").state(),
+            DownloadState::Queued
+        );
     }
 
     #[tokio::test]
