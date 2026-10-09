@@ -99,6 +99,8 @@ pub fn run() {
                     .await
                     .map_err(|_| std::io::Error::other("Could not open the download database."))?;
 
+                let resume_store = repository.http_resume_store();
+
                 let manager = DownloadManager::start(repository)
                     .await
                     .map_err(|_| std::io::Error::other("Could not load saved downloads."))?;
@@ -109,7 +111,7 @@ pub fn run() {
                 Ok::<_, std::io::Error>(DesktopState {
                     destination: Mutex::new(None),
                     manager: tokio::sync::Mutex::new(manager),
-                    executor: HttpExecutor::new(client),
+                    executor: HttpExecutor::with_resume_store(client, resume_store),
                     active: Mutex::new(None),
                 })
             })?;

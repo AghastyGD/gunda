@@ -5,7 +5,7 @@ use gunda_core::download::{
     DownloadDestination, DownloadOrigin, DownloadState, FileConflictPolicy, NewDownload,
     RequestContext,
 };
-use gunda_http::{HttpClient, HttpExecutor, partial_path};
+use gunda_http::{HttpClient, HttpExecutor, HttpResumeStore, partial_path};
 use gunda_storage::SqliteDownloadRepository;
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -73,6 +73,7 @@ async fn serve_stalled(point: CancellationPoint) -> StalledServer {
                         b"HTTP/1.1 200 OK\r\n\
                           Content-Length: 10\r\n\
                           Content-Type: application/octet-stream\r\n\
+                          ETag: \"version-42\"\r\n\
                           Connection: close\r\n\
                           \r\n\
                           hello",
@@ -111,6 +112,7 @@ async fn run_cancellation_case(point: CancellationPoint) {
         .await
         .expect("repository must open");
 
+    let resume_store = repository.http_resume_store();
     let mut manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
@@ -138,7 +140,10 @@ async fn run_cancellation_case(point: CancellationPoint) {
     let staging_path = partial_path(&output_directory, id);
     let final_path = output_directory.join("file.bin");
 
-    let executor = HttpExecutor::new(HttpClient::new().expect("HTTP client must build"));
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        resume_store.clone(),
+    );
 
     let cancellation = DownloadCancellation::new();
     let inspection_handle = cancellation.clone();
@@ -249,11 +254,31 @@ async fn run_cancellation_case(point: CancellationPoint) {
         }
     }
 
+    let expected_resume = resume_store.find(id).await.expect("checkpoint must load");
+    match point {
+        CancellationPoint::BeforeHeaders => assert!(expected_resume.is_none()),
+        CancellationPoint::DuringBody => {
+            let state = expected_resume.as_ref().expect("checkpoint must exist");
+            assert_eq!(state.strong_etag().as_bytes(), b"\"version-42\"");
+            assert_eq!(state.total_bytes(), 10);
+            assert_eq!(state.durable_bytes(), 5);
+        }
+    }
+
     manager.into_repository().close().await;
 
     let repository = SqliteDownloadRepository::open(&database_path)
         .await
         .expect("repository must reopen");
+
+    assert_eq!(
+        repository
+            .http_resume_store()
+            .find(id)
+            .await
+            .expect("checkpoint must survive reopen"),
+        expected_resume
+    );
 
     let manager = DownloadManager::start(repository)
         .await

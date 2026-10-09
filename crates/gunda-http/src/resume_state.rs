@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::pin::Pin;
 
 use gunda_core::application::RepositoryError;
 use gunda_core::download::DownloadId;
@@ -79,6 +80,49 @@ pub trait HttpResumeStore: Send + Sync {
         id: DownloadId,
         state: &HttpResumeState,
     ) -> impl Future<Output = Result<HttpResumeState, RepositoryError>> + Send;
+}
+
+pub(crate) type StoreFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, RepositoryError>> + Send + 'a>>;
+
+pub(crate) trait ResumePersistence: Send + Sync {
+    fn initialize_state(
+        &self,
+        id: DownloadId,
+        strong_etag: StrongEntityTag,
+        total_bytes: u64,
+    ) -> StoreFuture<'_, HttpResumeState>;
+
+    fn find_state(&self, id: DownloadId) -> StoreFuture<'_, Option<HttpResumeState>>;
+
+    fn save_state(
+        &self,
+        id: DownloadId,
+        state: HttpResumeState,
+    ) -> StoreFuture<'_, HttpResumeState>;
+}
+
+impl<S: HttpResumeStore> ResumePersistence for S {
+    fn initialize_state(
+        &self,
+        id: DownloadId,
+        strong_etag: StrongEntityTag,
+        total_bytes: u64,
+    ) -> StoreFuture<'_, HttpResumeState> {
+        Box::pin(async move { self.initialize(id, &strong_etag, total_bytes).await })
+    }
+
+    fn find_state(&self, id: DownloadId) -> StoreFuture<'_, Option<HttpResumeState>> {
+        Box::pin(async move { self.find(id).await })
+    }
+
+    fn save_state(
+        &self,
+        id: DownloadId,
+        state: HttpResumeState,
+    ) -> StoreFuture<'_, HttpResumeState> {
+        Box::pin(async move { self.save_checkpoint(id, &state).await })
+    }
 }
 
 #[cfg(test)]

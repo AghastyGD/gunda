@@ -2,12 +2,18 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use gunda_core::application::RepositoryErrorKind;
 use gunda_core::application::{DownloadCancellation, TransferOutcome, TransferProgress};
 use gunda_core::download::{DownloadId, RequestContext};
+use tokio::fs::File;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 
+use crate::HttpResumeState;
+use crate::resume_state::ResumePersistence;
 use crate::{HttpBody, HttpClient, HttpError, HttpInspection};
 
 /// File operation that failed withour exposing the affected path.
@@ -31,6 +37,7 @@ pub enum PartialDownloadError {
 
     ByteCountOverflow,
     InvalidBodyState,
+    ResumeStore(RepositoryErrorKind),
 }
 
 impl fmt::Display for PartialDownloadError {
@@ -45,6 +52,9 @@ impl fmt::Display for PartialDownloadError {
             }
             Self::InvalidBodyState => {
                 f.write_str("HTTP body is no longer available for a complete transfer")
+            }
+            Self::ResumeStore(kind) => {
+                write!(f, "HTTP resume storage failed: {kind:?}")
             }
         }
     }
@@ -129,14 +139,40 @@ pub async fn download_to_partial(
 /// The body must not have been consumed or failed.
 /// Existing files are never overwritten.
 pub(crate) async fn write_body_to_partial(
-    mut body: HttpBody,
+    body: HttpBody,
     id: DownloadId,
     directory: &Path,
     progress: TransferProgress,
     cancellation: DownloadCancellation,
 ) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
+    write_body_to_partial_with_resume(body, id, directory, progress, cancellation, None).await
+}
+pub(crate) async fn write_body_to_partial_with_resume(
+    mut body: HttpBody,
+    id: DownloadId,
+    directory: &Path,
+    progress: TransferProgress,
+    cancellation: DownloadCancellation,
+    resume_store: Option<Arc<dyn ResumePersistence>>,
+) -> Result<TransferOutcome<PartialDownload>, PartialDownloadError> {
     if !body.is_unconsumed() {
         return Err(PartialDownloadError::InvalidBodyState);
+    }
+
+    if cancellation.is_requested() {
+        return Ok(TransferOutcome::Cancelled { written_bytes: 0 });
+    }
+
+    if let Some(store) = resume_store.as_ref()
+        && store
+            .find_state(id)
+            .await
+            .map_err(|error| PartialDownloadError::ResumeStore(error.kind()))?
+            .is_some()
+    {
+        return Err(PartialDownloadError::ResumeStore(
+            RepositoryErrorKind::ConstraintViolation,
+        ));
     }
 
     if cancellation.is_requested() {
@@ -153,21 +189,71 @@ pub(crate) async fn write_body_to_partial(
         .await
         .map_err(|error| file_error(FileOperation::Create, error))?;
 
+    let mut resume_state = None;
+
+    if let (Some(store), Some(tag), Some(total)) = (
+        resume_store.as_ref(),
+        metadata.strong_etag(),
+        metadata.content_length(),
+    ) {
+        let expected = HttpResumeState::new(tag.clone(), total, 0)
+            .map_err(|_| PartialDownloadError::ResumeStore(RepositoryErrorKind::InvalidData))?;
+
+        let persisted = store
+            .initialize_state(id, tag.clone(), total)
+            .await
+            .map_err(|error| PartialDownloadError::ResumeStore(error.kind()))?;
+
+        if persisted != expected {
+            return Err(PartialDownloadError::ResumeStore(
+                RepositoryErrorKind::InvalidData,
+            ));
+        }
+
+        resume_state = Some(persisted);
+    }
+
     let mut written_bytes = 0_u64;
+    let mut last_checkpoint_bytes = 0_u64;
+    let mut last_checkpoint_at = Instant::now();
 
     loop {
-        let chunk = tokio::select! {
+        let received = tokio::select! {
             biased;
 
-            _ = cancellation.cancelled() => {
-                return Ok(TransferOutcome::Cancelled { written_bytes })
-            }
-
-            result = body.next_chunk() => result?,
+            _ = cancellation.cancelled() => None,
+            result = body.next_chunk() => Some(result),
         };
 
-        let Some(chunk) = chunk else {
-            break;
+        let chunk = match received {
+            None => {
+                sync_checkpoint(
+                    &mut file,
+                    id,
+                    resume_store.as_deref(),
+                    &mut resume_state,
+                    written_bytes,
+                )
+                .await?;
+
+                return Ok(TransferOutcome::Cancelled { written_bytes });
+            }
+
+            Some(Err(error)) => {
+                sync_checkpoint(
+                    &mut file,
+                    id,
+                    resume_store.as_deref(),
+                    &mut resume_state,
+                    written_bytes,
+                )
+                .await?;
+
+                return Err(error.into());
+            }
+
+            Some(Ok(None)) => break,
+            Some(Ok(Some(chunk))) => chunk,
         };
 
         let size =
@@ -177,7 +263,7 @@ pub(crate) async fn write_body_to_partial(
             .checked_add(size)
             .ok_or(PartialDownloadError::ByteCountOverflow)?;
 
-        // Finish an accepted write before acknowledging cancellation
+        // Finish an accepted write before acknowledging cancellation.
         file.write_all(&chunk)
             .await
             .map_err(|error| file_error(FileOperation::Write, error))?;
@@ -188,17 +274,40 @@ pub(crate) async fn write_body_to_partial(
 
         written_bytes = next_written_bytes;
         progress.report_written(written_bytes);
+
+        let checkpoint_due = resume_state.is_some()
+            && (written_bytes - last_checkpoint_bytes >= 8 * 1024 * 1024
+                || last_checkpoint_at.elapsed() >= Duration::from_secs(1));
+
+        if checkpoint_due {
+            sync_checkpoint(
+                &mut file,
+                id,
+                resume_store.as_deref(),
+                &mut resume_state,
+                written_bytes,
+            )
+            .await?;
+
+            last_checkpoint_bytes = written_bytes;
+            last_checkpoint_at = Instant::now();
+        }
     }
+
+    sync_checkpoint(
+        &mut file,
+        id,
+        resume_store.as_deref(),
+        &mut resume_state,
+        written_bytes,
+    )
+    .await?;
+
+    drop(file);
 
     if cancellation.is_requested() {
         return Ok(TransferOutcome::Cancelled { written_bytes });
     }
-
-    file.sync_all()
-        .await
-        .map_err(|error| file_error(FileOperation::Sync, error))?;
-
-    drop(file);
 
     Ok(TransferOutcome::Finished(PartialDownload {
         id,
@@ -206,6 +315,56 @@ pub(crate) async fn write_body_to_partial(
         written_bytes,
         metadata,
     }))
+}
+
+async fn sync_checkpoint(
+    file: &mut File,
+    id: DownloadId,
+    store: Option<&dyn ResumePersistence>,
+    state: &mut Option<HttpResumeState>,
+    written_bytes: u64,
+) -> Result<(), PartialDownloadError> {
+    file.flush()
+        .await
+        .map_err(|error| file_error(FileOperation::Flush, error))?;
+
+    file.sync_all()
+        .await
+        .map_err(|error| file_error(FileOperation::Sync, error))?;
+
+    let Some(current) = state.as_ref() else {
+        return Ok(());
+    };
+
+    if written_bytes == current.durable_bytes() {
+        return Ok(());
+    }
+
+    let store = store.ok_or(PartialDownloadError::ResumeStore(
+        RepositoryErrorKind::InvalidData,
+    ))?;
+
+    let candidate = HttpResumeState::new(
+        current.strong_etag().clone(),
+        current.total_bytes(),
+        written_bytes,
+    )
+    .map_err(|_| PartialDownloadError::ResumeStore(RepositoryErrorKind::InvalidData))?;
+
+    let persisted = store
+        .save_state(id, candidate.clone())
+        .await
+        .map_err(|error| PartialDownloadError::ResumeStore(error.kind()))?;
+
+    if persisted != candidate {
+        return Err(PartialDownloadError::ResumeStore(
+            RepositoryErrorKind::InvalidData,
+        ));
+    }
+
+    *state = Some(persisted);
+
+    Ok(())
 }
 
 fn file_error(operation: FileOperation, error: io::Error) -> PartialDownloadError {

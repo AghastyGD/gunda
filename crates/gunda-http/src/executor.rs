@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, ExecutionInput, ExecutionOutput, PreparedTransfer,
@@ -9,8 +10,10 @@ use gunda_core::download::{
     ResourceDescriptor, ResourceKind,
 };
 
+use crate::HttpResumeStore;
 use crate::destination::plan_destination;
-use crate::partial::write_body_to_partial;
+use crate::partial::write_body_to_partial_with_resume;
+use crate::resume_state::ResumePersistence;
 use crate::{
     FinalizeError, HttpBody, HttpClient, HttpError, PartialDownload, PartialDownloadError,
     finalize_download,
@@ -19,12 +22,27 @@ use crate::{
 /// Executes a direct HTTP resource as a file.
 pub struct HttpExecutor {
     client: HttpClient,
+    resume_store: Option<Arc<dyn ResumePersistence>>,
 }
 
 impl HttpExecutor {
     #[must_use]
     pub fn new(client: HttpClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            resume_store: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_resume_store<S>(client: HttpClient, store: S) -> Self
+    where
+        S: HttpResumeStore + 'static,
+    {
+        Self {
+            client,
+            resume_store: Some(Arc::new(store)),
+        }
     }
 }
 
@@ -34,6 +52,7 @@ pub struct HttpPreparedTransfer {
     id: DownloadId,
     destination: DownloadDestination,
     planned_destination: ResolvedDestination,
+    resume_store: Option<Arc<dyn ResumePersistence>>,
 }
 
 /// A complete partial file awaiting publication.
@@ -62,6 +81,7 @@ impl DownloadExecutor for HttpExecutor {
             id,
             destination,
             planned_destination,
+            resume_store: self.resume_store.clone(),
         })
     }
 }
@@ -94,13 +114,20 @@ impl PreparedTransfer for HttpPreparedTransfer {
             body,
             id,
             destination,
+            resume_store,
             ..
         } = self;
 
-        let outcome =
-            write_body_to_partial(body, id, destination.directory(), progress, cancellation)
-                .await
-                .map_err(partial_failure)?;
+        let outcome = write_body_to_partial_with_resume(
+            body,
+            id,
+            destination.directory(),
+            progress,
+            cancellation,
+            resume_store,
+        )
+        .await
+        .map_err(partial_failure)?;
 
         Ok(match outcome {
             TransferOutcome::Finished(partial) => TransferOutcome::Finished(HttpStagedTransfer {
@@ -206,6 +233,12 @@ fn partial_failure(error: PartialDownloadError) -> DownloadFailure {
         PartialDownloadError::ByteCountOverflow => DownloadFailure::new(
             FailureKind::UnsupportedResource,
             "resource size exceeds the supported range",
+            false,
+        ),
+
+        PartialDownloadError::ResumeStore(_) => DownloadFailure::new(
+            FailureKind::Storage,
+            "could not persist HTTP resume state",
             false,
         ),
     }

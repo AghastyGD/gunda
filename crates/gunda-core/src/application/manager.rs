@@ -308,12 +308,23 @@ where
                 _ = checkpoints.tick() => {
                     let written_bytes = *progress_receiver.borrow();
 
-                    self.checkpoint_progress(
+                    let checkpoint = self.checkpoint_progress(
                         &mut job,
                         written_bytes,
                         on_progress,
-                    )
-                    .await?;
+                    );
+                    tokio::pin!(checkpoint);
+
+                    // The transfer may hold a storage connection needed by this checkpoint.
+                    tokio::select! {
+                        biased;
+
+                        result = &mut transfer => {
+                            checkpoint.await?;
+                            break result;
+                        }
+                        result = &mut checkpoint => result?,
+                    }
                 }
             }
         };
@@ -724,6 +735,7 @@ mod tests {
         save_calls: Arc<AtomicUsize>,
         fail_save_at: Option<DownloadState>,
         fail_progress_save: bool,
+        shared_connection: Option<Arc<CheckpointContention>>,
     }
 
     impl FakeRepository {
@@ -739,6 +751,7 @@ mod tests {
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
                 fail_progress_save: false,
+                shared_connection: None,
             }
         }
 
@@ -752,6 +765,7 @@ mod tests {
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
                 fail_progress_save: false,
+                shared_connection: None,
             }
         }
 
@@ -765,6 +779,7 @@ mod tests {
                 save_calls: Arc::new(AtomicUsize::new(0)),
                 fail_save_at: None,
                 fail_progress_save: false,
+                shared_connection: None,
             }
         }
     }
@@ -821,6 +836,16 @@ mod tests {
 
         async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
             self.save_calls.fetch_add(1, Ordering::Relaxed);
+
+            let _connection = if let Some(shared) = &self.shared_connection
+                && job.state() == DownloadState::Downloading
+                && job.progress().downloaded_bytes() > 0
+            {
+                shared.checkpoint_waiting.notify_one();
+                Some(shared.connection.lock().await)
+            } else {
+                None
+            };
 
             if self.fail_save
                 || self.fail_save_at == Some(job.state())
@@ -1492,9 +1517,15 @@ mod tests {
         );
     }
 
+    struct CheckpointContention {
+        connection: tokio::sync::Mutex<()>,
+        checkpoint_waiting: tokio::sync::Notify,
+    }
+
     #[derive(Clone)]
     struct ProgressProbe {
         finalizations: Arc<AtomicUsize>,
+        shared_connection: Option<Arc<CheckpointContention>>,
     }
 
     impl DownloadExecutor for ProgressProbe {
@@ -1525,6 +1556,15 @@ mod tests {
             progress: TransferProgress,
             cancellation: DownloadCancellation,
         ) -> Result<TransferOutcome<Self::Staged>, DownloadFailure> {
+            if let Some(shared) = &self.shared_connection {
+                let connection = shared.connection.lock().await;
+                progress.report_written(2);
+                shared.checkpoint_waiting.notified().await;
+                drop(connection);
+                progress.report_written(5);
+                return Ok(TransferOutcome::Finished(self));
+            }
+
             progress.report_written(2);
 
             tokio::select! {
@@ -1572,6 +1612,7 @@ mod tests {
 
         let executor = ProgressProbe {
             finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
         };
 
         let mut observed = Vec::new();
@@ -1612,6 +1653,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn transfer_keeps_running_while_progress_waits_for_a_shared_connection() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let shared = Arc::new(CheckpointContention {
+            connection: tokio::sync::Mutex::new(()),
+            checkpoint_waiting: tokio::sync::Notify::new(),
+        });
+        manager.repository.shared_connection = Some(shared.clone());
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: finalizations.clone(),
+            shared_connection: Some(shared),
+        };
+        let mut observed = Vec::new();
+
+        let report = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.execute_with_progress(id, &executor, |event| {
+                if let DownloadEvent::ProgressChanged { progress, .. } = event {
+                    observed.push(progress.downloaded_bytes());
+                }
+            }),
+        )
+        .await
+        .expect("progress persistence must not prevent the transfer from releasing its connection")
+        .expect("execution must succeed");
+
+        assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+        assert_eq!(observed, vec![2, 5]);
+        assert_eq!(finalizations.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn checkpoint_failure_emits_no_progress_and_prevents_publication() {
         let (mut manager, _, id) = execution_fixture(None, None).await;
         manager.repository.fail_progress_save = true;
@@ -1619,6 +1692,7 @@ mod tests {
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
             finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
         };
 
         let mut notifications = 0;
@@ -1713,6 +1787,7 @@ mod tests {
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
             finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
         };
 
         let cancellation = DownloadCancellation::new();
@@ -1759,6 +1834,7 @@ mod tests {
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
             finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
         };
 
         let cancellation = DownloadCancellation::new();
@@ -1797,6 +1873,7 @@ mod tests {
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
             finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
         };
 
         let cancellation = DownloadCancellation::new();
