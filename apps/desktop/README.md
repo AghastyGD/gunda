@@ -1,42 +1,35 @@
-# sv
-
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
-
-## Creating a project
-
-If you're seeing this, you've probably already done this step. Congrats!
+# Rust-native desktop
 
 ```sh
-# create a new project
-npx sv create my-app
+cargo run -p gunda-desktop --locked
 ```
 
-To recreate this project with the same configuration:
+This workspace member connects egui to the existing HTTP executor, SQLite store,
+and application manager.
+
+The manager runs on a background Tokio runtime. The UI sends commands and receives
+coalesced snapshots; active cancellation has a separate signal so it does not
+wait for execution to release the manager. Folder selection retains a native
+`PathBuf`; strings are display-only. Source labels omit URL credentials, paths,
+and query parameters.
+
+The shared data folder is the platform-local data directory followed by
+`io.github.aghastygd.gunda`. A runtime lease prevents two clients from owning it.
+Use `--data-dir PATH` for isolated manual tests. The egui window/theme settings
+are stored under `ui-egui` inside that folder.
+
+Ctrl+N opens Add download. Arrow keys select rows when a text field or dialog
+does not have keyboard focus; Enter opens details. Escape or Hide dismisses a
+dialog without cancelling a transfer.
+
+## Validation
 
 ```sh
-# recreate this project
-pnpm dlx sv@0.17.0 create --template minimal --types ts --install pnpm apps/desktop
+cargo test -p gunda-desktop --locked
+cargo clippy -p gunda-desktop --all-targets --locked -- -D warnings
 ```
 
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+Integration tests use local HTTP fixtures and temporary data/output folders.
+Native picker, keyboard, and platform rendering still require manual checks.
+The transfer panel is an egui window within the main native window, not a separate
+OS window. No simulated downloads or segmented-transfer graphics are included.
