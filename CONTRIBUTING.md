@@ -15,22 +15,21 @@ Security issues should be reported through [SECURITY.md](SECURITY.md), not in a 
 
 You'll need Rust and the dependencies required by the part of Gunda you're working on.
 
-For desktop development, you'll also need Node.js, pnpm and the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for your platform.
+The desktop uses egui/eframe and requires OpenGL and your platform's window-system libraries. On Linux, folder selection needs a file-picker portal backend or Zenity.
 
 Before opening a pull request, run:
 
 ```console
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo build --workspace --all-features
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo build --workspace --all-features --locked
 ```
 
-For desktop changes, also run from `apps/desktop`:
+For desktop changes, also launch the native app with an isolated data folder and check the affected interactions:
 
 ```console
-pnpm check
-pnpm build
+cargo run -p gunda-desktop --locked -- --data-dir /path/to/test-data
 ```
 
 ## Tests
@@ -45,7 +44,7 @@ Gunda supports native filesystem paths, so avoid assuming paths are always valid
 
 ## A few project rules
 
-The Rust core should stay independent of Tauri and presentation code.
+The Rust core should stay independent of egui and presentation code.
 
 Protocol-specific behavior belongs in the relevant protocol implementation, and database-specific types should stay outside the core.
 

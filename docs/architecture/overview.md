@@ -21,7 +21,7 @@ This includes:
 * download manager orchestration
 * execution and cancellation contracts
 
-The core does not depend on Tauri, Svelte, SQLx, SQLite, or protocol-specific implementations.
+The core does not depend on egui, eframe, SQLx, SQLite, or protocol-specific implementations.
 
 ### `gunda-storage`
 
@@ -56,18 +56,18 @@ Future protocol engines may reuse the shared HTTP transport without depending on
 
 ### Desktop
 
-The Tauri desktop application is currently the composition root.
+The Rust-native desktop application in `apps/desktop` is currently the composition root.
 
 It connects:
 
 * `gunda-core`
 * `gunda-storage`
 * `gunda-http`
-* the Svelte desktop interface
+* the egui/eframe desktop interface
 
-Tauri commands and events form the boundary between the Rust application layer and the frontend.
+A background Tokio worker owns the manager, executor, and runtime lease. The UI sends commands and receives coalesced snapshots through channels; active cancellation uses a separate signal.
 
-The frontend owns presentation and local UI state. Download lifecycle decisions remain in Rust.
+The egui interface owns presentation and local UI state. Download lifecycle decisions remain in the manager.
 
 ## Dependency direction
 

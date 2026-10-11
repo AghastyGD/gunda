@@ -336,6 +336,22 @@ impl StagedTransfer for HttpStagedTransfer {
 }
 
 fn http_failure(error: HttpError) -> DownloadFailure {
+    if let HttpError::UnexpectedStatus(status) = error {
+        let kind = if matches!(status, 401 | 403) {
+            FailureKind::Authentication
+        } else {
+            FailureKind::RemoteRejected
+        };
+        let reason = reqwest::StatusCode::from_u16(status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("Unknown status");
+        return DownloadFailure::new(
+            kind,
+            format!("HTTP {status} {reason}"),
+            matches!(status, 408 | 429 | 500..=599),
+        );
+    }
     let (kind, message, retryable) = match error {
         HttpError::Configuration => (
             FailureKind::Internal,
@@ -349,21 +365,7 @@ fn http_failure(error: HttpError) -> DownloadFailure {
         ),
         HttpError::Timeout => (FailureKind::Network, "HTTP request timed out", true),
         HttpError::Transport => (FailureKind::Network, "HTTP transport failed", true),
-        HttpError::UnexpectedStatus(401 | 403) => (
-            FailureKind::Authentication,
-            "remote server rejected request authorization",
-            false,
-        ),
-        HttpError::UnexpectedStatus(408 | 429 | 500..=599) => (
-            FailureKind::RemoteRejected,
-            "remote server returned a potentially temporary failure",
-            true,
-        ),
-        HttpError::UnexpectedStatus(_) => (
-            FailureKind::RemoteRejected,
-            "remote server returned an unsupported response status",
-            false,
-        ),
+        HttpError::UnexpectedStatus(_) => unreachable!("HTTP statuses handled above"),
         HttpError::InvalidMetadata => (
             FailureKind::InvalidResponse,
             "HTTP response metadata is invalid",
@@ -531,4 +533,29 @@ fn filesystem_failure(kind: io::ErrorKind) -> DownloadFailure {
     };
 
     DownloadFailure::new(failure_kind, message, false)
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn http_status_failures_preserve_codes_reasons_and_retryability() {
+        for (status, reason, kind, retryable) in [
+            (403, "Forbidden", FailureKind::Authentication, false),
+            (404, "Not Found", FailureKind::RemoteRejected, false),
+            (429, "Too Many Requests", FailureKind::RemoteRejected, true),
+            (
+                503,
+                "Service Unavailable",
+                FailureKind::RemoteRejected,
+                true,
+            ),
+        ] {
+            let failure = http_failure(HttpError::UnexpectedStatus(status));
+            assert_eq!(failure.message(), format!("HTTP {status} {reason}"));
+            assert_eq!(failure.kind(), kind);
+            assert_eq!(failure.is_retryable(), retryable);
+        }
+    }
 }

@@ -4,37 +4,32 @@
 
 Gunda is a cross-platform download manager written in Rust and developed Linux-first.
 
-I'm building it around reliable downloads first, with browser integration and native support for streaming protocols such as HLS and DASH planned as the project grows.
+I'm building Gunda with reliable downloads as the priority. It's under active development, with download history and support for resuming interrupted transfers when supported by the server.
 
-## Status
+## Run from source
 
-Gunda is still under active development.
-
-The desktop can currently download files over HTTP/HTTPS, choose a destination, show live progress, cancel an active transfer, resume safely checkpointed downloads after a restart, and keep download records in SQLite.
-
-Only one download can run at a time. Downloads without a strong HTTP validator cannot be resumed. Browser integration, HLS, and DASH are not available yet.
-
-## Running the desktop
-
-You'll need:
-
-- Rust
-- Node.js
-- pnpm
-- the [Tauri 2 prerequisites](https://v2.tauri.app/start/prerequisites/) for
-  your operating system
-
-Then:
+With Rust installed:
 
 ```console
-cd apps/desktop
-pnpm install
-pnpm tauri dev
+git clone https://github.com/AghastyGD/gunda.git
+cd gunda
+cargo run -p gunda-desktop --locked
 ```
 
-Gunda is still early, so expect things to change.
+For development setup and contribution guidelines, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-If you'd like to contribute, see [CONTRIBUTING.md](CONTRIBUTING)
+## Tests
+
+```console
+cargo test --workspace --all-features --locked
+```
+
+## Feedback
+
+Found a bug? [Open an issue](https://github.com/AghastyGD/gunda/issues). Include your operating system, what happened, and any error message. For download failures, include the link if it's public, without private tokens or credentials.
+
+For security reports, see [SECURITY.md](SECURITY.md).
+
 ## License
 
 Gunda is licensed under the [GNU General Public License v3.0 only](LICENSE).
