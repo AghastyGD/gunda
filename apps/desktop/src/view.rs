@@ -13,7 +13,7 @@ pub struct DownloadView {
     pub origin: &'static str,
     pub destination: PathBuf,
     pub output: Option<PathBuf>,
-    pub error: Option<&'static str>,
+    pub error: Option<String>,
 }
 
 impl DownloadView {
@@ -55,8 +55,13 @@ impl DownloadView {
             output,
             error: (job.state() == DownloadState::Failed)
                 .then(|| {
-                    job.last_failure()
-                        .map(|failure| failure_message(failure.kind()))
+                    job.last_failure().map(|failure| {
+                        format!(
+                            "{}\nDetails: {}",
+                            failure_message(failure.kind()),
+                            failure.message()
+                        )
+                    })
                 })
                 .flatten(),
         }

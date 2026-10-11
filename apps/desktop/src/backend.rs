@@ -497,7 +497,9 @@ mod tests {
         })
         .await;
         let view = &snapshot.jobs[0];
-        assert!(view.error.is_some());
+        let error = view.error.as_deref().unwrap();
+        assert!(error.contains("HTTP 403 Forbidden"));
+        assert!(!error.contains("private"));
         assert!(!view.source.contains("private"));
         assert!(view.output.is_none());
         server.await.unwrap();

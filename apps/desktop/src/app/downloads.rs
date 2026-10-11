@@ -239,7 +239,10 @@ impl Desktop {
                         });
                         row.col(|ui| {
                             let color = self.state_color(view, active);
-                            ui.colored_label(color, view.label(active));
+                            let response = ui.colored_label(color, view.label(active));
+                            if let Some(error) = &view.error {
+                                response.on_hover_text(error);
+                            }
                         });
                         row.col(|ui| {
                             progress(ui, view, 135.0);
@@ -312,7 +315,7 @@ impl Desktop {
                         }
                     });
             });
-            if let Some(error) = view.error {
+            if let Some(error) = &view.error {
                 ui.colored_label(self.error_color(), error);
             }
         });

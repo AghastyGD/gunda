@@ -246,7 +246,7 @@ impl Desktop {
                     .to_string_lossy();
                 ui.add(egui::Label::new(destination.as_ref()).truncate())
                     .on_hover_text(destination.as_ref());
-                if let Some(error) = view.error {
+                if let Some(error) = &view.error {
                     ui.add_space(10.0);
                     notice(ui, error, self.error_color());
                 }
