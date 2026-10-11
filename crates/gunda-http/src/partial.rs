@@ -86,7 +86,7 @@ pub struct PartialDownload {
     path: PathBuf,
     written_bytes: u64,
     metadata: HttpInspection,
-    identity: Handle,
+    identity: Box<Handle>,
 }
 
 impl PartialDownload {
@@ -494,7 +494,7 @@ async fn stream_to_partial(
         path,
         written_bytes,
         metadata,
-        identity,
+        identity: Box::new(identity),
     }))
 }
 
