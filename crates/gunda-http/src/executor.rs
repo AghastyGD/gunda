@@ -15,7 +15,7 @@ use crate::destination::plan_destination;
 use crate::partial::{
     ResumeBody, ResumeTransfer, resume_body_to_partial, write_body_to_partial_with_resume,
 };
-use crate::recovery::{ResumeFileError, inspect_resume_candidate};
+use crate::recovery::{ResumeFileError, ResumePartial, inspect_resume_candidate};
 use crate::resume_state::ResumePersistence;
 use crate::{
     FinalizeError, HttpBody, HttpClient, HttpError, HttpInspection, HttpResumeState,
@@ -66,6 +66,7 @@ enum HttpPreparedBody {
     Resumed {
         body: ResumeBody,
         state: HttpResumeState,
+        partial: ResumePartial,
     },
 }
 
@@ -149,7 +150,7 @@ impl DownloadExecutor for HttpExecutor {
             recovery_integrity("interrupted HTTP download has no planned destination")
         })?;
 
-        inspect_resume_candidate(
+        let partial = inspect_resume_candidate(
             &partial_path(destination.directory(), id),
             (resume_state.durable_bytes() == resume_state.total_bytes())
                 .then(|| planned_destination.final_path()),
@@ -214,6 +215,7 @@ impl DownloadExecutor for HttpExecutor {
             body: HttpPreparedBody::Resumed {
                 body,
                 state: resume_state.clone(),
+                partial,
             },
             metadata,
             resource,
@@ -271,7 +273,11 @@ impl PreparedTransfer for HttpPreparedTransfer {
                 )
                 .await
             }
-            HttpPreparedBody::Resumed { body, state } => {
+            HttpPreparedBody::Resumed {
+                body,
+                state,
+                partial,
+            } => {
                 let store = resume_store.ok_or_else(|| {
                     storage_failure("HTTP resume state has no persistence adapter")
                 })?;
@@ -281,6 +287,7 @@ impl PreparedTransfer for HttpPreparedTransfer {
                         body,
                         metadata,
                         state,
+                        partial,
                     },
                     id,
                     destination.directory(),

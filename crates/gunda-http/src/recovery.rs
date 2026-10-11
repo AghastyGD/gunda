@@ -5,6 +5,8 @@ use std::io;
 use std::path::Path;
 
 use gunda_core::download::{DownloadJob, DownloadState, ResourceKind};
+use same_file::Handle;
+use tokio::fs::{File, OpenOptions};
 
 use crate::partial_path;
 
@@ -67,6 +69,17 @@ pub(crate) enum ResumeFileError {
     OutputUnavailable(io::ErrorKind),
 }
 
+pub(crate) struct ResumePartial {
+    file: File,
+    identity: Handle,
+}
+
+impl ResumePartial {
+    pub(crate) fn into_parts(self) -> (File, Handle) {
+        (self.file, self.identity)
+    }
+}
+
 impl fmt::Display for RecoveryInspectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -118,7 +131,7 @@ pub(crate) async fn inspect_resume_candidate(
     partial_path: &Path,
     planned_output: Option<&Path>,
     durable_bytes: u64,
-) -> Result<u64, ResumeFileError> {
+) -> Result<ResumePartial, ResumeFileError> {
     if let Some(path) = planned_output {
         match inspect_path(path).await {
             LocalFileState::Missing => {}
@@ -130,13 +143,93 @@ pub(crate) async fn inspect_resume_candidate(
     }
 
     match inspect_path(partial_path).await {
-        LocalFileState::RegularFile { bytes } if bytes >= durable_bytes => Ok(bytes),
+        LocalFileState::RegularFile { bytes } if bytes >= durable_bytes => Ok(()),
         LocalFileState::RegularFile { .. } => Err(ResumeFileError::PartialTooShort),
         LocalFileState::Missing => Err(ResumeFileError::MissingPartial),
         LocalFileState::Unavailable { kind } => Err(ResumeFileError::PartialUnavailable(kind)),
         LocalFileState::Symlink | LocalFileState::Other => Err(ResumeFileError::UnsafePartial),
+    }?;
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_no_follow(&mut options);
+
+    let file = match options.open(partial_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(match inspect_path(partial_path).await {
+                LocalFileState::Missing => ResumeFileError::MissingPartial,
+                LocalFileState::Symlink | LocalFileState::Other => ResumeFileError::UnsafePartial,
+                _ => ResumeFileError::PartialUnavailable(error.kind()),
+            });
+        }
+    };
+
+    let metadata = file
+        .metadata()
+        .await
+        .map_err(|error| ResumeFileError::PartialUnavailable(error.kind()))?;
+
+    if !metadata.is_file() {
+        return Err(ResumeFileError::UnsafePartial);
+    }
+
+    if metadata.len() < durable_bytes {
+        return Err(ResumeFileError::PartialTooShort);
+    }
+
+    let identity = file_identity(&file)
+        .await
+        .map_err(|error| ResumeFileError::PartialUnavailable(error.kind()))?;
+
+    match path_matches_identity(partial_path, &identity).await {
+        Ok(true) => Ok(ResumePartial { file, identity }),
+        Ok(false) => Err(ResumeFileError::UnsafePartial),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Err(ResumeFileError::MissingPartial)
+        }
+        Err(error) => Err(ResumeFileError::PartialUnavailable(error.kind())),
     }
 }
+
+pub(crate) async fn file_identity(file: &File) -> io::Result<Handle> {
+    let clone = file.try_clone().await?.into_std().await;
+    tokio::task::spawn_blocking(move || Handle::from_file(clone))
+        .await
+        .map_err(io::Error::other)?
+}
+
+pub(crate) async fn path_matches_identity(path: &Path, identity: &Handle) -> io::Result<bool> {
+    if !tokio::fs::symlink_metadata(path)
+        .await?
+        .file_type()
+        .is_file()
+    {
+        return Ok(false);
+    }
+
+    let path = path.to_owned();
+    let path_identity = tokio::task::spawn_blocking(move || Handle::from_path(path))
+        .await
+        .map_err(io::Error::other)??;
+
+    Ok(path_identity == *identity)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_no_follow(options: &mut OpenOptions) {
+    const O_NOFOLLOW: i32 = 0x20_000;
+    options.custom_flags(O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn configure_no_follow(options: &mut OpenOptions) {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn configure_no_follow(_options: &mut OpenOptions) {}
 
 pub(crate) async fn inspect_path(path: &Path) -> LocalFileState {
     match tokio::fs::symlink_metadata(path).await {

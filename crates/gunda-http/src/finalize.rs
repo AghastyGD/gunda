@@ -136,8 +136,10 @@ async fn publish(
     let metadata = tokio::fs::symlink_metadata(partial.path())
         .await
         .map_err(file_error)?;
+    let path_matches = partial.path_matches_open_file().await.map_err(file_error)?;
 
-    if !metadata.file_type().is_file() || metadata.len() != partial.written_bytes() {
+    if !metadata.file_type().is_file() || metadata.len() != partial.written_bytes() || !path_matches
+    {
         return Err(FinalizeError::InvalidPartial);
     }
 

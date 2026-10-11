@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use gunda_core::application::RepositoryErrorKind;
 use gunda_core::application::{DownloadCancellation, TransferOutcome, TransferProgress};
 use gunda_core::download::{DownloadId, RequestContext};
+use same_file::Handle;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use crate::HttpResumeState;
+use crate::recovery::{ResumePartial, file_identity, path_matches_identity};
 use crate::resume_state::ResumePersistence;
 use crate::{HttpBody, HttpClient, HttpError, HttpInspection, HttpRangeBody};
 
@@ -84,6 +86,7 @@ pub struct PartialDownload {
     path: PathBuf,
     written_bytes: u64,
     metadata: HttpInspection,
+    identity: Handle,
 }
 
 impl PartialDownload {
@@ -104,6 +107,10 @@ impl PartialDownload {
     #[must_use]
     pub const fn metadata(&self) -> &HttpInspection {
         &self.metadata
+    }
+
+    pub(crate) async fn path_matches_open_file(&self) -> io::Result<bool> {
+        path_matches_identity(&self.path, &self.identity).await
     }
 }
 
@@ -195,6 +202,9 @@ pub(crate) async fn write_body_to_partial_with_resume(
         .open(&path)
         .await
         .map_err(|error| file_error(FileOperation::Create, error))?;
+    let identity = file_identity(&file)
+        .await
+        .map_err(|error| file_error(FileOperation::Open, error))?;
 
     let mut resume_state = None;
 
@@ -231,6 +241,7 @@ pub(crate) async fn write_body_to_partial_with_resume(
         resume_store,
         resume_state,
         written_bytes: 0,
+        identity,
     })
     .await
 }
@@ -245,6 +256,7 @@ pub(crate) struct ResumeTransfer {
     pub(crate) body: ResumeBody,
     pub(crate) metadata: HttpInspection,
     pub(crate) state: HttpResumeState,
+    pub(crate) partial: ResumePartial,
 }
 
 pub(crate) async fn resume_body_to_partial(
@@ -259,6 +271,7 @@ pub(crate) async fn resume_body_to_partial(
         body,
         metadata,
         state: resume_state,
+        partial,
     } = transfer;
 
     let body = match body {
@@ -278,11 +291,14 @@ pub(crate) async fn resume_body_to_partial(
     }
 
     let path = partial_path(directory, id);
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(&path)
+    let (mut file, identity) = partial.into_parts();
+
+    if !path_matches_identity(&path, &identity)
         .await
-        .map_err(|error| file_error(FileOperation::Open, error))?;
+        .map_err(|error| file_error(FileOperation::Open, error))?
+    {
+        return Err(PartialDownloadError::InvalidPartial);
+    }
 
     let file_metadata = file
         .metadata()
@@ -318,6 +334,7 @@ pub(crate) async fn resume_body_to_partial(
         resume_store: Some(resume_store),
         resume_state: Some(resume_state),
         written_bytes,
+        identity,
     })
     .await
 }
@@ -357,6 +374,7 @@ struct StreamContext {
     resume_store: Option<Arc<dyn ResumePersistence>>,
     resume_state: Option<HttpResumeState>,
     written_bytes: u64,
+    identity: Handle,
 }
 
 async fn stream_to_partial(
@@ -373,6 +391,7 @@ async fn stream_to_partial(
         resume_store,
         mut resume_state,
         mut written_bytes,
+        identity,
     } = context;
 
     let mut last_checkpoint_bytes = written_bytes;
@@ -475,6 +494,7 @@ async fn stream_to_partial(
         path,
         written_bytes,
         metadata,
+        identity,
     }))
 }
 
