@@ -3,9 +3,9 @@ use std::time::Duration;
 use gunda_core::download::RequestContext;
 use reqwest::header::{
     ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG,
-    HeaderMap, HeaderName, HeaderValue, IF_RANGE, RANGE,
+    HeaderMap, HeaderName, HeaderValue, IF_RANGE, LOCATION, RANGE,
 };
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, Method, StatusCode};
 
 use crate::body::HttpBody;
 use crate::error::{HttpError, map_request_error};
@@ -61,7 +61,7 @@ impl HttpClient {
         let client = Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none()) // TODO: maybe add a custom redirect policy here later?
+            .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
             .referer(false)
             .no_proxy()
@@ -75,21 +75,60 @@ impl HttpClient {
         Ok(Self { client })
     }
 
+    async fn send_redirected(
+        &self,
+        request: &RequestContext,
+        method: Method,
+        mut headers: HeaderMap,
+    ) -> Result<reqwest::Response, HttpError> {
+        let mut url = request.url().clone();
+        for hop in 0..=10 {
+            let mut builder = self
+                .client
+                .request(method.clone(), url.clone())
+                .headers(headers.clone());
+            if method == Method::HEAD {
+                builder = builder.timeout(Duration::from_secs(30));
+            }
+            let response = builder.send().await.map_err(map_request_error)?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                return Ok(response);
+            }
+            let status = response.status().as_u16();
+            if hop == 10 {
+                return Err(HttpError::UnexpectedStatus(status));
+            }
+            let location =
+                single_header(response.headers(), LOCATION)?.ok_or(HttpError::InvalidMetadata)?;
+            let next = url.join(location).map_err(|_| HttpError::InvalidMetadata)?;
+            validate_url(&RequestContext::new(next.clone(), Vec::new()))?;
+            if url.scheme() == "https" && next.scheme() != "https" {
+                return Err(HttpError::InvalidRequest);
+            }
+            if url.origin() != next.origin() {
+                // Caller headers may contain credentials, including custom tokens.
+                // Only transport-owned headers travel to a different origin.
+                let mut transport_headers = HeaderMap::new();
+                for name in [ACCEPT_ENCODING, RANGE, IF_RANGE] {
+                    if let Some(value) = headers.get(&name) {
+                        transport_headers.insert(name, value.clone());
+                    }
+                }
+                headers = transport_headers;
+            }
+            url = next;
+        }
+        unreachable!("redirect loop always returns within its hop limit")
+    }
+
     /// Requests metadata without downloading the resource body.
     ///
-    /// Redirects and servers that reject HEAD are reported as errors.
+    /// Follows HTTP redirects; servers that reject HEAD are reported as errors.
     pub async fn inspect(&self, request: &RequestContext) -> Result<HttpInspection, HttpError> {
         validate_url(request)?;
         let headers = request_headers(request)?;
 
-        let response = self
-            .client
-            .head(request.url().clone())
-            .headers(headers)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(map_request_error)?;
+        let response = self.send_redirected(request, Method::HEAD, headers).await?;
 
         inspect_response(&response)
     }
@@ -102,13 +141,7 @@ impl HttpClient {
         validate_url(request)?;
         let headers = request_headers(request)?;
 
-        let response = self
-            .client
-            .get(request.url().clone())
-            .headers(headers)
-            .send()
-            .await
-            .map_err(map_request_error)?;
+        let response = self.send_redirected(request, Method::GET, headers).await?;
 
         let metadata = inspect_response(&response)?;
 
@@ -142,13 +175,7 @@ impl HttpClient {
         headers.insert(RANGE, range_value);
         headers.insert(IF_RANGE, validator_value);
 
-        let response = self
-            .client
-            .get(request.url().clone())
-            .headers(headers)
-            .send()
-            .await
-            .map_err(map_request_error)?;
+        let response = self.send_redirected(request, Method::GET, headers).await?;
 
         if response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(HttpError::UnexpectedStatus(response.status().as_u16()));

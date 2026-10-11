@@ -193,3 +193,28 @@ async fn truncated_range_does_not_finish_successfully() {
 
     server.await.expect("server task must succeed");
 }
+
+#[tokio::test]
+async fn redirected_range_preserves_checkpoint_headers() {
+    let (target, target_server) = serve_once(
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-73\"\r\nConnection: close\r\n\r\nworld",
+    ).await;
+    let (url, server) = serve_once(&format!(
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )).await;
+    let client = HttpClient::new().unwrap();
+    let validator = StrongEntityTag::parse(b"\"version-73\"").unwrap();
+    let mut body = client
+        .open_range(&RequestContext::new(url, Vec::new()), 5, 10, &validator)
+        .await
+        .unwrap();
+    let mut contents = Vec::new();
+    while let Some(chunk) = body.next_chunk().await.unwrap() {
+        contents.extend_from_slice(&chunk);
+    }
+    assert_eq!(contents, b"world");
+    server.await.unwrap();
+    let received = target_server.await.unwrap().to_ascii_lowercase();
+    assert!(received.contains("range: bytes=5-\r\n"));
+    assert!(received.contains("if-range: \"version-73\"\r\n"));
+}

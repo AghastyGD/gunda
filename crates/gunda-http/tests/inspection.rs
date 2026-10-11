@@ -81,25 +81,46 @@ async fn zero_length_is_preserved() {
 }
 
 #[tokio::test]
-async fn redirects_are_reported_without_following_them() {
-    let (url, server) = serve_once(
-        "HTTP/1.1 302 Found\r\n\
-         Location: /another-file.bin\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n",
-    )
-    .await;
-
-    let client = HttpClient::new().expect("client must build");
-    let request = RequestContext::new(url, Vec::new());
-
-    assert!(matches!(
-        client.inspect(&request).await,
-        Err(HttpError::UnexpectedStatus(302))
-    ));
-
-    server.await.expect("server task must succeed");
+async fn redirects_follow_to_metadata_and_body_without_leaking_caller_headers() {
+    for head in [true, false] {
+        let (target, target_server) =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+                .await;
+        let (url, server) = serve_once(&format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )).await;
+        let client = HttpClient::new().unwrap();
+        let request = RequestContext::new(
+            url,
+            vec![
+                RequestHeader::new(
+                    "Authorization",
+                    "Bearer secret",
+                    HeaderSensitivity::Sensitive,
+                ),
+                RequestHeader::new("X-Api-Key", "secret", HeaderSensitivity::Sensitive),
+            ],
+        );
+        if head {
+            assert_eq!(
+                client.inspect(&request).await.unwrap().content_length(),
+                Some(5)
+            );
+        } else {
+            let mut body = client.open(&request).await.unwrap();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next_chunk().await.unwrap() {
+                bytes.extend_from_slice(&chunk);
+            }
+            assert_eq!(bytes, b"hello");
+        }
+        let initial = server.await.unwrap().to_ascii_lowercase();
+        assert!(initial.contains("authorization: bearer secret"));
+        let redirected = target_server.await.unwrap().to_ascii_lowercase();
+        assert!(redirected.starts_with(if head { "head " } else { "get " }));
+        assert!(!redirected.contains("secret"));
+        assert!(redirected.contains("accept-encoding: identity"));
+    }
 }
 
 #[tokio::test]
@@ -411,5 +432,44 @@ async fn unusable_entity_tags_do_not_prevent_full_downloads() {
         assert!(body.is_finished());
 
         server.await.expect("server task must succeed");
+    }
+}
+
+#[tokio::test]
+async fn redirect_chains_stop_after_ten_hops() {
+    let mut next = Url::parse("http://127.0.0.1:1/unreached").unwrap();
+    let mut servers = Vec::new();
+    for _ in 0..11 {
+        let (url, server) = serve_once(&format!(
+            "HTTP/1.1 302 Found\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )).await;
+        next = url;
+        servers.push(server);
+    }
+    let client = HttpClient::new().unwrap();
+    assert!(matches!(
+        client.open(&RequestContext::new(next, Vec::new())).await,
+        Err(HttpError::UnexpectedStatus(302))
+    ));
+    for server in servers {
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn redirects_reject_unsupported_schemes_and_embedded_credentials() {
+    for location in [
+        "file:///tmp/file.bin",
+        "http://user:password@127.0.0.1/file.bin",
+    ] {
+        let (url, server) = serve_once(&format!(
+            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )).await;
+        let client = HttpClient::new().unwrap();
+        assert!(matches!(
+            client.open(&RequestContext::new(url, Vec::new())).await,
+            Err(HttpError::InvalidRequest)
+        ));
+        server.await.unwrap();
     }
 }
