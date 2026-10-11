@@ -221,14 +221,18 @@ impl Desktop {
                 self.error = Some("This download is no longer running.".into());
             }
             ui.separator();
-            if action_button(ui, Icon::Inspect, "Inspect", selected.is_some(), ACCENT).clicked() {
+            if action_button(ui, Icon::Inspect, "Details", selected.is_some(), ACCENT).clicked() {
                 self.transfer = self.selected;
             }
             if self.busy() {
                 ui.spinner();
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(RichText::new("Gunda").strong().weak());
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search)
+                        .hint_text("Filter downloads…")
+                        .desired_width(200.0),
+                );
             });
         });
     }
@@ -329,16 +333,14 @@ impl Desktop {
                         "Idle".into()
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new("Keep Gunda open while downloading.")
-                                .small()
-                                .weak(),
-                        );
+                        ui.label(RichText::new("HTTP / HTTPS").small().weak());
                     });
                 });
             });
         egui::Panel::left("library")
-            .exact_size(180.0)
+            .resizable(true)
+            .default_size(180.0)
+            .size_range(150.0..=260.0)
             .frame(
                 egui::Frame::new()
                     .fill(colors.surface)
@@ -354,11 +356,11 @@ impl Desktop {
                 egui::Frame::new()
                     .fill(colors.surface)
                     .stroke(border)
-                    .inner_margin(10),
+                    .inner_margin(6),
             )
             .show(ui, |ui| self.inspector(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(colors.background).inner_margin(8))
+            .frame(egui::Frame::new().fill(colors.background).inner_margin(3))
             .show(ui, |ui| self.table(ui));
         self.add_dialog(&ctx);
         self.transfer_dialog(&ctx);

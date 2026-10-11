@@ -24,8 +24,8 @@ pub(super) fn action_button(
     let button = ui
         .add_enabled_ui(enabled, |ui| {
             egui::Button::new((egui::Atom::custom(id, egui::vec2(22.0, 22.0)), label))
-                .frame(false)
-                .min_size(egui::vec2(98.0, 38.0))
+                .frame(true)
+                .min_size(egui::vec2(88.0, 30.0))
                 .atom_ui(ui)
         })
         .inner;
@@ -118,7 +118,7 @@ pub(super) fn dialog_heading(
         let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 36.0), egui::Sense::hover());
         paint_icon(ui.painter(), rect.shrink(5.0), icon, ACCENT);
         ui.vertical(|ui| {
-            ui.add(egui::Label::new(RichText::new(title).size(18.0).strong()).truncate())
+            ui.add(egui::Label::new(RichText::new(title).size(13.0).strong()).truncate())
                 .on_hover_text(title);
             ui.label(RichText::new(subtitle).size(12.0).color(colors.muted));
         });
@@ -127,7 +127,7 @@ pub(super) fn dialog_heading(
 
 pub(super) fn stat(ui: &mut egui::Ui, label: &str, value: &str, colors: Palette) {
     ui.label(RichText::new(label).size(12.0).color(colors.muted));
-    ui.label(RichText::new(value).size(17.0).strong());
+    ui.label(RichText::new(value).size(12.0));
 }
 
 pub(super) fn notice(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -135,7 +135,7 @@ pub(super) fn notice(ui: &mut egui::Ui, text: &str, color: Color32) {
         .fill(color.gamma_multiply(0.08))
         .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.35)))
         .inner_margin(8)
-        .corner_radius(3)
+        .corner_radius(0)
         .show(ui, |ui| {
             ui.colored_label(color, text);
         });
@@ -157,17 +157,24 @@ pub(super) fn display_total(view: &DownloadView) -> String {
 
 pub(super) fn progress(ui: &mut egui::Ui, view: &DownloadView, width: f32) {
     if let Some(fraction) = view.progress() {
-        ui.add(
-            egui::ProgressBar::new(fraction)
-                .desired_width(width)
-                .desired_height(16.0)
-                .fill(if view.state == DownloadState::Completed {
-                    Color32::from_rgb(49, 164, 112)
-                } else {
-                    ACCENT
-                })
-                .text(format!("{:.1}%", fraction * 100.0)),
-        );
+        ui.scope(|ui| {
+            // Keep the percentage readable on both the filled and empty parts,
+            // independently of the table's selection and light/dark theme.
+            ui.visuals_mut().extreme_bg_color = Color32::from_rgb(48, 55, 61);
+            ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+            ui.add(
+                egui::ProgressBar::new(fraction)
+                    .corner_radius(0)
+                    .desired_width(width)
+                    .desired_height(16.0)
+                    .fill(if view.state == DownloadState::Completed {
+                        Color32::from_rgb(24, 111, 70)
+                    } else {
+                        ACCENT
+                    })
+                    .text(RichText::new(format!("{:.1}%", fraction * 100.0)).color(Color32::WHITE)),
+            );
+        });
     } else {
         ui.label(format!("{} · size unknown", bytes(view.written)));
     }

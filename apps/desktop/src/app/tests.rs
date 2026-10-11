@@ -100,8 +100,12 @@ fn keyboard_shortcut_opens_add_dialog_and_escape_hides_transfer_details() {
 fn empty_loading_and_error_views_render_in_both_themes() {
     for dark in [false, true] {
         for (ready, notice, title) in [
-            (true, None, "Ready for your first download"),
-            (false, None, "Opening your downloads"),
+            (
+                true,
+                None,
+                "No downloads. Use File > Add download or Ctrl+N.",
+            ),
+            (false, None, "Loading downloads…"),
             (
                 false,
                 Some("Could not load saved downloads."),
@@ -206,6 +210,54 @@ fn both_themes_render_table_inspector_and_dialogs_at_supported_sizes() {
             );
             assert!(!output.shapes.is_empty());
             output.textures_delta.clear();
+        }
+    }
+}
+
+#[test]
+fn selected_rows_and_progress_keep_readable_text_in_both_themes() {
+    for dark in [false, true] {
+        let ctx = egui::Context::default();
+        let mut view = crate::view::tests::sample(DownloadState::Completed);
+        view.total = Some(view.written);
+        let name = view.name.clone();
+        let id = view.id;
+        let mut desktop = desktop(Snapshot {
+            ready: true,
+            jobs: vec![view],
+            ..Default::default()
+        });
+        desktop.dark = dark;
+        desktop.selected = Some(id);
+        desktop.theme(&ctx);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1180.0, 780.0),
+                )),
+                ..Default::default()
+            },
+            |ui| desktop.render(ui),
+        );
+        output.textures_delta.clear();
+        let selection_text = ctx
+            .style_of(if dark {
+                egui::Theme::Dark
+            } else {
+                egui::Theme::Light
+            })
+            .visuals
+            .selection
+            .stroke
+            .color;
+        assert_ne!(selection_text, ACCENT);
+        for (text, expected) in [(name.as_str(), selection_text), ("100.0%", Color32::WHITE)] {
+            assert!(output.shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(shape)
+                    if shape.galley.job.text == text
+                        && shape.galley.job.sections.iter().all(|section| section.format.color == expected))
+            }), "missing readable text: {text}, dark={dark}");
         }
     }
 }

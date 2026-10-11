@@ -195,6 +195,7 @@ impl Desktop {
                         if let Some(fraction) = view.progress() {
                             ui.add(
                                 egui::ProgressBar::new(fraction)
+                                    .corner_radius(0)
                                     .desired_width(ui.available_width())
                                     .desired_height(20.0)
                                     .fill(if view.state == DownloadState::Completed {
