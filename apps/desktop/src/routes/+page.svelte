@@ -132,7 +132,7 @@
     clearFeedback();
     dialogError = "";
     addDialog.showModal();
-    requestAnimationFrame(() => urlInput.focus());
+    requestAnimationFrame(() => urlInput?.focus());
   }
 
   function closeAddDialog() {
@@ -505,10 +505,10 @@
   </main>
 </div>
 
-<dialog bind:this={addDialog} class="download-dialog" onclose={returnAddFocus} oncancel={(event) => submitting && event.preventDefault()}>
+<dialog bind:this={addDialog} class="download-dialog" aria-labelledby="add-download-heading" onclose={returnAddFocus} oncancel={(event) => submitting && event.preventDefault()}>
   <form onsubmit={startDownload}>
     <header class="dialog-header">
-      <h2>Add download</h2>
+      <h2 id="add-download-heading">Add download</h2>
       <button type="button" class="icon-button" aria-label="Close add download dialog" onclick={closeAddDialog} disabled={submitting}><Icon name="close" /></button>
     </header>
 
