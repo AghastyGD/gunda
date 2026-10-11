@@ -193,7 +193,6 @@ where
     }
 
     /// Executes a job with progress observation and cooperative cancellation.
-    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
     pub async fn execute_controlled<E, F>(
         &mut self,
         id: DownloadId,
@@ -205,11 +204,30 @@ where
         E: DownloadExecutor,
         F: FnMut(DownloadEvent) + Send,
     {
-        self.execute_inner(id, executor, &cancellation, &mut on_progress)
+        self.execute_controlled_with_updates(id, executor, cancellation, |event, _| {
+            if matches!(event, DownloadEvent::ProgressChanged { .. }) {
+                on_progress(event);
+            }
+        })
+        .await
+    }
+
+    /// Reports saved inspection metadata and progress; the observer must not block.
+    #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
+    pub async fn execute_controlled_with_updates<E, F>(
+        &mut self,
+        id: DownloadId,
+        executor: &E,
+        cancellation: DownloadCancellation,
+        mut on_update: F,
+    ) -> Result<ExecutionReport, DownloadManagerError>
+    where
+        E: DownloadExecutor,
+        F: FnMut(DownloadEvent, &DownloadJob) + Send,
+    {
+        self.execute_inner(id, executor, &cancellation, &mut on_update)
             .await
-            .inspect_err(|error| {
-                report_management_error("manager.execute", error);
-            })
+            .inspect_err(|error| report_management_error("manager.execute", error))
     }
     async fn execute_inner<E, F>(
         &mut self,
@@ -220,7 +238,7 @@ where
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
         E: DownloadExecutor,
-        F: FnMut(DownloadEvent) + Send,
+        F: FnMut(DownloadEvent, &DownloadJob) + Send,
     {
         let mut job = self
             .jobs
@@ -292,6 +310,14 @@ where
 
         execution_transition(&mut job, DownloadState::Downloading)?;
         job = self.commit_job(job).await?;
+        on_progress(
+            DownloadEvent::StateChanged {
+                id,
+                previous: DownloadState::Inspecting,
+                current: DownloadState::Downloading,
+            },
+            &job,
+        );
 
         let (progress_sender, progress_receiver) = TransferProgress::channel();
         progress_sender.report_written(starting_bytes);
@@ -391,12 +417,23 @@ where
 
         execution_transition(&mut job, DownloadState::Finalizing)?;
         job = self.commit_job(job).await?;
+        on_progress(
+            DownloadEvent::StateChanged {
+                id,
+                previous: DownloadState::Downloading,
+                current: DownloadState::Finalizing,
+            },
+            &job,
+        );
 
         if progress_changed {
-            on_progress(DownloadEvent::ProgressChanged {
-                id,
-                progress: job.progress(),
-            });
+            on_progress(
+                DownloadEvent::ProgressChanged {
+                    id,
+                    progress: job.progress(),
+                },
+                &job,
+            );
         }
 
         let output = match staged.finalize().await {
@@ -549,7 +586,7 @@ where
         on_progress: &mut F,
     ) -> Result<(), RepositoryError>
     where
-        F: FnMut(DownloadEvent) + Send,
+        F: FnMut(DownloadEvent, &DownloadJob) + Send,
     {
         let progress = validated_execution_progress(job, written_bytes)?;
 
@@ -562,10 +599,13 @@ where
 
         *job = self.commit_job(candidate).await?;
 
-        on_progress(DownloadEvent::ProgressChanged {
-            id: job.id(),
-            progress: job.progress(),
-        });
+        on_progress(
+            DownloadEvent::ProgressChanged {
+                id: job.id(),
+                progress: job.progress(),
+            },
+            job,
+        );
 
         Ok(())
     }
@@ -577,7 +617,7 @@ where
         on_progress: &mut F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
-        F: FnMut(DownloadEvent) + Send,
+        F: FnMut(DownloadEvent, &DownloadJob) + Send,
     {
         let id = job.id();
         let previous = job.state();
@@ -597,10 +637,13 @@ where
         let persisted = self.commit_job(job).await?;
 
         if persisted.progress() != persisted_progress {
-            on_progress(DownloadEvent::ProgressChanged {
-                id,
-                progress: persisted.progress(),
-            });
+            on_progress(
+                DownloadEvent::ProgressChanged {
+                    id,
+                    progress: persisted.progress(),
+                },
+                &persisted,
+            );
         }
 
         tracing::info!("download execution cancelled");
@@ -1363,6 +1406,57 @@ mod tests {
             .expect("manager must start");
 
         (manager, executor, id)
+    }
+
+    #[tokio::test]
+    async fn inspection_observer_receives_saved_metadata_before_transfer() {
+        let (mut manager, executor, id) = execution_fixture(None, None).await;
+        let mut observed = false;
+        manager
+            .execute_controlled_with_updates(
+                id,
+                &executor,
+                DownloadCancellation::new(),
+                |event, job| {
+                    if matches!(
+                        event,
+                        DownloadEvent::StateChanged {
+                            current: DownloadState::Downloading,
+                            ..
+                        }
+                    ) {
+                        assert_eq!(executor.saves.load(Ordering::Relaxed), 2);
+                        assert_eq!(*executor.calls.lock().unwrap(), vec!["prepare"]);
+                        assert_eq!(job.state(), DownloadState::Downloading);
+                        assert_eq!(job.progress().total_bytes(), Some(5));
+                        assert_eq!(job.progress().downloaded_bytes(), 0);
+                        assert!(job.resource().is_some());
+                        assert_eq!(
+                            job.resolved_destination().unwrap().final_path(),
+                            PathBuf::from("downloads").join("result.bin")
+                        );
+                        observed = true;
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        assert!(observed);
+    }
+
+    #[tokio::test]
+    async fn inspection_save_failure_does_not_publish_metadata() {
+        let (mut manager, executor, id) =
+            execution_fixture(Some(DownloadState::Downloading), None).await;
+        let mut observed = false;
+        let result = manager
+            .execute_controlled_with_updates(id, &executor, DownloadCancellation::new(), |_, _| {
+                observed = true;
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!observed);
+        assert_eq!(*executor.calls.lock().unwrap(), vec!["prepare"]);
     }
 
     #[tokio::test]

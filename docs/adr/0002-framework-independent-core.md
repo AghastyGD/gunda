@@ -2,6 +2,10 @@
 
 Status: Accepted
 
+Update (2026-10-11): the desktop now uses egui/eframe instead of Tauri/Svelte.
+The original context below is retained; the framework-independent core decision
+still applies to the native client's background worker and UI channels.
+
 ## Context
 
 The first user-facing application is expected to use Tauri and Svelte. Active
