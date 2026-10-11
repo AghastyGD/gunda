@@ -7,7 +7,22 @@ use tokio::time::timeout;
 use url::Url;
 
 pub async fn serve_once(response: &str) -> (Url, JoinHandle<String>) {
-    let response = response.to_owned();
+    let (url, task) = serve_sequence(&[response]).await;
+    let task = tokio::spawn(async move {
+        task.await
+            .expect("server task must succeed")
+            .pop()
+            .expect("server must receive one request")
+    });
+
+    (url, task)
+}
+
+pub async fn serve_sequence(responses: &[&str]) -> (Url, JoinHandle<Vec<String>>) {
+    let responses = responses
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -17,35 +32,33 @@ pub async fn serve_once(response: &str) -> (Url, JoinHandle<String>) {
 
     let task = tokio::spawn(async move {
         timeout(Duration::from_secs(10), async move {
-            let (mut socket, _) = listener.accept().await.expect("client must connect");
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("client must connect");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
 
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-
-            loop {
-                let read = socket
-                    .read(&mut buffer)
-                    .await
-                    .expect("request must be readable");
-
-                assert_ne!(read, 0, "client closed before sending headers");
-                request.extend_from_slice(&buffer[..read]);
-
-                assert!(request.len() <= 16 * 1024, "test request is too large");
-
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
+                loop {
+                    let read = socket
+                        .read(&mut buffer)
+                        .await
+                        .expect("request must be readable");
+                    assert_ne!(read, 0, "client closed before sending headers");
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(request.len() <= 16 * 1024, "test request is too large");
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
                 }
+
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response must be written");
+                socket.shutdown().await.expect("socket must shut down");
+                requests.push(String::from_utf8(request).expect("test request must be UTF-8"));
             }
-
-            socket
-                .write_all(response.as_bytes())
-                .await
-                .expect("response must be written");
-
-            socket.shutdown().await.expect("socket must shut down");
-
-            String::from_utf8(request).expect("test request must be UTF-8")
+            requests
         })
         .await
         .expect("local server must finish within its deadline")

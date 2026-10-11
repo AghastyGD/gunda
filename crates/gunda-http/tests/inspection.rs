@@ -1,6 +1,6 @@
 mod common;
 
-use common::serve_once;
+use common::{serve_once, serve_sequence};
 
 use gunda_core::download::{HeaderSensitivity, RequestContext, RequestHeader};
 use gunda_http::{HttpClient, HttpError};
@@ -120,6 +120,38 @@ async fn redirects_follow_to_metadata_and_body_without_leaking_caller_headers() 
         assert!(redirected.starts_with(if head { "head " } else { "get " }));
         assert!(!redirected.contains("secret"));
         assert!(redirected.contains("accept-encoding: identity"));
+    }
+}
+
+#[tokio::test]
+async fn same_origin_redirects_preserve_caller_headers() {
+    let (url, server) = serve_sequence(&[
+        "HTTP/1.1 307 Temporary Redirect\r\nLocation: /payload.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+    ])
+    .await;
+    let client = HttpClient::new().unwrap();
+    let request = RequestContext::new(
+        url,
+        vec![RequestHeader::new(
+            "X-Download-Token",
+            "local-test-token",
+            HeaderSensitivity::Sensitive,
+        )],
+    );
+
+    let mut body = client.open(&request).await.unwrap();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.next_chunk().await.unwrap() {
+        bytes.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(bytes, b"hello");
+    let requests = server.await.unwrap();
+    assert!(requests[0].starts_with("GET /file.bin HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with("GET /payload.bin HTTP/1.1\r\n"));
+    for request in requests {
+        assert!(request.contains("x-download-token: local-test-token\r\n"));
     }
 }
 
@@ -449,7 +481,7 @@ async fn redirect_chains_stop_after_ten_hops() {
     let client = HttpClient::new().unwrap();
     assert!(matches!(
         client.open(&RequestContext::new(next, Vec::new())).await,
-        Err(HttpError::UnexpectedStatus(302))
+        Err(HttpError::Redirect)
     ));
     for server in servers {
         server.await.unwrap();

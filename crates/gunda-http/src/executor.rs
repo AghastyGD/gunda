@@ -365,6 +365,11 @@ fn http_failure(error: HttpError) -> DownloadFailure {
         ),
         HttpError::Timeout => (FailureKind::Network, "HTTP request timed out", true),
         HttpError::Transport => (FailureKind::Network, "HTTP transport failed", true),
+        HttpError::Redirect => (
+            FailureKind::RemoteRejected,
+            "HTTP redirect could not be followed safely",
+            false,
+        ),
         HttpError::UnexpectedStatus(_) => unreachable!("HTTP statuses handled above"),
         HttpError::InvalidMetadata => (
             FailureKind::InvalidResponse,
@@ -557,5 +562,17 @@ mod failure_tests {
             assert_eq!(failure.kind(), kind);
             assert_eq!(failure.is_retryable(), retryable);
         }
+    }
+
+    #[test]
+    fn redirect_limit_failure_is_safe_and_not_retryable() {
+        let failure = http_failure(HttpError::Redirect);
+
+        assert_eq!(failure.kind(), FailureKind::RemoteRejected);
+        assert_eq!(
+            failure.message(),
+            "HTTP redirect could not be followed safely"
+        );
+        assert!(!failure.is_retryable());
     }
 }

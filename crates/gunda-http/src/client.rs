@@ -94,17 +94,13 @@ impl HttpClient {
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
             }
-            let status = response.status().as_u16();
             if hop == 10 {
-                return Err(HttpError::UnexpectedStatus(status));
+                return Err(HttpError::Redirect);
             }
             let location =
                 single_header(response.headers(), LOCATION)?.ok_or(HttpError::InvalidMetadata)?;
             let next = url.join(location).map_err(|_| HttpError::InvalidMetadata)?;
-            validate_url(&RequestContext::new(next.clone(), Vec::new()))?;
-            if url.scheme() == "https" && next.scheme() != "https" {
-                return Err(HttpError::InvalidRequest);
-            }
+            validate_redirect(&url, &next)?;
             if url.origin() != next.origin() {
                 // Caller headers may contain credentials, including custom tokens.
                 // Only transport-owned headers travel to a different origin.
@@ -219,6 +215,14 @@ impl HttpClient {
 
         Ok(HttpRangeBody::new(HttpBody::new(response, metadata), range))
     }
+}
+
+fn validate_redirect(current: &url::Url, next: &url::Url) -> Result<(), HttpError> {
+    validate_url(&RequestContext::new(next.clone(), Vec::new()))?;
+    if current.scheme() == "https" && next.scheme() != "https" {
+        return Err(HttpError::InvalidRequest);
+    }
+    Ok(())
 }
 
 fn inspect_response(response: &reqwest::Response) -> Result<HttpInspection, HttpError> {
@@ -349,4 +353,24 @@ fn response_strong_etag(headers: &HeaderMap) -> Option<StrongEntityTag> {
     }
 
     StrongEntityTag::parse(value.as_bytes()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_redirect;
+    use crate::HttpError;
+    use url::Url;
+
+    #[test]
+    fn redirects_reject_https_downgrades() {
+        let current = Url::parse("https://example.com/file.bin").unwrap();
+        let downgraded = Url::parse("http://example.com/file.bin").unwrap();
+        let secure = Url::parse("https://cdn.example.com/file.bin").unwrap();
+
+        assert_eq!(
+            validate_redirect(&current, &downgraded),
+            Err(HttpError::InvalidRequest)
+        );
+        assert_eq!(validate_redirect(&current, &secure), Ok(()));
+    }
 }

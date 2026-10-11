@@ -8,6 +8,7 @@ pub enum HttpError {
     InvalidRequest,
     Timeout,
     Transport,
+    Redirect,
     UnexpectedStatus(u16),
     InvalidMetadata,
     UnsupportedEncoding,
@@ -22,6 +23,7 @@ impl fmt::Display for HttpError {
             Self::InvalidRequest => f.write_str("HTTP request context is invalid or unsupported"),
             Self::Timeout => f.write_str("HTTP request timed out"),
             Self::Transport => f.write_str("HTTP transport failed"),
+            Self::Redirect => f.write_str("HTTP redirect could not be followed safely"),
             Self::UnexpectedStatus(status) => {
                 write!(f, "unexpected HTTP response status: {status}")
             }
