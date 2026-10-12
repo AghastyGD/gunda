@@ -18,6 +18,7 @@ use gunda_core::{
 use gunda_http::{HttpClient, HttpExecutor};
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Duration;
 use url::Url;
 
 use crate::view::DownloadView;
@@ -40,6 +41,8 @@ pub enum Command {
 }
 
 type Active = Arc<Mutex<Option<(DownloadId, DownloadCancellation)>>>;
+
+const MAX_AUTOMATIC_ATTEMPTS: u8 = 3;
 
 pub struct Backend {
     commands: Option<mpsc::Sender<Command>>,
@@ -283,15 +286,57 @@ async fn run(
             snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
             publish(&sender, &ctx, snapshot.clone());
             let progress_control = cancellation.clone();
-            let result = manager
-                .execute_controlled_with_updates(id, &executor, cancellation, |_, job| {
-                    snapshot.pause_supported = progress_control.pause_supported();
-                    if let Some(view) = snapshot.jobs.iter_mut().find(|view| view.id == job.id()) {
-                        *view = DownloadView::from_job(job);
-                        publish(&sender, &ctx, snapshot.clone());
-                    }
-                })
-                .await;
+            let mut attempts = 0;
+            let result = loop {
+                attempts += 1;
+                let result = manager
+                    .execute_controlled_with_updates(
+                        id,
+                        &executor,
+                        cancellation.clone(),
+                        |_, job| {
+                            snapshot.pause_supported = progress_control.pause_supported();
+                            if let Some(view) =
+                                snapshot.jobs.iter_mut().find(|view| view.id == job.id())
+                            {
+                                *view = DownloadView::from_job(job);
+                                publish(&sender, &ctx, snapshot.clone());
+                            }
+                        },
+                    )
+                    .await;
+
+                let can_retry = matches!(
+                    &result,
+                    Ok(report)
+                        if matches!(
+                            &report.event,
+                            gunda_core::application::DownloadEvent::Failed { failure, .. }
+                                if failure.is_retryable()
+                        )
+                );
+                if !can_retry || attempts >= MAX_AUTOMATIC_ATTEMPTS {
+                    break result;
+                }
+
+                if let Err(error) = manager.retry(id).await {
+                    break Err(error);
+                }
+
+                let delay_seconds = 1_u64 << (attempts - 1);
+                snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
+                snapshot.notice = Some(format!(
+                    "Connection problem. Trying again in {delay_seconds} seconds…"
+                ));
+                publish(&sender, &ctx, snapshot.clone());
+
+                tokio::select! {
+                    biased;
+                    _ = cancellation.stopped() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
+                }
+                snapshot.notice = None;
+            };
             if let Ok(mut slot) = active.lock() {
                 *slot = None;
             }
@@ -593,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn retryable_failure_can_be_retried_from_the_start() {
+    async fn retryable_failure_is_retried_automatically() {
         let data = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -621,15 +666,6 @@ mod tests {
             })
             .unwrap();
 
-        let failed = wait_for(&mut backend, |snapshot| {
-            !snapshot.busy && snapshot.jobs.first().is_some_and(DownloadView::can_retry)
-        })
-        .await;
-        let id = failed.jobs[0].id;
-        assert_eq!(failed.jobs[0].written, 0);
-
-        backend.send(Command::Retry(id)).unwrap();
-
         let completed = wait_for(&mut backend, |snapshot| {
             !snapshot.busy
                 && snapshot
@@ -639,13 +675,103 @@ mod tests {
         })
         .await;
         let view = &completed.jobs[0];
-        assert_eq!(view.id, id);
         assert_eq!(view.written, 5);
         assert_eq!(
             std::fs::read(view.output.as_ref().unwrap()).unwrap(),
             b"hello"
         );
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn automatic_retries_stop_after_the_configured_attempt_limit() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..MAX_AUTOMATIC_ATTEMPTS {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url: Url::parse(&format!("http://{address}/file.bin")).unwrap(),
+                directory: output.path().into(),
+            })
+            .unwrap();
+
+        let failed = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy && snapshot.jobs.first().is_some_and(DownloadView::can_retry)
+        })
+        .await;
+
+        assert_eq!(failed.jobs[0].written, 0);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancellation_during_automatic_retry_backoff_stops_another_request() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            socket.shutdown().await.unwrap();
+            timeout(Duration::from_millis(1500), listener.accept())
+                .await
+                .is_err()
+        });
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url: Url::parse(&format!("http://{address}/file.bin")).unwrap(),
+                directory: output.path().into(),
+            })
+            .unwrap();
+        let retrying = wait_for(&mut backend, |snapshot| {
+            snapshot
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Trying again"))
+        })
+        .await;
+        let id = retrying.jobs[0].id;
+        assert!(backend.cancel(id));
+
+        let cancelled = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Cancelled)
+        })
+        .await;
+
+        assert_eq!(cancelled.jobs[0].written, 0);
+        assert!(
+            server.await.unwrap(),
+            "backoff must not issue another request"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
