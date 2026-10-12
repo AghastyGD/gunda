@@ -1,4 +1,5 @@
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use gunda_core::application::{
@@ -15,7 +16,9 @@ use crate::destination::plan_destination;
 use crate::partial::{
     ResumeBody, ResumeTransfer, resume_body_to_partial, write_body_to_partial_with_resume,
 };
-use crate::recovery::{ResumeFileError, ResumePartial, inspect_resume_candidate};
+use crate::recovery::{
+    ResumeFileError, ResumePartial, inspect_resume_candidate, remove_partial_for_restart,
+};
 use crate::resume_state::ResumePersistence;
 use crate::{
     FinalizeError, HttpBody, HttpClient, HttpError, HttpInspection, HttpResumeState,
@@ -46,6 +49,17 @@ impl HttpExecutor {
             client,
             resume_store: Some(Arc::new(store)),
         }
+    }
+
+    /// Discards the HTTP staging file and checkpoint before a zero-byte restart.
+    pub async fn reset_for_restart(&self, id: DownloadId, directory: &Path) -> Result<(), ()> {
+        remove_partial_for_restart(&partial_path(directory, id))
+            .await
+            .map_err(|_| ())?;
+        if let Some(store) = &self.resume_store {
+            store.clear_state(id).await.map_err(|_| ())?;
+        }
+        Ok(())
     }
 }
 

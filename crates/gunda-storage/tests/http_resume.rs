@@ -115,6 +115,23 @@ async fn initialization_cannot_replace_existing_resume_state() {
 }
 
 #[tokio::test]
+async fn clearing_resume_state_allows_a_zero_byte_restart() {
+    let repository = SqliteDownloadRepository::open_in_memory()
+        .await
+        .expect("repository must open");
+    let id = create_job(&repository).await;
+    let store = repository.http_resume_store();
+    store
+        .initialize(id, &tag(b"\"old-representation\""), 10)
+        .await
+        .expect("resume state must initialize");
+
+    store.clear(id).await.expect("resume state must clear");
+
+    assert_eq!(store.find(id).await.expect("lookup must succeed"), None);
+}
+
+#[tokio::test]
 async fn checkpoint_updates_preserve_identity_and_are_monotonic() {
     let repository = SqliteDownloadRepository::open_in_memory()
         .await

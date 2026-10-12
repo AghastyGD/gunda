@@ -80,6 +80,9 @@ pub trait HttpResumeStore: Send + Sync {
         id: DownloadId,
         state: &HttpResumeState,
     ) -> impl Future<Output = Result<HttpResumeState, RepositoryError>> + Send;
+
+    /// Removes saved HTTP identity after the caller discards its partial file.
+    fn clear(&self, id: DownloadId) -> impl Future<Output = Result<(), RepositoryError>> + Send;
 }
 
 pub(crate) type StoreFuture<'a, T> =
@@ -100,6 +103,8 @@ pub(crate) trait ResumePersistence: Send + Sync {
         id: DownloadId,
         state: HttpResumeState,
     ) -> StoreFuture<'_, HttpResumeState>;
+
+    fn clear_state(&self, id: DownloadId) -> StoreFuture<'_, ()>;
 }
 
 impl<S: HttpResumeStore> ResumePersistence for S {
@@ -122,6 +127,10 @@ impl<S: HttpResumeStore> ResumePersistence for S {
         state: HttpResumeState,
     ) -> StoreFuture<'_, HttpResumeState> {
         Box::pin(async move { self.save_checkpoint(id, &state).await })
+    }
+
+    fn clear_state(&self, id: DownloadId) -> StoreFuture<'_, ()> {
+        Box::pin(async move { self.clear(id).await })
     }
 }
 

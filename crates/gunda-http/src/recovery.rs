@@ -192,6 +192,29 @@ pub(crate) async fn inspect_resume_candidate(
     }
 }
 
+pub(crate) async fn remove_partial_for_restart(path: &Path) -> io::Result<()> {
+    match inspect_path(path).await {
+        LocalFileState::Missing => return Ok(()),
+        LocalFileState::RegularFile { .. } => {}
+        LocalFileState::Unavailable { kind } => return Err(io::Error::from(kind)),
+        LocalFileState::Symlink | LocalFileState::Other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsafe partial",
+            ));
+        }
+    }
+
+    let partial = inspect_resume_candidate(path, None, 0)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "unsafe partial"))?;
+    drop(partial);
+
+    // The destination directory is user-selected and must remain under the
+    // application's control while restart cleanup is performed.
+    tokio::fs::remove_file(path).await
+}
+
 pub(crate) async fn file_identity(file: &File) -> io::Result<Handle> {
     let clone = file.try_clone().await?.into_std().await;
     tokio::task::spawn_blocking(move || Handle::from_file(clone))

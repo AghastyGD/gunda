@@ -303,13 +303,15 @@ impl Desktop {
                             {
                                 self.error = Some("This download cannot be paused safely.".into());
                             }
-                        } else if (view.can_resume() || view.can_retry())
+                        } else if (view.can_resume() || view.can_retry() || view.can_restart())
                             && ui
                                 .add_enabled(
                                     !self.busy(),
                                     egui::Button::new(
                                         RichText::new(if view.can_retry() {
                                             "Retry"
+                                        } else if view.can_restart() {
+                                            "Restart"
                                         } else {
                                             "Resume"
                                         })
@@ -318,10 +320,17 @@ impl Desktop {
                                     .fill(ACCENT)
                                     .min_size(egui::vec2(88.0, 32.0)),
                                 )
+                                .on_hover_text(if view.can_restart() {
+                                    "Discard saved progress and start again from zero."
+                                } else {
+                                    ""
+                                })
                                 .clicked()
                         {
                             self.send(if view.can_retry() {
                                 Command::Retry(view.id)
+                            } else if view.can_restart() {
+                                Command::Restart(view.id)
                             } else {
                                 Command::Resume(view.id)
                             });

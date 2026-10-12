@@ -162,6 +162,16 @@ where
             })
     }
 
+    /// Returns a failed job to the queue with progress reset to zero.
+    #[tracing::instrument(name = "manager.restart", skip_all, fields(download_id = id.value()))]
+    pub async fn restart(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+        self.change_idle_state(id, DownloadCommandKind::Restart)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.restart", error);
+            })
+    }
+
     /// Cancels a queued or paused job without deleting its files or history.
     ///
     /// Cancelling active execution requires worker coordination and is not
@@ -551,6 +561,7 @@ where
             {
                 DownloadState::Queued
             }
+            (DownloadCommandKind::Restart, DownloadState::Failed) => DownloadState::Queued,
             (DownloadCommandKind::Cancel, DownloadState::Queued | DownloadState::Paused) => {
                 DownloadState::Cancelled
             }
@@ -572,6 +583,10 @@ where
                 command,
                 state: previous,
             })?;
+
+        if command == DownloadCommandKind::Restart {
+            candidate.update_progress(DownloadProgress::default(), OffsetDateTime::now_utc());
+        }
 
         self.commit_job(candidate).await?;
 
@@ -805,8 +820,8 @@ mod tests {
     };
     use crate::download::{
         DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin,
-        DownloadState, FailureKind, FileConflictPolicy, NewDownload, RequestContext,
-        ResolvedDestination, ResourceDescriptor, ResourceKind,
+        DownloadProgress, DownloadState, FailureKind, FileConflictPolicy, NewDownload,
+        RequestContext, ResolvedDestination, ResourceDescriptor, ResourceKind,
     };
 
     struct FakeRepository {
@@ -1267,6 +1282,35 @@ mod tests {
         ));
         assert!(manager.job(id) == Some(&original));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_resets_progress_for_a_non_retryable_failure() {
+        let mut original = job(1);
+        let id = original.id();
+        original
+            .transition_to(DownloadState::Inspecting, OffsetDateTime::now_utc())
+            .expect("inspection transition must succeed");
+        original.update_progress(
+            DownloadProgress::new(7, Some(10)).expect("progress must be valid"),
+            OffsetDateTime::now_utc(),
+        );
+        original
+            .fail(
+                DownloadFailure::new(FailureKind::Integrity, "resource changed", false),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("failure transition must succeed");
+
+        let mut manager = DownloadManager::start(FakeRepository::with_jobs(vec![original]))
+            .await
+            .expect("manager must start");
+        manager.restart(id).await.expect("restart must succeed");
+
+        let restarted = manager.job(id).expect("job must exist");
+        assert_eq!(restarted.state(), DownloadState::Queued);
+        assert_eq!(restarted.progress(), DownloadProgress::default());
+        assert!(restarted.last_failure().is_some());
     }
 
     #[tokio::test]

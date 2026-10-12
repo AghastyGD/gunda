@@ -198,18 +198,30 @@ impl Desktop {
             let selected = self.selected_view().cloned();
             let can_resume = selected.as_ref().is_some_and(DownloadView::can_resume);
             let can_retry = selected.as_ref().is_some_and(DownloadView::can_retry);
-            if action_button(
+            let can_restart = selected.as_ref().is_some_and(DownloadView::can_restart);
+            let mut restart_action = action_button(
                 ui,
                 Icon::Resume,
-                if can_retry { "Retry" } else { "Resume" },
-                !self.busy() && (can_resume || can_retry),
+                if can_retry {
+                    "Retry"
+                } else if can_restart {
+                    "Restart"
+                } else {
+                    "Resume"
+                },
+                !self.busy() && (can_resume || can_retry || can_restart),
                 Color32::from_rgb(52, 170, 111),
-            )
-            .clicked()
-            {
+            );
+            if can_restart {
+                restart_action = restart_action
+                    .on_hover_text("Discard saved progress and start again from zero.");
+            }
+            if restart_action.clicked() {
                 let id = selected.as_ref().unwrap().id;
                 self.send(if can_retry {
                     Command::Retry(id)
+                } else if can_restart {
+                    Command::Restart(id)
                 } else {
                     Command::Resume(id)
                 });

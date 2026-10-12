@@ -36,6 +36,7 @@ pub enum Command {
     Start { url: Url, directory: PathBuf },
     Resume(DownloadId),
     Retry(DownloadId),
+    Restart(DownloadId),
 }
 
 type Active = Arc<Mutex<Option<(DownloadId, DownloadCancellation)>>>;
@@ -235,6 +236,38 @@ async fn run(
                 .await
                 .map(|_| id)
                 .map_err(|_| "This download cannot be retried."),
+            Command::Restart(id) => {
+                let eligible = manager.jobs().any(|job| {
+                    job.id() == id
+                        && job.state() == gunda_core::download::DownloadState::Failed
+                        && !job
+                            .last_failure()
+                            .is_some_and(gunda_core::download::DownloadFailure::is_retryable)
+                });
+                if !eligible {
+                    Err("This download cannot be restarted.")
+                } else if executor
+                    .reset_for_restart(
+                        id,
+                        manager
+                            .jobs()
+                            .find(|job| job.id() == id)
+                            .expect("eligible job must exist")
+                            .destination()
+                            .directory(),
+                    )
+                    .await
+                    .is_err()
+                {
+                    Err("The previous download data could not be cleared safely.")
+                } else {
+                    manager
+                        .restart(id)
+                        .await
+                        .map(|_| id)
+                        .map_err(|_| "This download could not be restarted.")
+                }
+            }
         };
         if let Ok(id) = id {
             let cancellation = DownloadCancellation::new();
@@ -497,9 +530,22 @@ mod tests {
     async fn rejected_download_has_a_safe_failure_message() {
         let data = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
-        let (mut url, server) =
-            serve(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                    .as_slice(),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket.write_all(response).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let mut url = Url::parse(&format!("http://{address}/file.bin")).unwrap();
         url.set_query(Some("token=private"));
         let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
         wait_for(&mut backend, |snapshot| snapshot.ready).await;
@@ -523,6 +569,26 @@ mod tests {
         assert!(!error.contains("private"));
         assert!(!view.source.contains("private"));
         assert!(view.output.is_none());
+
+        let id = view.id;
+        let partial = gunda_http::partial_path(output.path(), id);
+        std::fs::write(&partial, b"old partial").unwrap();
+        backend.send(Command::Restart(id)).unwrap();
+        let restarted = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Completed)
+        })
+        .await;
+        let restarted_view = &restarted.jobs[0];
+        assert_eq!(restarted_view.written, 5);
+        assert_eq!(
+            std::fs::read(restarted_view.output.as_ref().unwrap()).unwrap(),
+            b"hello"
+        );
+        assert!(!partial.exists());
         server.await.unwrap();
     }
 

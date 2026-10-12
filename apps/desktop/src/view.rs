@@ -83,6 +83,10 @@ impl DownloadView {
         self.state == DownloadState::Failed && self.retryable
     }
 
+    pub fn can_restart(&self) -> bool {
+        self.state == DownloadState::Failed && !self.retryable
+    }
+
     pub fn progress(&self) -> Option<f32> {
         if self.state == DownloadState::Completed {
             return Some(1.0);
@@ -194,5 +198,15 @@ pub(crate) mod tests {
         assert!(view.can_retry());
         view.state = DownloadState::Interrupted;
         assert!(!view.can_retry());
+    }
+
+    #[test]
+    fn only_non_retryable_failed_jobs_offer_restart() {
+        let mut view = sample(DownloadState::Failed);
+        assert!(view.can_restart());
+        view.retryable = true;
+        assert!(!view.can_restart());
+        view.state = DownloadState::Interrupted;
+        assert!(!view.can_restart());
     }
 }

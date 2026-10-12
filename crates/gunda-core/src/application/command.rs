@@ -13,6 +13,8 @@ pub enum DownloadCommand {
 
     Retry(DownloadId),
 
+    Restart(DownloadId),
+
     Remove {
         id: DownloadId,
         delete_partial_data: bool,
@@ -30,6 +32,7 @@ pub enum DownloadCommandKind {
     Resume,
     Cancel,
     Retry,
+    Restart,
     Remove,
 }
 
@@ -49,6 +52,7 @@ impl DownloadCommand {
             Self::Resume(_) => DownloadCommandKind::Resume,
             Self::Cancel(_) => DownloadCommandKind::Cancel,
             Self::Retry(_) => DownloadCommandKind::Retry,
+            Self::Restart(_) => DownloadCommandKind::Restart,
             Self::Remove { .. } => DownloadCommandKind::Remove,
         }
     }
@@ -60,7 +64,11 @@ impl DownloadCommand {
     pub fn target_id(&self) -> Option<DownloadId> {
         match self {
             Self::Create(_) => None,
-            Self::Pause(id) | Self::Resume(id) | Self::Cancel(id) | Self::Retry(id) => Some(*id),
+            Self::Pause(id)
+            | Self::Resume(id)
+            | Self::Cancel(id)
+            | Self::Retry(id)
+            | Self::Restart(id) => Some(*id),
             Self::Remove { id, .. } => Some(*id),
         }
     }
@@ -120,6 +128,11 @@ mod tests {
             (
                 DownloadCommand::Retry(id),
                 DownloadCommandKind::Retry,
+                Some(id),
+            ),
+            (
+                DownloadCommand::Restart(id),
+                DownloadCommandKind::Restart,
                 Some(id),
             ),
             (

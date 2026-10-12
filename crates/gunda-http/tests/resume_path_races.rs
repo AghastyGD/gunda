@@ -63,6 +63,11 @@ impl HttpResumeStore for TestResumeStore {
         *self.state.lock().expect("store lock must be available") = Some(state.clone());
         Ok(state.clone())
     }
+
+    async fn clear(&self, _id: DownloadId) -> Result<(), RepositoryError> {
+        *self.state.lock().expect("store lock must be available") = None;
+        Ok(())
+    }
 }
 
 fn test_id() -> DownloadId {
@@ -230,4 +235,62 @@ async fn substitution_after_transfer_is_not_published() {
     assert_eq!(tokio::fs::read(&partial).await.unwrap(), b"substitute");
     assert!(!directory.path().join("file.bin").exists());
     server.await.expect("server task must succeed");
+}
+
+#[tokio::test]
+async fn restart_removes_the_partial_and_clears_its_resume_state() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let id = test_id();
+    let partial = partial_path(directory.path(), id);
+    std::fs::write(&partial, b"old partial bytes").expect("partial must be created");
+    let store = TestResumeStore::at(5);
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    executor
+        .reset_for_restart(id, directory.path())
+        .await
+        .expect("safe partial must be discarded");
+
+    assert!(!partial.exists());
+    assert_eq!(store.find(id).await.expect("lookup must succeed"), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restart_rejects_symlink_without_touching_its_target_or_state() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let target = directory.path().join("user-file.bin");
+    let partial = partial_path(directory.path(), test_id());
+    std::fs::write(&target, b"must survive").expect("target must be created");
+    std::os::unix::fs::symlink(&target, &partial).expect("symlink must be created");
+    let store = TestResumeStore::at(5);
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    assert!(
+        executor
+            .reset_for_restart(test_id(), directory.path())
+            .await
+            .is_err()
+    );
+
+    assert_eq!(std::fs::read(&target).unwrap(), b"must survive");
+    assert!(
+        std::fs::symlink_metadata(&partial)
+            .expect("unsafe staging entry must remain untouched")
+            .file_type()
+            .is_symlink()
+    );
+    assert!(
+        store
+            .find(test_id())
+            .await
+            .expect("lookup must succeed")
+            .is_some()
+    );
 }

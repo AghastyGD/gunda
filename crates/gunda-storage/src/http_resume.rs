@@ -113,6 +113,15 @@ impl HttpResumeStore for SqliteHttpResumeStore {
             "HTTP checkpoint cannot change representation or move backwards",
         ))
     }
+
+    async fn clear(&self, id: DownloadId) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM http_resume_state WHERE download_id = $1")
+            .bind(id.value())
+            .execute(&self.pool)
+            .await
+            .map_err(|_| internal_error("could not clear HTTP resume state"))?;
+        Ok(())
+    }
 }
 
 fn decode_state(row: &SqliteRow) -> Result<HttpResumeState, RepositoryError> {
