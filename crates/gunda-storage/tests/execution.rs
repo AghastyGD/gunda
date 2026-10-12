@@ -200,6 +200,27 @@ async fn persist_interrupted_fixture(
     durable_bytes: u64,
     partial: &[u8],
 ) -> gunda_core::download::DownloadId {
+    persist_interrupted_fixture_with_total(
+        database_path,
+        output_directory,
+        url,
+        generic_bytes,
+        durable_bytes,
+        partial,
+        10,
+    )
+    .await
+}
+
+async fn persist_interrupted_fixture_with_total(
+    database_path: &Path,
+    output_directory: &Path,
+    url: Url,
+    generic_bytes: u64,
+    durable_bytes: u64,
+    partial: &[u8],
+    total_bytes: u64,
+) -> gunda_core::download::DownloadId {
     let repository = SqliteDownloadRepository::open(database_path)
         .await
         .expect("repository must open");
@@ -225,7 +246,7 @@ async fn persist_interrupted_fixture(
         now,
     );
     job.update_progress(
-        DownloadProgress::new(generic_bytes, Some(10)).expect("progress must be valid"),
+        DownloadProgress::new(generic_bytes, Some(total_bytes)).expect("progress must be valid"),
         now,
     );
     job.transition_to(DownloadState::Downloading, now)
@@ -235,13 +256,14 @@ async fn persist_interrupted_fixture(
     let store = repository.http_resume_store();
     let tag = StrongEntityTag::parse(b"\"version-31\"").expect("tag must be valid");
     store
-        .initialize(id, &tag, 10)
+        .initialize(id, &tag, total_bytes)
         .await
         .expect("resume state must initialize");
     store
         .save_checkpoint(
             id,
-            &HttpResumeState::new(tag, 10, durable_bytes).expect("checkpoint must be valid"),
+            &HttpResumeState::new(tag, total_bytes, durable_bytes)
+                .expect("checkpoint must be valid"),
         )
         .await
         .expect("checkpoint must be saved");
@@ -1040,41 +1062,70 @@ async fn download_resumes_after_repeated_process_interruptions() {
         .expect("local listener must bind");
     let address = listener.local_addr().expect("address must exist");
     let (release_first, first_released) = oneshot::channel();
+    let checkpoint_prefix = vec![b'a'; 8 * 1024 * 1024 + 1];
+    let total_bytes = 16 * 1024 * 1024 + 5;
     let server = tokio::spawn(async move {
-        timeout(Duration::from_secs(15), async move {
+        timeout(Duration::from_secs(45), async move {
             let (mut first, _) = listener.accept().await.expect("client must connect");
             let first_request = read_request(&mut first).await;
+            let remaining = total_bytes - 5;
+            let headers = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-{}/{total_bytes}\r\nContent-Length: {remaining}\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\n",
+                total_bytes - 1,
+            );
             first
-                .write_all(
-                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nw",
-                )
+                .write_all(headers.as_bytes())
                 .await
-                .expect("first response prefix must be written");
-            sleep(Duration::from_millis(1100)).await;
+                .expect("first response headers must be written");
             first
-                .write_all(b"o")
+                .write_all(&checkpoint_prefix)
                 .await
-                .expect("checkpointing byte must be written");
+                .expect("checkpoint prefix must be written");
             first_released.await.expect("test must release first server");
             drop(first);
 
             let (mut second, _) = listener.accept().await.expect("client must reconnect");
             let second_request = read_request(&mut second).await;
+            let second_request_text = String::from_utf8_lossy(&second_request).to_ascii_lowercase();
+            let range_line = second_request_text
+                .lines()
+                .find(|line| line.starts_with("range: bytes="))
+                .expect("second request must contain a byte range");
+            let start = range_line
+                .trim_start_matches("range: bytes=")
+                .trim_end_matches('-')
+                .parse::<u64>()
+                .expect("range offset must be valid");
+            let remaining = total_bytes - start;
+            let headers = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{}/{total_bytes}\r\nContent-Length: {remaining}\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\n",
+                total_bytes - 1,
+            );
             second
-                .write_all(
-                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 7-9/10\r\nContent-Length: 3\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nrld",
-                )
+                .write_all(headers.as_bytes())
+                .await
+                .expect("remaining response headers must be written");
+            second
+                .write_all(&vec![b'z'; remaining as usize])
                 .await
                 .expect("remaining response must be written");
             second.shutdown().await.expect("socket must close");
-            vec![first_request, second_request]
+            (first_request, second_request, start)
         })
         .await
         .expect("server must finish within its deadline")
     });
     let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
-    let id =
-        persist_interrupted_fixture(&database_path, &output_directory, url, 5, 5, b"hello").await;
+    let id = persist_interrupted_fixture_with_total(
+        &database_path,
+        &output_directory,
+        url,
+        5,
+        5,
+        b"hello",
+        total_bytes,
+    )
+    .await;
 
     let repository = SqliteDownloadRepository::open(&database_path)
         .await
@@ -1090,15 +1141,12 @@ async fn download_resumes_after_repeated_process_interruptions() {
     );
     let execution = tokio::spawn(async move { manager.execute(id, &executor).await });
 
-    timeout(Duration::from_secs(8), async {
+    let checkpoint = timeout(Duration::from_secs(45), async {
         loop {
-            if store
-                .find(id)
-                .await
-                .expect("checkpoint must load")
-                .is_some_and(|state| state.durable_bytes() == 7)
+            if let Some(state) = store.find(id).await.expect("checkpoint must load")
+                && state.durable_bytes() >= 5 + 8 * 1024 * 1024
             {
-                break;
+                break state.durable_bytes();
             }
             sleep(Duration::from_millis(20)).await;
         }
@@ -1135,21 +1183,31 @@ async fn download_resumes_after_repeated_process_interruptions() {
         .expect("second resume must complete");
 
     assert!(matches!(report.event, DownloadEvent::Completed { .. }));
-    assert_eq!(
-        tokio::fs::read(output_directory.join("file.bin"))
-            .await
-            .expect("output must exist"),
-        b"helloworld"
+    let output = tokio::fs::read(output_directory.join("file.bin"))
+        .await
+        .expect("output must exist");
+    assert_eq!(output.len(), total_bytes as usize);
+    assert_eq!(&output[..5], b"hello");
+    assert!(
+        output[5..checkpoint as usize]
+            .iter()
+            .all(|byte| *byte == b'a')
     );
-    let requests = server.await.expect("server must succeed");
-    let first = String::from_utf8(requests[0].clone())
+    assert!(
+        output[checkpoint as usize..]
+            .iter()
+            .all(|byte| *byte == b'z')
+    );
+    let (first_request, second_request, resumed_from) = server.await.expect("server must succeed");
+    assert_eq!(resumed_from, checkpoint);
+    let first = String::from_utf8(first_request)
         .expect("request must be UTF-8")
         .to_ascii_lowercase();
-    let second = String::from_utf8(requests[1].clone())
+    let second = String::from_utf8(second_request)
         .expect("request must be UTF-8")
         .to_ascii_lowercase();
     assert!(first.contains("range: bytes=5-\r\n"));
-    assert!(second.contains("range: bytes=7-\r\n"));
+    assert!(second.contains(&format!("range: bytes={checkpoint}-\r\n")));
     manager.into_repository().close().await;
 }
 
