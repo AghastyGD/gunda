@@ -196,16 +196,41 @@ impl Desktop {
             }
             ui.separator();
             let selected = self.selected_view().cloned();
+            let can_resume = selected.as_ref().is_some_and(DownloadView::can_resume);
+            let can_retry = selected.as_ref().is_some_and(DownloadView::can_retry);
             if action_button(
                 ui,
                 Icon::Resume,
-                "Resume",
-                !self.busy() && selected.as_ref().is_some_and(DownloadView::can_resume),
+                if can_retry { "Retry" } else { "Resume" },
+                !self.busy() && (can_resume || can_retry),
                 Color32::from_rgb(52, 170, 111),
             )
             .clicked()
             {
-                self.send(Command::Resume(selected.as_ref().unwrap().id));
+                let id = selected.as_ref().unwrap().id;
+                self.send(if can_retry {
+                    Command::Retry(id)
+                } else {
+                    Command::Resume(id)
+                });
+            }
+            let active_selected = self.selected.is_some() && self.selected == self.snapshot.active;
+            let mut pause = action_button(
+                ui,
+                Icon::Pause,
+                "Pause",
+                active_selected && self.snapshot.pause_supported,
+                Color32::from_rgb(218, 156, 55),
+            );
+            if active_selected && !self.snapshot.pause_supported {
+                pause = pause
+                    .on_disabled_hover_text("This server does not support resuming this download.");
+            }
+            if pause.clicked()
+                && let Some(id) = self.selected
+                && !self.backend.pause(id)
+            {
+                self.error = Some("This download cannot be paused safely.".into());
             }
             if action_button(
                 ui,

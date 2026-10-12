@@ -8,7 +8,7 @@ mod repository;
 mod transfer_progress;
 
 pub use command::{DownloadCommand, DownloadCommandKind};
-pub use download_cancellation::DownloadCancellation;
+pub use download_cancellation::{DownloadCancellation, DownloadControlRequest};
 pub use error::DownloadManagerError;
 pub use event::{DownloadEvent, DownloadEventKind};
 pub use execution::{

@@ -19,7 +19,7 @@ pub struct ExecutionInput {
 /// Outcome of writing an execution's staging file.
 pub enum TransferOutcome<T> {
     Finished(T),
-    Cancelled { written_bytes: u64 },
+    Stopped { written_bytes: u64 },
 }
 
 /// Opens a resource and prepares it for transfer.
@@ -44,6 +44,11 @@ pub trait PreparedTransfer: Send + Sized {
     /// Returns the reconciled byte count already present in staging.
     fn starting_bytes(&self) -> u64 {
         0
+    }
+
+    /// Returns whether this prepared transfer can stop at a durable checkpoint.
+    fn supports_pause(&self) -> bool {
+        false
     }
 
     /// Returns the output path planned for this executino.

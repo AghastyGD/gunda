@@ -175,6 +175,9 @@ fn unknown_size_transfer_dialog_does_not_show_a_percentage() {
                 assert!(output.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "The final size will appear when the download finishes.")
                 }));
+                assert!(output.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == "This server does not support resuming this download. Cancelling will stop it permanently.")
+                }));
                 assert!(!output.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text.contains('%'))
                 }));

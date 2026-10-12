@@ -6,9 +6,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 use time::OffsetDateTime;
 
 use super::{
-    DownloadCancellation, DownloadEvent, DownloadExecutor, DownloadManagerError,
-    DownloadRepository, ExecutionInput, ExecutionReport, PreparedTransfer, RepositoryError,
-    RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
+    DownloadCancellation, DownloadControlRequest, DownloadEvent, DownloadExecutor,
+    DownloadManagerError, DownloadRepository, ExecutionInput, ExecutionReport, PreparedTransfer,
+    RepositoryError, RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
 };
 
 use crate::{
@@ -152,6 +152,16 @@ where
             })
     }
 
+    /// Returns a retryable failed job to the queue.
+    #[tracing::instrument(name = "manager.retry", skip_all, fields(download_id = id.value()))]
+    pub async fn retry(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+        self.change_idle_state(id, DownloadCommandKind::Retry)
+            .await
+            .inspect_err(|error| {
+                report_management_error("manager.retry", error);
+            })
+    }
+
     /// Cancels a queued or paused job without deleting its files or history.
     ///
     /// Cancelling active execution requires worker coordination and is not
@@ -192,7 +202,7 @@ where
             .await
     }
 
-    /// Executes a job with progress observation and cooperative cancellation.
+    /// Executes a job with progress observation and cooperative pause or cancellation.
     pub async fn execute_controlled<E, F>(
         &mut self,
         id: DownloadId,
@@ -253,9 +263,9 @@ where
             });
         }
 
-        if cancellation.is_requested() {
+        if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_cancellation(job, None, on_progress)
+                .record_execution_stop(job, None, request, on_progress)
                 .await;
         }
 
@@ -274,14 +284,17 @@ where
         let preparation = tokio::select! {
             biased;
 
-            _ = cancellation.cancelled() => None,
+            _ = cancellation.stopped() => None,
             result = executor.prepare(input) => Some(result),
         };
 
         let prepared = match preparation {
             None => {
+                let request = cancellation.request_kind().ok_or_else(|| {
+                    invalid_repository_data("execution stopped without a request")
+                })?;
                 return self
-                    .record_execution_cancellation(job, None, on_progress)
+                    .record_execution_stop(job, None, request, on_progress)
                     .await;
             }
             Some(Ok(prepared)) => prepared,
@@ -292,6 +305,7 @@ where
 
         let total_bytes = prepared.total_bytes();
         let starting_bytes = prepared.starting_bytes();
+        cancellation.set_pause_supported(prepared.supports_pause());
 
         let initial_progress = DownloadProgress::new(starting_bytes, total_bytes)
             .map_err(|_| invalid_repository_data("execution progress is invalid"))?;
@@ -302,9 +316,9 @@ where
         job.update_progress(initial_progress, inspected_at);
         job.resolve_destination(prepared.planned_destination(), inspected_at);
 
-        if cancellation.is_requested() {
+        if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_cancellation(job, None, on_progress)
+                .record_execution_stop(job, None, request, on_progress)
                 .await;
         }
 
@@ -366,16 +380,22 @@ where
         let staged = match transfer_result {
             Ok(TransferOutcome::Finished(staged)) => staged,
 
-            Ok(TransferOutcome::Cancelled { written_bytes }) => {
-                if !cancellation.is_requested() || written_bytes < reported_bytes {
+            Ok(TransferOutcome::Stopped { written_bytes }) => {
+                let Some(request) = cancellation.request_kind() else {
                     return Err(invalid_repository_data(
-                        "executor returned inconsistent cancellation",
+                        "executor stopped without a control request",
+                    )
+                    .into());
+                };
+                if written_bytes < reported_bytes {
+                    return Err(invalid_repository_data(
+                        "executor returned inconsistent stopped progress",
                     )
                     .into());
                 }
 
                 return self
-                    .record_execution_cancellation(job, Some(written_bytes), on_progress)
+                    .record_execution_stop(job, Some(written_bytes), request, on_progress)
                     .await;
             }
 
@@ -405,9 +425,9 @@ where
             );
         }
 
-        if cancellation.is_requested() {
+        if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_cancellation(job, Some(written_bytes), on_progress)
+                .record_execution_stop(job, Some(written_bytes), request, on_progress)
                 .await;
         }
 
@@ -524,6 +544,13 @@ where
             (DownloadCommandKind::Resume, DownloadState::Paused | DownloadState::Interrupted) => {
                 DownloadState::Queued
             }
+            (DownloadCommandKind::Retry, DownloadState::Failed)
+                if current
+                    .last_failure()
+                    .is_some_and(DownloadFailure::is_retryable) =>
+            {
+                DownloadState::Queued
+            }
             (DownloadCommandKind::Cancel, DownloadState::Queued | DownloadState::Paused) => {
                 DownloadState::Cancelled
             }
@@ -610,10 +637,11 @@ where
         Ok(())
     }
 
-    async fn record_execution_cancellation<F>(
+    async fn record_execution_stop<F>(
         &mut self,
         mut job: DownloadJob,
         written_bytes: Option<u64>,
+        request: DownloadControlRequest,
         on_progress: &mut F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
@@ -633,7 +661,11 @@ where
             job.update_progress(progress, OffsetDateTime::now_utc());
         }
 
-        execution_transition(&mut job, DownloadState::Cancelled)?;
+        let state = match request {
+            DownloadControlRequest::Pause => DownloadState::Paused,
+            DownloadControlRequest::Cancel => DownloadState::Cancelled,
+        };
+        execution_transition(&mut job, state)?;
         let persisted = self.commit_job(job).await?;
 
         if persisted.progress() != persisted_progress {
@@ -646,13 +678,13 @@ where
             );
         }
 
-        tracing::info!("download execution cancelled");
+        tracing::info!(state = ?state, "download execution stopped");
 
         Ok(ExecutionReport {
             event: DownloadEvent::StateChanged {
                 id,
                 previous,
-                current: DownloadState::Cancelled,
+                current: state,
             },
             cleanup_pending: false,
         })
@@ -766,9 +798,10 @@ mod tests {
 
     use super::DownloadManager;
     use crate::application::{
-        DownloadCancellation, DownloadEvent, DownloadExecutor, DownloadManagerError,
-        DownloadRepository, ExecutionInput, ExecutionOutput, PreparedTransfer, RepositoryError,
-        RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
+        DownloadCancellation, DownloadCommandKind, DownloadEvent, DownloadExecutor,
+        DownloadManagerError, DownloadRepository, ExecutionInput, ExecutionOutput,
+        PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer, TransferOutcome,
+        TransferProgress,
     };
     use crate::download::{
         DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadOrigin,
@@ -1162,6 +1195,78 @@ mod tests {
             manager.job(id).expect("job must exist").state(),
             DownloadState::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn retryable_failure_can_be_returned_to_the_queue() {
+        let mut original = job(1);
+        let id = original.id();
+        original
+            .transition_to(DownloadState::Inspecting, OffsetDateTime::now_utc())
+            .expect("inspection transition must succeed");
+        original
+            .fail(
+                DownloadFailure::new(FailureKind::Network, "connection closed", true),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("failure transition must succeed");
+
+        let repository = FakeRepository::with_jobs(vec![original]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        let event = manager.retry(id).await.expect("retry must succeed");
+
+        assert!(
+            event
+                == DownloadEvent::StateChanged {
+                    id,
+                    previous: DownloadState::Failed,
+                    current: DownloadState::Queued,
+                }
+        );
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("lookup must succeed")
+            .expect("job must exist");
+        assert_eq!(persisted.state(), DownloadState::Queued);
+        assert!(persisted.last_failure().is_some());
+        assert!(manager.job(id) == Some(&persisted));
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_failure_cannot_return_to_the_queue() {
+        let mut original = job(1);
+        let id = original.id();
+        original
+            .transition_to(DownloadState::Inspecting, OffsetDateTime::now_utc())
+            .expect("inspection transition must succeed");
+        original
+            .fail(
+                DownloadFailure::new(FailureKind::Integrity, "resource changed", false),
+                OffsetDateTime::now_utc(),
+            )
+            .expect("failure transition must succeed");
+
+        let repository = FakeRepository::with_jobs(vec![original.clone()]);
+        let mut manager = DownloadManager::start(repository)
+            .await
+            .expect("manager must start");
+
+        assert!(matches!(
+            manager.retry(id).await,
+            Err(DownloadManagerError::InvalidOperation {
+                command: DownloadCommandKind::Retry,
+                state: DownloadState::Failed,
+                ..
+            })
+        ));
+        assert!(manager.job(id) == Some(&original));
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -1682,6 +1787,10 @@ mod tests {
             Some(5)
         }
 
+        fn supports_pause(&self) -> bool {
+            true
+        }
+
         fn planned_destination(&self) -> ResolvedDestination {
             ResolvedDestination::new(PathBuf::from("downloads").join("result.bin"))
         }
@@ -1705,8 +1814,8 @@ mod tests {
             tokio::select! {
                 biased;
 
-                _ = cancellation.cancelled() => {
-                    return Ok(TransferOutcome::Cancelled {
+                _ = cancellation.stopped() => {
+                    return Ok(TransferOutcome::Stopped {
                         written_bytes: 2,
                     });
                 }
@@ -1958,6 +2067,51 @@ mod tests {
             .expect("job must exist");
 
         assert_eq!(persisted.state(), DownloadState::Cancelled);
+        assert_eq!(persisted.progress().downloaded_bytes(), 2);
+        assert!(manager.job(id) == Some(&persisted));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn active_pause_preserves_progress_without_publication() {
+        let (mut manager, _, id) = execution_fixture(None, None).await;
+
+        let finalizations = Arc::new(AtomicUsize::new(0));
+        let executor = ProgressProbe {
+            finalizations: Arc::clone(&finalizations),
+            shared_connection: None,
+        };
+
+        let control = DownloadCancellation::new();
+        let handle = control.clone();
+
+        let report = manager
+            .execute_controlled(id, &executor, control, |event| {
+                if let DownloadEvent::ProgressChanged { progress, .. } = event
+                    && progress.downloaded_bytes() == 2
+                {
+                    handle.request_pause();
+                }
+            })
+            .await
+            .expect("pause must persist");
+
+        assert!(matches!(
+            report.event,
+            DownloadEvent::StateChanged {
+                previous: DownloadState::Downloading,
+                current: DownloadState::Paused,
+                ..
+            }
+        ));
+        assert_eq!(finalizations.load(Ordering::Relaxed), 0);
+
+        let persisted = manager
+            .repository
+            .find_by_id(id)
+            .await
+            .expect("repository must be readable")
+            .expect("job must exist");
+        assert_eq!(persisted.state(), DownloadState::Paused);
         assert_eq!(persisted.progress().downloaded_bytes(), 2);
         assert!(manager.job(id) == Some(&persisted));
     }

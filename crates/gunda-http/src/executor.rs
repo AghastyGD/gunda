@@ -243,6 +243,13 @@ impl PreparedTransfer for HttpPreparedTransfer {
         self.starting_bytes
     }
 
+    fn supports_pause(&self) -> bool {
+        matches!(self.body, HttpPreparedBody::Resumed { .. })
+            || (self.resume_store.is_some()
+                && self.metadata.content_length().is_some()
+                && self.metadata.strong_etag().is_some())
+    }
+
     fn planned_destination(&self) -> ResolvedDestination {
         self.planned_destination.clone()
     }
@@ -305,8 +312,8 @@ impl PreparedTransfer for HttpPreparedTransfer {
                 partial,
                 destination,
             }),
-            TransferOutcome::Cancelled { written_bytes } => {
-                TransferOutcome::Cancelled { written_bytes }
+            TransferOutcome::Stopped { written_bytes } => {
+                TransferOutcome::Stopped { written_bytes }
             }
         })
     }

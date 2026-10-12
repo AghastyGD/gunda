@@ -25,7 +25,7 @@ struct TestResumeStore {
 
 impl TestResumeStore {
     fn at(durable_bytes: u64) -> Self {
-        let tag = StrongEntityTag::parse(b"\"version-42\"").expect("tag must be valid");
+        let tag = StrongEntityTag::parse(b"\"version-23\"").expect("tag must be valid");
         let state = HttpResumeState::new(tag, 10, durable_bytes).expect("state must be valid");
 
         Self {
@@ -98,7 +98,7 @@ async fn prepare_resume(
         "HTTP/1.1 206 Partial Content\r\n\
          Content-Range: bytes 5-9/10\r\n\
          Content-Length: 5\r\n\
-         ETag: \"version-42\"\r\n\
+         ETag: \"version-23\"\r\n\
          Connection: close\r\n\
          \r\n\
          world",

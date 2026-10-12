@@ -407,7 +407,7 @@ async fn cancellation_interrupts_a_stalled_body_and_preserves_partial() {
 
     assert!(matches!(
         outcome,
-        TransferOutcome::Cancelled { written_bytes: 5 }
+        TransferOutcome::Stopped { written_bytes: 5 }
     ));
 
     assert_eq!(

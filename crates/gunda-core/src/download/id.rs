@@ -60,10 +60,10 @@ mod tests {
 
     #[test]
     fn positive_value_creates_download_id() {
-        let id = DownloadId::new(42).expect("42 is a valid download ID");
+        let id = DownloadId::new(54).expect("54 is a valid download ID");
 
-        assert_eq!(id.value(), 42);
-        assert_eq!(id.to_string(), "42")
+        assert_eq!(id.value(), 54);
+        assert_eq!(id.to_string(), "54")
     }
 
     #[test]

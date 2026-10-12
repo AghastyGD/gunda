@@ -250,6 +250,16 @@ impl Desktop {
                     ui.add_space(10.0);
                     notice(ui, error, self.error_color());
                 }
+                if active && !self.snapshot.pause_supported {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(
+                            "This server does not support resuming this download. Cancelling will stop it permanently.",
+                        )
+                        .size(12.0)
+                        .color(colors.muted),
+                    );
+                }
                 ui.add_space(14.0);
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -279,19 +289,42 @@ impl Desktop {
                             {
                                 self.backend.cancel(view.id);
                             }
-                        } else if view.can_resume()
+                            if ui
+                                .add_enabled(
+                                    self.snapshot.pause_supported,
+                                    egui::Button::new("Pause")
+                                        .min_size(egui::vec2(88.0, 32.0)),
+                                )
+                                .on_disabled_hover_text(
+                                    "This server does not support resuming this download.",
+                                )
+                                .clicked()
+                                && !self.backend.pause(view.id)
+                            {
+                                self.error = Some("This download cannot be paused safely.".into());
+                            }
+                        } else if (view.can_resume() || view.can_retry())
                             && ui
                                 .add_enabled(
                                     !self.busy(),
                                     egui::Button::new(
-                                        RichText::new("Resume").color(Color32::WHITE),
+                                        RichText::new(if view.can_retry() {
+                                            "Retry"
+                                        } else {
+                                            "Resume"
+                                        })
+                                        .color(Color32::WHITE),
                                     )
                                     .fill(ACCENT)
                                     .min_size(egui::vec2(88.0, 32.0)),
                                 )
                                 .clicked()
                         {
-                            self.send(Command::Resume(view.id));
+                            self.send(if view.can_retry() {
+                                Command::Retry(view.id)
+                            } else {
+                                Command::Resume(view.id)
+                            });
                         }
                     });
                 });

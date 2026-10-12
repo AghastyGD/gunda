@@ -8,6 +8,7 @@ use super::theme::{ACCENT, Palette};
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
     Add,
+    Pause,
     Resume,
     Cancel,
     Inspect,
@@ -70,6 +71,17 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Colo
                 color,
                 egui::Stroke::NONE,
             ));
+        }
+        Icon::Pause => {
+            for offset in [-4.0, 4.0] {
+                painter.line_segment(
+                    [
+                        center + egui::vec2(offset, -7.0),
+                        center + egui::vec2(offset, 7.0),
+                    ],
+                    stroke,
+                );
+            }
         }
         Icon::Cancel => {
             painter.line_segment(

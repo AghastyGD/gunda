@@ -174,7 +174,7 @@ pub(crate) async fn write_body_to_partial_with_resume(
     }
 
     if cancellation.is_requested() {
-        return Ok(TransferOutcome::Cancelled { written_bytes: 0 });
+        return Ok(TransferOutcome::Stopped { written_bytes: 0 });
     }
 
     if let Some(store) = resume_store.as_ref()
@@ -190,7 +190,7 @@ pub(crate) async fn write_body_to_partial_with_resume(
     }
 
     if cancellation.is_requested() {
-        return Ok(TransferOutcome::Cancelled { written_bytes: 0 });
+        return Ok(TransferOutcome::Stopped { written_bytes: 0 });
     }
 
     let metadata = body.metadata().clone();
@@ -287,7 +287,7 @@ pub(crate) async fn resume_body_to_partial(
     let written_bytes = resume_state.durable_bytes();
 
     if cancellation.is_requested() {
-        return Ok(TransferOutcome::Cancelled { written_bytes });
+        return Ok(TransferOutcome::Stopped { written_bytes });
     }
 
     let path = partial_path(directory, id);
@@ -401,7 +401,7 @@ async fn stream_to_partial(
         let received = tokio::select! {
             biased;
 
-            _ = cancellation.cancelled() => None,
+            _ = cancellation.stopped() => None,
             result = body.next_chunk() => Some(result),
         };
 
@@ -416,7 +416,7 @@ async fn stream_to_partial(
                 )
                 .await?;
 
-                return Ok(TransferOutcome::Cancelled { written_bytes });
+                return Ok(TransferOutcome::Stopped { written_bytes });
             }
 
             Some(Err(error)) => {
@@ -486,7 +486,7 @@ async fn stream_to_partial(
     drop(file);
 
     if cancellation.is_requested() {
-        return Ok(TransferOutcome::Cancelled { written_bytes });
+        return Ok(TransferOutcome::Stopped { written_bytes });
     }
 
     Ok(TransferOutcome::Finished(PartialDownload {

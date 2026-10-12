@@ -28,7 +28,7 @@ async fn serve_file() -> (Url, JoinHandle<()>) {
         b"HTTP/1.1 200 OK\r\n\
           Content-Length: 5\r\n\
           Content-Type: application/octet-stream\r\n\
-          ETag: \"version-42\"\r\n\
+          ETag: \"version-31\"\r\n\
           Connection: close\r\n\
           \r\n\
           hello",
@@ -113,7 +113,7 @@ async fn serve_range_response() -> (Url, JoinHandle<Vec<u8>>) {
                     b"HTTP/1.1 206 Partial Content\r\n\
                       Content-Range: bytes 5-9/10\r\n\
                       Content-Length: 5\r\n\
-                      ETag: \"version-42\"\r\n\
+                      ETag: \"version-31\"\r\n\
                       Connection: close\r\n\r\n\
                       world",
                 )
@@ -183,7 +183,7 @@ async fn persist_interrupted_fixture(
     repository.save(&job).await.expect("job must be saved");
 
     let store = repository.http_resume_store();
-    let tag = StrongEntityTag::parse(b"\"version-42\"").expect("tag must be valid");
+    let tag = StrongEntityTag::parse(b"\"version-31\"").expect("tag must be valid");
     store
         .initialize(id, &tag, 10)
         .await
@@ -327,7 +327,7 @@ async fn run_persistent_execution(reject_completed: bool) {
     assert!(!partial_path(&output_directory, id).exists());
 
     let expected_resume = HttpResumeState::new(
-        StrongEntityTag::parse(b"\"version-42\"").expect("tag must be valid"),
+        StrongEntityTag::parse(b"\"version-31\"").expect("tag must be valid"),
         5,
         5,
     )
@@ -540,7 +540,7 @@ async fn truncated_response_checkpoints_only_the_written_prefix() {
         .await
         .expect("manager must start");
     let (url, server) = serve_response(
-        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"version-42\"\r\nConnection: close\r\n\r\nhello",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nhello",
     ).await;
     let id = manager
         .create(new_download(url, directory.path()))
@@ -584,8 +584,8 @@ async fn truncated_response_checkpoints_only_the_written_prefix() {
 async fn full_downloads_without_a_strong_tag_and_known_size_have_no_resume_state() {
     for response in [
         b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello".as_slice(),
-        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: W/\"version-42\"\r\nConnection: close\r\n\r\nhello".as_slice(),
-        b"HTTP/1.1 200 OK\r\nETag: \"version-42\"\r\nConnection: close\r\n\r\nhello".as_slice(),
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: W/\"version-31\"\r\nConnection: close\r\n\r\nhello".as_slice(),
+        b"HTTP/1.1 200 OK\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nhello".as_slice(),
     ] {
         let directory = tempdir().expect("temporary directory must exist");
         let repository = SqliteDownloadRepository::open_in_memory().await.expect("repository must open");
@@ -696,7 +696,7 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
     let initial = resume_store
         .initialize(
             id,
-            &StrongEntityTag::parse(b"\"version-42\"").expect("tag must be valid"),
+            &StrongEntityTag::parse(b"\"version-31\"").expect("tag must be valid"),
             10,
         )
         .await
@@ -755,7 +755,71 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
         .expect("request must be UTF-8")
         .to_ascii_lowercase();
     assert!(request.contains("range: bytes=5-\r\n"));
-    assert!(request.contains("if-range: \"version-42\"\r\n"));
+    assert!(request.contains("if-range: \"version-31\"\r\n"));
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn retryable_failure_resumes_from_the_durable_checkpoint() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+    let (url, server) = serve_range_response().await;
+    let id =
+        persist_interrupted_fixture(&database_path, &output_directory, url, 5, 5, b"hello").await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let mut job = repository
+        .find_by_id(id)
+        .await
+        .expect("job lookup must succeed")
+        .expect("job must exist");
+    job.fail(
+        gunda_core::download::DownloadFailure::new(FailureKind::Network, "connection closed", true),
+        OffsetDateTime::now_utc(),
+    )
+    .expect("active job must fail");
+    repository.save(&job).await.expect("failure must persist");
+    repository.close().await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must start");
+    assert_eq!(
+        manager.job(id).expect("job must exist").state(),
+        DownloadState::Failed
+    );
+    manager.retry(id).await.expect("retry must queue the job");
+
+    let executor =
+        HttpExecutor::with_resume_store(HttpClient::new().expect("HTTP client must build"), store);
+    let report = manager
+        .execute(id, &executor)
+        .await
+        .expect("retry must execute");
+
+    assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+    assert_eq!(
+        tokio::fs::read(output_directory.join("file.bin"))
+            .await
+            .expect("output must be readable"),
+        b"helloworld"
+    );
+    let request = server.await.expect("server must succeed");
+    let request = String::from_utf8(request)
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    assert!(request.contains("range: bytes=5-\r\n"));
+    assert!(request.contains("if-range: \"version-31\"\r\n"));
     manager.into_repository().close().await;
 }
 

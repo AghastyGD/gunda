@@ -13,7 +13,7 @@ use gunda_http::{
 use tempfile::tempdir;
 
 fn test_id() -> DownloadId {
-    DownloadId::new(42).expect("ID must be valid")
+    DownloadId::new(55).expect("ID must be valid")
 }
 
 async fn prepare_partial(directory: &Path) -> PartialDownload {

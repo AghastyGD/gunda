@@ -27,6 +27,7 @@ pub struct Snapshot {
     pub ready: bool,
     pub busy: bool,
     pub active: Option<DownloadId>,
+    pub pause_supported: bool,
     pub jobs: Vec<DownloadView>,
     pub notice: Option<String>,
 }
@@ -34,6 +35,7 @@ pub struct Snapshot {
 pub enum Command {
     Start { url: Url, directory: PathBuf },
     Resume(DownloadId),
+    Retry(DownloadId),
 }
 
 type Active = Arc<Mutex<Option<(DownloadId, DownloadCancellation)>>>;
@@ -117,6 +119,16 @@ impl Backend {
         {
             cancellation.request();
             return true;
+        }
+        false
+    }
+
+    pub fn pause(&self, id: DownloadId) -> bool {
+        if let Ok(active) = self.active.lock()
+            && let Some((active_id, control)) = active.as_ref()
+            && *active_id == id
+        {
+            return control.request_pause();
         }
         false
     }
@@ -218,6 +230,11 @@ async fn run(
                 .await
                 .map(|_| id)
                 .map_err(|_| "This download cannot be resumed."),
+            Command::Retry(id) => manager
+                .retry(id)
+                .await
+                .map(|_| id)
+                .map_err(|_| "This download cannot be retried."),
         };
         if let Ok(id) = id {
             let cancellation = DownloadCancellation::new();
@@ -229,10 +246,13 @@ async fn run(
                 break;
             }
             snapshot.active = Some(id);
+            snapshot.pause_supported = false;
             snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
             publish(&sender, &ctx, snapshot.clone());
+            let progress_control = cancellation.clone();
             let result = manager
                 .execute_controlled_with_updates(id, &executor, cancellation, |_, job| {
+                    snapshot.pause_supported = progress_control.pause_supported();
                     if let Some(view) = snapshot.jobs.iter_mut().find(|view| view.id == job.id()) {
                         *view = DownloadView::from_job(job);
                         publish(&sender, &ctx, snapshot.clone());
@@ -261,6 +281,7 @@ async fn run(
         }
         snapshot.busy = false;
         snapshot.active = None;
+        snapshot.pause_supported = false;
         publish(&sender, &ctx, snapshot.clone());
     }
 }
@@ -506,6 +527,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn retryable_failure_can_be_retried_from_the_start() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for response in [
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                    .as_slice(),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket.write_all(response).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let url = Url::parse(&format!("http://{address}/file.bin")).unwrap();
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url,
+                directory: output.path().into(),
+            })
+            .unwrap();
+
+        let failed = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy && snapshot.jobs.first().is_some_and(DownloadView::can_retry)
+        })
+        .await;
+        let id = failed.jobs[0].id;
+        assert_eq!(failed.jobs[0].written, 0);
+
+        backend.send(Command::Retry(id)).unwrap();
+
+        let completed = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Completed)
+        })
+        .await;
+        let view = &completed.jobs[0];
+        assert_eq!(view.id, id);
+        assert_eq!(view.written, 5);
+        assert_eq!(
+            std::fs::read(view.output.as_ref().unwrap()).unwrap(),
+            b"hello"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cancellation_reaches_the_transfer_without_waiting_for_the_command_loop() {
         let data = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
@@ -521,11 +598,13 @@ mod tests {
             timeout(Duration::from_secs(10), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read_request(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                    .await
+                    .unwrap();
                 received.send(()).unwrap();
                 released.await.unwrap();
-                let _ = socket
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
-                    .await;
+                let _ = socket.write_all(b"hello").await;
             })
             .await
             .unwrap();
@@ -542,7 +621,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let snapshot = wait_for(&mut backend, |snapshot| snapshot.active.is_some()).await;
+        let snapshot = wait_for(&mut backend, |snapshot| {
+            snapshot.active.is_some()
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Downloading)
+        })
+        .await;
+        assert!(!snapshot.pause_supported);
+        assert!(!backend.pause(snapshot.active.unwrap()));
         assert!(backend.cancel(snapshot.active.unwrap()));
         let snapshot = wait_for(&mut backend, |snapshot| {
             !snapshot.busy
@@ -555,6 +643,92 @@ mod tests {
         assert!(snapshot.jobs[0].output.is_none());
         release.send(()).unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_download_can_pause_and_resume_from_its_checkpoint() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut initial, _) = listener.accept().await.unwrap();
+            read_request(&mut initial).await;
+            initial
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"version-63\"\r\nConnection: close\r\n\r\nhello",
+                )
+                .await
+                .unwrap();
+            released.await.unwrap();
+            drop(initial);
+
+            let (mut resumed, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut resumed).await;
+            resumed
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-63\"\r\nConnection: close\r\n\r\nworld",
+                )
+                .await
+                .unwrap();
+            resumed.shutdown().await.unwrap();
+            request
+        });
+        let url = Url::parse(&format!("http://{address}/file.bin")).unwrap();
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url,
+                directory: output.path().into(),
+            })
+            .unwrap();
+
+        let downloading = wait_for(&mut backend, |snapshot| {
+            snapshot.busy
+                && snapshot.jobs.first().is_some_and(|view| {
+                    view.state == DownloadState::Downloading && view.written == 5
+                })
+        })
+        .await;
+        let id = downloading.jobs[0].id;
+        assert!(downloading.pause_supported);
+        assert!(backend.pause(id));
+
+        let paused = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Paused)
+        })
+        .await;
+        assert_eq!(paused.jobs[0].written, 5);
+        assert!(paused.jobs[0].can_resume());
+        assert!(paused.jobs[0].output.is_none());
+
+        release.send(()).unwrap();
+        backend.send(Command::Resume(id)).unwrap();
+
+        let completed = wait_for(&mut backend, |snapshot| {
+            !snapshot.busy
+                && snapshot
+                    .jobs
+                    .first()
+                    .is_some_and(|view| view.state == DownloadState::Completed)
+        })
+        .await;
+        assert_eq!(completed.jobs[0].written, 10);
+        assert_eq!(
+            std::fs::read(completed.jobs[0].output.as_ref().unwrap()).unwrap(),
+            b"helloworld"
+        );
+        let request = String::from_utf8(server.await.unwrap())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(request.contains("range: bytes=5-\r\n"));
+        assert!(request.contains("if-range: \"version-63\"\r\n"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

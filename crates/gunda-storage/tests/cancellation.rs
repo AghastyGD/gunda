@@ -73,7 +73,7 @@ async fn serve_stalled(point: CancellationPoint) -> StalledServer {
                         b"HTTP/1.1 200 OK\r\n\
                           Content-Length: 10\r\n\
                           Content-Type: application/octet-stream\r\n\
-                          ETag: \"version-42\"\r\n\
+                          ETag: \"version-21\"\r\n\
                           Connection: close\r\n\
                           \r\n\
                           hello",
@@ -259,7 +259,7 @@ async fn run_cancellation_case(point: CancellationPoint) {
         CancellationPoint::BeforeHeaders => assert!(expected_resume.is_none()),
         CancellationPoint::DuringBody => {
             let state = expected_resume.as_ref().expect("checkpoint must exist");
-            assert_eq!(state.strong_etag().as_bytes(), b"\"version-42\"");
+            assert_eq!(state.strong_etag().as_bytes(), b"\"version-21\"");
             assert_eq!(state.total_bytes(), 10);
             assert_eq!(state.durable_bytes(), 5);
         }

@@ -14,6 +14,7 @@ pub struct DownloadView {
     pub destination: PathBuf,
     pub output: Option<PathBuf>,
     pub error: Option<String>,
+    pub retryable: bool,
 }
 
 impl DownloadView {
@@ -64,6 +65,10 @@ impl DownloadView {
                     })
                 })
                 .flatten(),
+            retryable: job.state() == DownloadState::Failed
+                && job
+                    .last_failure()
+                    .is_some_and(gunda_core::download::DownloadFailure::is_retryable),
         }
     }
 
@@ -72,6 +77,10 @@ impl DownloadView {
             self.state,
             DownloadState::Paused | DownloadState::Interrupted
         )
+    }
+
+    pub fn can_retry(&self) -> bool {
+        self.state == DownloadState::Failed && self.retryable
     }
 
     pub fn progress(&self) -> Option<f32> {
@@ -147,6 +156,7 @@ pub(crate) mod tests {
             destination: PathBuf::from("Downloads"),
             output: None,
             error: None,
+            retryable: false,
         }
     }
 
@@ -174,5 +184,15 @@ pub(crate) mod tests {
         ] {
             assert!(!sample(state).can_resume());
         }
+    }
+
+    #[test]
+    fn only_retryable_failed_jobs_offer_retry() {
+        let mut view = sample(DownloadState::Failed);
+        assert!(!view.can_retry());
+        view.retryable = true;
+        assert!(view.can_retry());
+        view.state = DownloadState::Interrupted;
+        assert!(!view.can_retry());
     }
 }
