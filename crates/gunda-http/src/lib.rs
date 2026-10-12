@@ -13,7 +13,7 @@ mod validator;
 pub use body::HttpBody;
 pub use client::{HttpClient, HttpInspection};
 pub use error::HttpError;
-pub use executor::{HttpExecutor, HttpPreparedTransfer, HttpStagedTransfer};
+pub use executor::{HttpExecutor, HttpPreparedTransfer, HttpStagedTransfer, RestartResetError};
 pub use finalize::{FinalizeError, FinalizeFailure, FinalizedDownload, finalize_download};
 pub use partial::{
     FileOperation, PartialDownload, PartialDownloadError, download_to_partial, partial_path,

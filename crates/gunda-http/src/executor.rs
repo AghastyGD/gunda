@@ -1,10 +1,10 @@
-use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::{error::Error, fmt, io};
 
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, ExecutionInput, ExecutionOutput, PreparedTransfer,
-    StagedTransfer, TransferOutcome, TransferProgress,
+    RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
 };
 use gunda_core::download::{
     DownloadDestination, DownloadFailure, DownloadId, FailureKind, ResolvedDestination,
@@ -31,6 +31,24 @@ pub struct HttpExecutor {
     resume_store: Option<Arc<dyn ResumePersistence>>,
 }
 
+/// Identifies which restart cleanup operation failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartResetError {
+    PartialFile(io::ErrorKind),
+    ResumeStorage(RepositoryErrorKind),
+}
+
+impl fmt::Display for RestartResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PartialFile(kind) => write!(f, "could not discard partial file: {kind:?}"),
+            Self::ResumeStorage(kind) => write!(f, "could not clear HTTP resume state: {kind:?}"),
+        }
+    }
+}
+
+impl Error for RestartResetError {}
+
 impl HttpExecutor {
     #[must_use]
     pub fn new(client: HttpClient) -> Self {
@@ -52,12 +70,19 @@ impl HttpExecutor {
     }
 
     /// Discards the HTTP staging file and checkpoint before a zero-byte restart.
-    pub async fn reset_for_restart(&self, id: DownloadId, directory: &Path) -> Result<(), ()> {
+    pub async fn reset_for_restart(
+        &self,
+        id: DownloadId,
+        directory: &Path,
+    ) -> Result<(), RestartResetError> {
         remove_partial_for_restart(&partial_path(directory, id))
             .await
-            .map_err(|_| ())?;
+            .map_err(|error| RestartResetError::PartialFile(error.kind()))?;
         if let Some(store) = &self.resume_store {
-            store.clear_state(id).await.map_err(|_| ())?;
+            store
+                .clear_state(id)
+                .await
+                .map_err(|error| RestartResetError::ResumeStorage(error.kind()))?;
         }
         Ok(())
     }

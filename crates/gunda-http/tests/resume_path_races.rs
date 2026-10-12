@@ -5,15 +5,16 @@ use std::sync::{Arc, Mutex};
 
 use common::serve_once;
 use gunda_core::application::{
-    DownloadExecutor, ExecutionInput, PreparedTransfer, RepositoryError, StagedTransfer,
-    TransferOutcome,
+    DownloadExecutor, ExecutionInput, PreparedTransfer, RepositoryError, RepositoryErrorKind,
+    StagedTransfer, TransferOutcome,
 };
 use gunda_core::download::{
     DownloadDestination, DownloadId, DownloadProgress, FailureKind, FileConflictPolicy,
     RequestContext, ResolvedDestination, ResourceDescriptor, ResourceKind,
 };
 use gunda_http::{
-    HttpClient, HttpExecutor, HttpResumeState, HttpResumeStore, StrongEntityTag, partial_path,
+    HttpClient, HttpExecutor, HttpResumeState, HttpResumeStore, RestartResetError, StrongEntityTag,
+    partial_path,
 };
 use tempfile::tempdir;
 use url::Url;
@@ -21,6 +22,7 @@ use url::Url;
 #[derive(Clone)]
 struct TestResumeStore {
     state: Arc<Mutex<Option<HttpResumeState>>>,
+    clear_error: Option<RepositoryErrorKind>,
 }
 
 impl TestResumeStore {
@@ -30,6 +32,7 @@ impl TestResumeStore {
 
         Self {
             state: Arc::new(Mutex::new(Some(state))),
+            clear_error: None,
         }
     }
 }
@@ -65,6 +68,9 @@ impl HttpResumeStore for TestResumeStore {
     }
 
     async fn clear(&self, _id: DownloadId) -> Result<(), RepositoryError> {
+        if let Some(kind) = self.clear_error {
+            return Err(RepositoryError::new(kind, "private-storage-marker"));
+        }
         *self.state.lock().expect("store lock must be available") = None;
         Ok(())
     }
@@ -256,6 +262,59 @@ async fn restart_removes_the_partial_and_clears_its_resume_state() {
 
     assert!(!partial.exists());
     assert_eq!(store.find(id).await.expect("lookup must succeed"), None);
+}
+
+#[tokio::test]
+async fn restart_reports_file_failure_without_clearing_resume_state() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let id = test_id();
+    let partial = partial_path(directory.path(), id);
+    std::fs::create_dir(&partial).expect("unsafe staging directory must exist");
+    let store = TestResumeStore::at(5);
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    let error = executor
+        .reset_for_restart(id, directory.path())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RestartResetError::PartialFile(std::io::ErrorKind::InvalidInput)
+    );
+    assert!(partial.is_dir());
+    assert!(store.find(id).await.unwrap().is_some());
+    assert!(!format!("{error} {error:?}").contains(directory.path().to_string_lossy().as_ref()));
+}
+
+#[tokio::test]
+async fn restart_reports_storage_failure_after_removing_partial() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let id = test_id();
+    let partial = partial_path(directory.path(), id);
+    std::fs::write(&partial, b"old partial bytes").expect("partial must be created");
+    let mut store = TestResumeStore::at(5);
+    store.clear_error = Some(RepositoryErrorKind::Unavailable);
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    let error = executor
+        .reset_for_restart(id, directory.path())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        RestartResetError::ResumeStorage(RepositoryErrorKind::Unavailable)
+    );
+    assert!(!partial.exists());
+    assert!(store.find(id).await.unwrap().is_some());
+    assert!(!format!("{error} {error:?}").contains("private-storage-marker"));
 }
 
 #[cfg(unix)]
