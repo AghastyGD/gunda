@@ -135,6 +135,8 @@ impl Desktop {
     }
 
     pub(super) fn table(&mut self, ui: &mut egui::Ui) {
+        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+
         if let Some(message) = self.error.as_ref().or(self.snapshot.notice.as_ref()) {
             ui.horizontal_wrapped(|ui| {
                 ui.colored_label(self.error_color(), message);

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use gunda_core::application::{
-    DownloadEvent, DownloadManager, DownloadManagerError, DownloadRepository,
+    DownloadCancellation, DownloadEvent, DownloadManager, DownloadManagerError, DownloadRepository,
 };
 use gunda_core::download::{
     DownloadDestination, DownloadOrigin, DownloadProgress, DownloadState, FailureKind,
@@ -19,8 +19,9 @@ use tempfile::tempdir;
 use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use url::Url;
 
 async fn serve_file() -> (Url, JoinHandle<()>) {
@@ -121,6 +122,55 @@ async fn serve_range_response() -> (Url, JoinHandle<Vec<u8>>) {
                 .expect("response must be written");
             socket.shutdown().await.expect("socket must close");
             request
+        })
+        .await
+        .expect("server must finish within its deadline")
+    });
+
+    let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
+    (url, task)
+}
+
+async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+
+    loop {
+        let read = socket
+            .read(&mut buffer)
+            .await
+            .expect("request must be readable");
+        assert_ne!(read, 0, "client closed before sending headers");
+        request.extend_from_slice(&buffer[..read]);
+        assert!(request.len() <= 16 * 1024);
+
+        if request.windows(4).any(|part| part == b"\r\n\r\n") {
+            return request;
+        }
+    }
+}
+
+async fn serve_captured_responses(
+    responses: Vec<&'static [u8]>,
+) -> (Url, JoinHandle<Vec<Vec<u8>>>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("local listener must bind");
+    let address = listener.local_addr().expect("address must exist");
+
+    let task = tokio::spawn(async move {
+        timeout(Duration::from_secs(15), async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("client must connect");
+                requests.push(read_request(&mut socket).await);
+                socket
+                    .write_all(response)
+                    .await
+                    .expect("response must be written");
+                socket.shutdown().await.expect("socket must close");
+            }
+            requests
         })
         .await
         .expect("server must finish within its deadline")
@@ -756,6 +806,350 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
         .to_ascii_lowercase();
     assert!(request.contains("range: bytes=5-\r\n"));
     assert!(request.contains("if-range: \"version-31\"\r\n"));
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn changed_resource_rejects_resume_without_touching_the_partial() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+    let (url, server) = serve_captured_responses(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"version-32\"\r\nConnection: close\r\n\r\nchanged!!!",
+    ])
+    .await;
+    let id =
+        persist_interrupted_fixture(&database_path, &output_directory, url, 5, 5, b"hello").await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must recover");
+    manager.resume(id).await.expect("resume must queue the job");
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    let report = manager
+        .execute(id, &executor)
+        .await
+        .expect("recovery failure must persist");
+
+    assert!(matches!(report.event, DownloadEvent::Failed { .. }));
+    let failure = manager
+        .job(id)
+        .expect("job must exist")
+        .last_failure()
+        .expect("failure must exist");
+    assert_eq!(failure.kind(), FailureKind::Integrity);
+    assert!(!failure.is_retryable());
+    assert_eq!(
+        tokio::fs::read(partial_path(&output_directory, id))
+            .await
+            .expect("partial must remain"),
+        b"hello"
+    );
+    assert_eq!(
+        store
+            .find(id)
+            .await
+            .expect("checkpoint must load")
+            .expect("checkpoint must remain")
+            .durable_bytes(),
+        5
+    );
+    assert!(!output_directory.join("file.bin").exists());
+    let requests = server.await.expect("server must succeed");
+    let request = String::from_utf8(requests[0].clone())
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    assert!(request.contains("range: bytes=5-\r\n"));
+    assert!(request.contains("if-range: \"version-31\"\r\n"));
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn zero_checkpoint_resumes_with_a_validated_full_response() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+    let (url, server) = serve_captured_responses(vec![
+        b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nhelloworld",
+    ])
+    .await;
+    let id = persist_interrupted_fixture(&database_path, &output_directory, url, 0, 0, b"").await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must recover");
+    manager.resume(id).await.expect("resume must queue the job");
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+
+    let report = manager
+        .execute(id, &executor)
+        .await
+        .expect("zero checkpoint must resume");
+
+    assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+    assert_eq!(
+        tokio::fs::read(output_directory.join("file.bin"))
+            .await
+            .expect("output must exist"),
+        b"helloworld"
+    );
+    assert_eq!(
+        store
+            .find(id)
+            .await
+            .expect("checkpoint must load")
+            .expect("checkpoint must remain")
+            .durable_bytes(),
+        10
+    );
+    let requests = server.await.expect("server must succeed");
+    let request = String::from_utf8(requests[0].clone())
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    assert!(!request.contains("range:"));
+    assert!(!request.contains("if-range:"));
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn cancellation_during_resume_checkpoints_the_new_prefix_without_publication() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("local listener must bind");
+    let address = listener.local_addr().expect("address must exist");
+    let (release, released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        timeout(Duration::from_secs(10), async move {
+            let (mut socket, _) = listener.accept().await.expect("client must connect");
+            let request = read_request(&mut socket).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nwo",
+                )
+                .await
+                .expect("partial response must be written");
+            released.await.expect("test must release server");
+            drop(socket);
+            request
+        })
+        .await
+        .expect("server must finish within its deadline")
+    });
+    let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
+    let id =
+        persist_interrupted_fixture(&database_path, &output_directory, url, 5, 5, b"hello").await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must recover");
+    manager.resume(id).await.expect("resume must queue the job");
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+    let cancellation = DownloadCancellation::new();
+    let control = cancellation.clone();
+
+    let report = timeout(
+        Duration::from_secs(8),
+        manager.execute_controlled(id, &executor, cancellation, |event| {
+            if let DownloadEvent::ProgressChanged { progress, .. } = event
+                && progress.downloaded_bytes() == 7
+            {
+                control.request();
+            }
+        }),
+    )
+    .await
+    .expect("cancellation must not wait for EOF")
+    .expect("cancellation must persist");
+
+    assert!(matches!(
+        report.event,
+        DownloadEvent::StateChanged {
+            current: DownloadState::Cancelled,
+            ..
+        }
+    ));
+    assert_eq!(
+        tokio::fs::read(partial_path(&output_directory, id))
+            .await
+            .expect("partial must remain"),
+        b"hellowo"
+    );
+    assert_eq!(
+        store
+            .find(id)
+            .await
+            .expect("checkpoint must load")
+            .expect("checkpoint must remain")
+            .durable_bytes(),
+        7
+    );
+    assert!(!output_directory.join("file.bin").exists());
+    release.send(()).expect("server must still be waiting");
+    let request = String::from_utf8(server.await.expect("server must succeed"))
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    assert!(request.contains("range: bytes=5-\r\n"));
+    assert!(request.contains("if-range: \"version-31\"\r\n"));
+    manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn download_resumes_after_repeated_process_interruptions() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("local listener must bind");
+    let address = listener.local_addr().expect("address must exist");
+    let (release_first, first_released) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        timeout(Duration::from_secs(15), async move {
+            let (mut first, _) = listener.accept().await.expect("client must connect");
+            let first_request = read_request(&mut first).await;
+            first
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 5-9/10\r\nContent-Length: 5\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nw",
+                )
+                .await
+                .expect("first response prefix must be written");
+            sleep(Duration::from_millis(1100)).await;
+            first
+                .write_all(b"o")
+                .await
+                .expect("checkpointing byte must be written");
+            first_released.await.expect("test must release first server");
+            drop(first);
+
+            let (mut second, _) = listener.accept().await.expect("client must reconnect");
+            let second_request = read_request(&mut second).await;
+            second
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 7-9/10\r\nContent-Length: 3\r\nETag: \"version-31\"\r\nConnection: close\r\n\r\nrld",
+                )
+                .await
+                .expect("remaining response must be written");
+            second.shutdown().await.expect("socket must close");
+            vec![first_request, second_request]
+        })
+        .await
+        .expect("server must finish within its deadline")
+    });
+    let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
+    let id =
+        persist_interrupted_fixture(&database_path, &output_directory, url, 5, 5, b"hello").await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must recover");
+    manager.resume(id).await.expect("resume must queue the job");
+    let executor = HttpExecutor::with_resume_store(
+        HttpClient::new().expect("HTTP client must build"),
+        store.clone(),
+    );
+    let execution = tokio::spawn(async move { manager.execute(id, &executor).await });
+
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if store
+                .find(id)
+                .await
+                .expect("checkpoint must load")
+                .is_some_and(|state| state.durable_bytes() == 7)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("second durable checkpoint must be reached");
+
+    execution.abort();
+    let Err(interrupted) = execution.await else {
+        panic!("execution must be interrupted");
+    };
+    assert!(interrupted.is_cancelled());
+    release_first
+        .send(())
+        .expect("first server must still be waiting");
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen again");
+    let store = repository.http_resume_store();
+    let mut manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must recover again");
+    assert_eq!(
+        manager.job(id).expect("job must exist").state(),
+        DownloadState::Interrupted
+    );
+    manager.resume(id).await.expect("resume must queue again");
+    let executor =
+        HttpExecutor::with_resume_store(HttpClient::new().expect("HTTP client must build"), store);
+    let report = manager
+        .execute(id, &executor)
+        .await
+        .expect("second resume must complete");
+
+    assert!(matches!(report.event, DownloadEvent::Completed { .. }));
+    assert_eq!(
+        tokio::fs::read(output_directory.join("file.bin"))
+            .await
+            .expect("output must exist"),
+        b"helloworld"
+    );
+    let requests = server.await.expect("server must succeed");
+    let first = String::from_utf8(requests[0].clone())
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    let second = String::from_utf8(requests[1].clone())
+        .expect("request must be UTF-8")
+        .to_ascii_lowercase();
+    assert!(first.contains("range: bytes=5-\r\n"));
+    assert!(second.contains("range: bytes=7-\r\n"));
     manager.into_repository().close().await;
 }
 
