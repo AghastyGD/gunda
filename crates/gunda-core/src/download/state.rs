@@ -79,10 +79,24 @@ impl DownloadState {
         }
     }
 
-    /// Returns whether no further execution transition is allowed.
+    /// Returns whether the current execution attempt has ended.
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Cancelled)
+    }
+
+    /// Returns whether a new attempt can replace this idle job's execution data.
+    #[must_use]
+    pub const fn can_restart(self) -> bool {
+        matches!(
+            self,
+            Self::Queued
+                | Self::Paused
+                | Self::Interrupted
+                | Self::Failed
+                | Self::Cancelled
+                | Self::Completed
+        )
     }
 
     /// Returns whether this state represents work owned by the current process.

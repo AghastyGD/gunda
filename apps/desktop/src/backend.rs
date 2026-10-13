@@ -240,35 +240,22 @@ async fn run(
                 .map(|_| id)
                 .map_err(|_| "This download cannot be retried."),
             Command::Restart(id) => {
-                let eligible = manager.jobs().any(|job| {
-                    job.id() == id
-                        && job.state() == gunda_core::download::DownloadState::Failed
-                        && !job
-                            .last_failure()
-                            .is_some_and(gunda_core::download::DownloadFailure::is_retryable)
-                });
-                if !eligible {
-                    Err("This download cannot be restarted.")
-                } else if executor
-                    .reset_for_restart(
-                        id,
+                let directory = manager
+                    .job(id)
+                    .filter(|job| job.state().can_restart())
+                    .map(|job| job.destination().directory().to_path_buf());
+                if let Some(directory) = directory {
+                    if executor.reset_for_restart(id, &directory).await.is_err() {
+                        Err("The previous download data could not be cleared safely.")
+                    } else {
                         manager
-                            .jobs()
-                            .find(|job| job.id() == id)
-                            .expect("eligible job must exist")
-                            .destination()
-                            .directory(),
-                    )
-                    .await
-                    .is_err()
-                {
-                    Err("The previous download data could not be cleared safely.")
+                            .restart(id)
+                            .await
+                            .map(|_| id)
+                            .map_err(|_| "This download could not be restarted.")
+                    }
                 } else {
-                    manager
-                        .restart(id)
-                        .await
-                        .map(|_| id)
-                        .map_err(|_| "This download could not be restarted.")
+                    Err("This download cannot be restarted.")
                 }
             }
         };
@@ -569,6 +556,112 @@ mod tests {
         let history = wait_for(&mut reopened, |snapshot| snapshot.ready).await;
         assert_eq!(history.jobs[0].state, DownloadState::Completed);
         assert_eq!(history.jobs[0].output, view.output);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restart_downloads_idle_jobs_from_zero_and_preserves_published_files() {
+        for (state, keep_output) in [
+            (DownloadState::Queued, false),
+            (DownloadState::Paused, false),
+            (DownloadState::Interrupted, false),
+            (DownloadState::Failed, false),
+            (DownloadState::Cancelled, false),
+            (DownloadState::Completed, false),
+            (DownloadState::Completed, true),
+        ] {
+            let data = tempfile::tempdir().unwrap();
+            let output = tempfile::tempdir().unwrap();
+            let (url, server) =
+                serve(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")
+                    .await;
+            let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
+                .await
+                .unwrap();
+            let mut manager = DownloadManager::start(repository).await.unwrap();
+            let id = manager
+                .create(NewDownload::new(
+                    RequestContext::new(url, Vec::new()),
+                    DownloadDestination::new(
+                        output.path().into(),
+                        Some("file.bin".into()),
+                        FileConflictPolicy::Rename,
+                    ),
+                    DownloadOrigin::Desktop,
+                ))
+                .await
+                .unwrap()
+                .download_id();
+            let mut job = manager.job(id).unwrap().clone();
+            let repository = manager.into_repository();
+            let published = output.path().join("file.bin");
+            std::fs::write(&published, b"previous output").unwrap();
+            if !keep_output {
+                std::fs::remove_file(&published).unwrap();
+            }
+            let mut snapshot = job.snapshot();
+            snapshot.state = state;
+            snapshot.progress = DownloadProgress::new(5, Some(10)).unwrap();
+            snapshot.resolved_destination = Some(gunda_core::download::ResolvedDestination::new(
+                published.clone(),
+            ));
+            snapshot.resource = Some(ResourceDescriptor::new(
+                ResourceKind::File,
+                Some("old file".into()),
+                None,
+            ));
+            if state == DownloadState::Failed {
+                snapshot.last_failure = Some(gunda_core::download::DownloadFailure::new(
+                    gunda_core::download::FailureKind::Network,
+                    "old failure",
+                    true,
+                ));
+            }
+            job = DownloadJob::restore(snapshot);
+            repository.save(&job).await.unwrap();
+            let store = repository.http_resume_store();
+            let tag = StrongEntityTag::parse(b"\"old-representation\"").unwrap();
+            let initial = store.initialize(id, &tag, 10).await.unwrap();
+            let checkpoint = HttpResumeState::new(initial.strong_etag().clone(), 10, 5).unwrap();
+            store.save_checkpoint(id, &checkpoint).await.unwrap();
+            let partial = partial_path(output.path(), id);
+            std::fs::write(&partial, b"stale").unwrap();
+
+            let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+            wait_for(&mut backend, |snapshot| snapshot.ready).await;
+            backend.send(Command::Restart(id)).unwrap();
+            let completed = wait_for(&mut backend, |snapshot| {
+                !snapshot.busy
+                    && snapshot.jobs.first().is_some_and(|view| {
+                        view.state == DownloadState::Completed && view.total == Some(5)
+                    })
+            })
+            .await;
+            let view = &completed.jobs[0];
+            assert_eq!(view.id, id);
+            assert_eq!(view.written, 5);
+            assert_eq!(
+                std::fs::read(view.output.as_ref().unwrap()).unwrap(),
+                b"hello"
+            );
+            assert!(view.error.is_none());
+            assert!(!partial.exists());
+            assert!(store.find(id).await.unwrap().is_none());
+            if keep_output {
+                assert_eq!(std::fs::read(&published).unwrap(), b"previous output");
+                assert_ne!(view.output.as_ref().unwrap(), &published);
+            } else {
+                assert_eq!(view.output.as_ref().unwrap(), &published);
+            }
+            let request = String::from_utf8(server.await.unwrap())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(!request.contains("\r\nrange:"));
+            assert!(!request.contains("\r\nif-range:"));
+            let persisted = repository.find_by_id(id).await.unwrap().unwrap();
+            assert_eq!(persisted.state(), DownloadState::Completed);
+            assert_eq!(persisted.progress().downloaded_bytes(), 5);
+            assert!(persisted.last_failure().is_none());
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -303,37 +303,33 @@ impl Desktop {
                             {
                                 self.error = Some("This download cannot be paused safely.".into());
                             }
-                        } else if (view.can_resume() || view.can_retry() || view.can_restart())
-                            && ui
-                                .add_enabled(
+                        } else {
+                            if view.can_restart()
+                                && ui.add_enabled(!self.busy(), egui::Button::new("Restart")
+                                    .min_size(egui::vec2(88.0, 32.0)))
+                                    .on_hover_text("Discard saved progress and download again from zero. Existing files are kept.")
+                                    .clicked()
+                            {
+                                self.send(Command::Restart(view.id));
+                            }
+                            if (view.can_resume() || view.can_retry())
+                                && ui.add_enabled(
                                     !self.busy(),
-                                    egui::Button::new(
-                                        RichText::new(if view.can_retry() {
-                                            "Retry"
-                                        } else if view.can_restart() {
-                                            "Restart"
-                                        } else {
-                                            "Resume"
-                                        })
-                                        .color(Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .min_size(egui::vec2(88.0, 32.0)),
-                                )
-                                .on_hover_text(if view.can_restart() {
-                                    "Discard saved progress and start again from zero."
+                                    egui::Button::new(RichText::new(if view.can_retry() {
+                                        "Retry"
+                                    } else {
+                                        "Resume"
+                                    }).color(Color32::WHITE))
+                                        .fill(ACCENT)
+                                        .min_size(egui::vec2(88.0, 32.0)),
+                                ).clicked()
+                            {
+                                self.send(if view.can_retry() {
+                                    Command::Retry(view.id)
                                 } else {
-                                    ""
-                                })
-                                .clicked()
-                        {
-                            self.send(if view.can_retry() {
-                                Command::Retry(view.id)
-                            } else if view.can_restart() {
-                                Command::Restart(view.id)
-                            } else {
-                                Command::Resume(view.id)
-                            });
+                                    Command::Resume(view.id)
+                                });
+                            }
                         }
                     });
                 });

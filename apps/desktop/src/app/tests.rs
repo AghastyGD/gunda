@@ -22,6 +22,55 @@ fn desktop(snapshot: Snapshot) -> Desktop {
 }
 
 #[test]
+fn stopped_transfer_dialog_keeps_restart_separate_from_resume_and_retry() {
+    for (state, retryable, continuation) in [
+        (DownloadState::Paused, false, Some("Resume")),
+        (DownloadState::Interrupted, false, Some("Resume")),
+        (DownloadState::Failed, true, Some("Retry")),
+        (DownloadState::Cancelled, false, None),
+        (DownloadState::Completed, false, None),
+    ] {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            let mut view = crate::view::tests::sample(state);
+            view.retryable = retryable;
+            let id = view.id;
+            let mut desktop = desktop(Snapshot {
+                ready: true,
+                jobs: vec![view],
+                ..Default::default()
+            });
+            desktop.update();
+            desktop.transfer = Some(id);
+            desktop.dark = dark;
+            desktop.theme(&ctx);
+            for frame in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| desktop.transfer_dialog(ui.ctx()),
+                );
+                if frame == 1 {
+                    let has_label = |label: &str| {
+                        output.shapes.iter().any(|shape|
+                        matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == label))
+                    };
+                    assert!(has_label("Restart"));
+                    assert_eq!(has_label("Resume"), continuation == Some("Resume"));
+                    assert_eq!(has_label("Retry"), continuation == Some("Retry"));
+                }
+                output.textures_delta.clear();
+            }
+        }
+    }
+}
+
+#[test]
 fn filters_separate_running_interrupted_and_completed_rows() {
     let view = crate::view::tests::sample(DownloadState::Interrupted);
     assert!(Filter::Interrupted.matches(&view, None));

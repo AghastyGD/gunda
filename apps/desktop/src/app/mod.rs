@@ -199,32 +199,35 @@ impl Desktop {
             let can_resume = selected.as_ref().is_some_and(DownloadView::can_resume);
             let can_retry = selected.as_ref().is_some_and(DownloadView::can_retry);
             let can_restart = selected.as_ref().is_some_and(DownloadView::can_restart);
-            let mut restart_action = action_button(
+            let resume_action = action_button(
                 ui,
                 Icon::Resume,
-                if can_retry {
-                    "Retry"
-                } else if can_restart {
-                    "Restart"
-                } else {
-                    "Resume"
-                },
-                !self.busy() && (can_resume || can_retry || can_restart),
+                if can_retry { "Retry" } else { "Resume" },
+                !self.busy() && (can_resume || can_retry),
                 Color32::from_rgb(52, 170, 111),
             );
-            if can_restart {
-                restart_action = restart_action
-                    .on_hover_text("Discard saved progress and start again from zero.");
-            }
-            if restart_action.clicked() {
+            if resume_action.clicked() {
                 let id = selected.as_ref().unwrap().id;
                 self.send(if can_retry {
                     Command::Retry(id)
-                } else if can_restart {
-                    Command::Restart(id)
                 } else {
                     Command::Resume(id)
                 });
+            }
+            if action_button(
+                ui,
+                Icon::Resume,
+                "Restart",
+                !self.busy() && can_restart,
+                ACCENT,
+            )
+            .on_hover_text(
+                "Discard saved progress and download again from zero. Existing files are kept.",
+            )
+            .clicked()
+                && let Some(view) = &selected
+            {
+                self.send(Command::Restart(view.id));
             }
             let active_selected = self.selected.is_some() && self.selected == self.snapshot.active;
             let mut pause = action_button(

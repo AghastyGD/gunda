@@ -162,7 +162,7 @@ where
             })
     }
 
-    /// Returns a failed job to the queue with progress reset to zero.
+    /// Queues a fresh attempt for an idle job with execution metadata cleared.
     #[tracing::instrument(name = "manager.restart", skip_all, fields(download_id = id.value()))]
     pub async fn restart(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Restart)
@@ -561,7 +561,7 @@ where
             {
                 DownloadState::Queued
             }
-            (DownloadCommandKind::Restart, DownloadState::Failed) => DownloadState::Queued,
+            (DownloadCommandKind::Restart, state) if state.can_restart() => DownloadState::Queued,
             (DownloadCommandKind::Cancel, DownloadState::Queued | DownloadState::Paused) => {
                 DownloadState::Cancelled
             }
@@ -576,17 +576,17 @@ where
 
         let mut candidate = current.clone();
 
-        candidate
-            .transition_to(next, OffsetDateTime::now_utc())
-            .map_err(|_| DownloadManagerError::InvalidOperation {
-                id,
-                command,
-                state: previous,
-            })?;
-
+        let updated_at = OffsetDateTime::now_utc();
         if command == DownloadCommandKind::Restart {
-            candidate.update_progress(DownloadProgress::default(), OffsetDateTime::now_utc());
+            candidate.restart(updated_at)
+        } else {
+            candidate.transition_to(next, updated_at)
         }
+        .map_err(|_| DownloadManagerError::InvalidOperation {
+            id,
+            command,
+            state: previous,
+        })?;
 
         self.commit_job(candidate).await?;
 
@@ -1310,7 +1310,109 @@ mod tests {
         let restarted = manager.job(id).expect("job must exist");
         assert_eq!(restarted.state(), DownloadState::Queued);
         assert_eq!(restarted.progress(), DownloadProgress::default());
-        assert!(restarted.last_failure().is_some());
+        assert!(restarted.last_failure().is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_clears_every_idle_attempt_and_persists_before_returning() {
+        for state in [
+            DownloadState::Queued,
+            DownloadState::Paused,
+            DownloadState::Interrupted,
+            DownloadState::Failed,
+            DownloadState::Cancelled,
+            DownloadState::Completed,
+        ] {
+            let mut snapshot = job(1).snapshot();
+            let id = snapshot.id;
+            snapshot.state = state;
+            snapshot.progress = DownloadProgress::new(10, Some(10)).unwrap();
+            snapshot.resource = Some(ResourceDescriptor::new(
+                ResourceKind::File,
+                Some("old.bin".into()),
+                None,
+            ));
+            snapshot.resolved_destination = Some(ResolvedDestination::new("old.bin".into()));
+            snapshot.last_failure = Some(DownloadFailure::new(
+                FailureKind::Integrity,
+                "old failure",
+                false,
+            ));
+            let original = DownloadJob::restore(snapshot);
+            let mut manager =
+                DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
+                    .await
+                    .unwrap();
+
+            let event = manager.restart(id).await.unwrap();
+
+            assert!(
+                event
+                    == DownloadEvent::StateChanged {
+                        id,
+                        previous: state,
+                        current: DownloadState::Queued
+                    }
+            );
+            let restarted = manager.job(id).unwrap();
+            assert_eq!(restarted.state(), DownloadState::Queued);
+            assert_eq!(restarted.progress(), DownloadProgress::default());
+            assert!(restarted.resource().is_none());
+            assert!(restarted.resolved_destination().is_none());
+            assert!(restarted.last_failure().is_none());
+            assert!(restarted.request() == original.request());
+            assert!(restarted.destination() == original.destination());
+            assert!(restarted.origin() == original.origin());
+            assert_eq!(restarted.created_at(), original.created_at());
+            assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == Some(restarted));
+            assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_restart_save_preserves_the_completed_attempt() {
+        let mut snapshot = job(1).snapshot();
+        snapshot.state = DownloadState::Completed;
+        snapshot.progress = DownloadProgress::new(10, Some(10)).unwrap();
+        let original = DownloadJob::restore(snapshot);
+        let id = original.id();
+        let mut repository = FakeRepository::with_jobs(vec![original.clone()]);
+        repository.fail_save = true;
+        let mut manager = DownloadManager::start(repository).await.unwrap();
+
+        assert!(manager.restart(id).await.is_err());
+        assert!(manager.job(id) == Some(&original));
+        assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == Some(&original));
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_active_execution_states_without_saving() {
+        for state in [
+            DownloadState::Inspecting,
+            DownloadState::Downloading,
+            DownloadState::Finalizing,
+        ] {
+            let original = job(1);
+            let id = original.id();
+            let mut manager =
+                DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
+                    .await
+                    .unwrap();
+            let mut snapshot = original.snapshot();
+            snapshot.state = state;
+            let active = DownloadJob::restore(snapshot);
+            manager.jobs.insert(id, active.clone());
+
+            assert!(matches!(
+                manager.restart(id).await,
+                Err(DownloadManagerError::InvalidOperation {
+                    command: DownloadCommandKind::Restart,
+                    ..
+                })
+            ));
+            assert!(manager.job(id) == Some(&active));
+            assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
@@ -1423,7 +1525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_job_cannot_return_to_the_queue() {
+    async fn cancelled_job_cannot_resume_its_old_attempt() {
         let original = job(1);
         let id = original.id();
 

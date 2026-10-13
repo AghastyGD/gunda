@@ -221,6 +221,23 @@ impl DownloadJob {
         Ok(())
     }
 
+    /// Starts a new attempt without retaining the previous execution metadata.
+    pub fn restart(&mut self, updated_at: OffsetDateTime) -> Result<(), InvalidStateTransition> {
+        if !self.state.can_restart() {
+            return Err(InvalidStateTransition::new(
+                self.state,
+                DownloadState::Queued,
+            ));
+        }
+        self.state = DownloadState::Queued;
+        self.progress = DownloadProgress::default();
+        self.resource = None;
+        self.resolved_destination = None;
+        self.last_failure = None;
+        self.updated_at = updated_at;
+        Ok(())
+    }
+
     /// Replaces the durable progress checkpoint.
     pub fn update_progress(&mut self, progress: DownloadProgress, updated_at: OffsetDateTime) {
         self.progress = progress;

@@ -84,7 +84,7 @@ impl DownloadView {
     }
 
     pub fn can_restart(&self) -> bool {
-        self.state == DownloadState::Failed && !self.retryable
+        self.state.can_restart()
     }
 
     pub fn progress(&self) -> Option<f32> {
@@ -201,12 +201,23 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn only_non_retryable_failed_jobs_offer_restart() {
-        let mut view = sample(DownloadState::Failed);
-        assert!(view.can_restart());
-        view.retryable = true;
-        assert!(!view.can_restart());
-        view.state = DownloadState::Interrupted;
-        assert!(!view.can_restart());
+    fn every_idle_state_offers_restart_regardless_of_retryability() {
+        for state in [
+            DownloadState::Queued,
+            DownloadState::Paused,
+            DownloadState::Interrupted,
+            DownloadState::Failed,
+            DownloadState::Cancelled,
+            DownloadState::Completed,
+            DownloadState::Inspecting,
+            DownloadState::Downloading,
+            DownloadState::Finalizing,
+        ] {
+            for retryable in [false, true] {
+                let mut view = sample(state);
+                view.retryable = retryable;
+                assert_eq!(view.can_restart(), !state.requires_recovery_after_restart());
+            }
+        }
     }
 }
