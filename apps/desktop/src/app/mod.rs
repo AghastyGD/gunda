@@ -199,16 +199,27 @@ impl Desktop {
             let can_resume = selected.as_ref().is_some_and(DownloadView::can_resume);
             let can_retry = selected.as_ref().is_some_and(DownloadView::can_retry);
             let can_restart = selected.as_ref().is_some_and(DownloadView::can_restart);
+            let save_status = selected
+                .as_ref()
+                .is_some_and(|view| view.completion_pending);
             let resume_action = action_button(
                 ui,
                 Icon::Resume,
-                if can_retry { "Retry" } else { "Resume" },
-                !self.busy() && (can_resume || can_retry),
+                if save_status {
+                    "Save status"
+                } else if can_retry {
+                    "Retry"
+                } else {
+                    "Resume"
+                },
+                !self.busy() && (save_status || can_resume || can_retry),
                 Color32::from_rgb(52, 170, 111),
             );
             if resume_action.clicked() {
                 let id = selected.as_ref().unwrap().id;
-                self.send(if can_retry {
+                self.send(if save_status {
+                    Command::SaveStatus(id)
+                } else if can_retry {
                     Command::Retry(id)
                 } else {
                     Command::Resume(id)

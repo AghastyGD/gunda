@@ -43,7 +43,10 @@ impl Filter {
         match self {
             Self::All => true,
             Self::Active => active == Some(view.id),
-            Self::Interrupted => view.can_resume(),
+            Self::Interrupted => matches!(
+                view.state,
+                DownloadState::Paused | DownloadState::Interrupted
+            ),
             Self::Completed => view.state == DownloadState::Completed,
             Self::Failed => view.state == DownloadState::Failed,
             Self::Cancelled => view.state == DownloadState::Cancelled,

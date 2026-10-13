@@ -126,7 +126,7 @@ async fn existing_partial_file_is_never_overwritten() {
 }
 
 #[tokio::test]
-async fn interrupted_transfer_preserves_partial_without_reporting_success() {
+async fn interrupted_nonresumable_transfer_discards_its_owned_partial() {
     let directory = tempdir().expect("temporary directory must exist");
 
     let (url, server) = serve_once(
@@ -152,16 +152,8 @@ async fn interrupted_transfer_preserves_partial_without_reporting_success() {
 
     let path = partial_path(directory.path(), test_id());
 
-    assert!(path.exists());
+    assert!(!path.exists());
     assert!(!directory.path().join("file.bin").exists());
-
-    let length = tokio::fs::metadata(&path)
-        .await
-        .expect("partial file must remain")
-        .len();
-
-    // The HTTP parser may report failure before delivering any bytes.
-    assert!(length <= 5);
 
     server.await.expect("server task must succeed");
 }

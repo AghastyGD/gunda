@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -9,10 +10,10 @@ use std::{
 
 use eframe::egui;
 use gunda_core::{
-    application::{DownloadCancellation, DownloadManager, DownloadManagerError},
+    application::{DownloadCancellation, DownloadManager, DownloadManagerError, ExecutionOutput},
     download::{
-        DownloadDestination, DownloadId, DownloadOrigin, FileConflictPolicy, NewDownload,
-        RequestContext,
+        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, FileConflictPolicy,
+        NewDownload, RequestContext,
     },
 };
 use gunda_http::{HttpClient, HttpExecutor};
@@ -38,6 +39,7 @@ pub enum Command {
     Resume(DownloadId),
     Retry(DownloadId),
     Restart(DownloadId),
+    SaveStatus(DownloadId),
 }
 
 type Active = Arc<Mutex<Option<(DownloadId, DownloadCancellation)>>>;
@@ -206,9 +208,10 @@ async fn run(
             return;
         }
     };
+    let mut pending_outputs = BTreeMap::new();
     let mut snapshot = Snapshot {
         ready: true,
-        jobs: manager.jobs().map(DownloadView::from_job).collect(),
+        jobs: idle_views(&manager, &executor, &pending_outputs).await,
         ..Default::default()
     };
     publish(&sender, &ctx, snapshot.clone());
@@ -220,6 +223,21 @@ async fn run(
         snapshot.notice = None;
         publish(&sender, &ctx, snapshot.clone());
         let id = match command {
+            Command::SaveStatus(id) => {
+                if let Some(output) = pending_outputs.get(&id) {
+                    if manager.confirm_published_output(id, output).await.is_ok() {
+                        pending_outputs.remove(&id);
+                    } else {
+                        snapshot.notice = Some("The file is saved, but its status could not be updated. Try Save status again.".into());
+                    }
+                } else {
+                    snapshot.notice = Some("There is no saved file status to update.".into());
+                }
+                snapshot.jobs = idle_views(&manager, &executor, &pending_outputs).await;
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
             Command::Start { url, directory } => manager
                 .create(NewDownload::new(
                     RequestContext::new(url, Vec::new()),
@@ -229,11 +247,25 @@ async fn run(
                 .await
                 .map(|event| event.download_id())
                 .map_err(|_| "Could not save the new download."),
-            Command::Resume(id) => manager
-                .resume(id)
-                .await
-                .map(|_| id)
-                .map_err(|_| "This download cannot be resumed."),
+            Command::Resume(id) => {
+                let available = match manager.job(id) {
+                    Some(job) => executor.can_resume(job).await,
+                    None => Ok(false),
+                };
+                match available {
+                    Ok(true) => manager
+                        .resume(id)
+                        .await
+                        .map(|_| id)
+                        .map_err(|_| "This download cannot be resumed."),
+                    Ok(false) => Err(
+                        "Saved progress is unavailable. Use Restart to download again from zero.",
+                    ),
+                    Err(_) => Err(
+                        "Could not check saved progress. Check the application data folder and try again.",
+                    ),
+                }
+            }
             Command::Retry(id) => manager
                 .retry(id)
                 .await
@@ -270,7 +302,9 @@ async fn run(
             }
             snapshot.active = Some(id);
             snapshot.pause_supported = false;
-            snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
+            if let Some(job) = manager.job(id) {
+                update_job_view(&mut snapshot, job);
+            }
             publish(&sender, &ctx, snapshot.clone());
             let progress_control = cancellation.clone();
             let mut attempts = 0;
@@ -283,12 +317,8 @@ async fn run(
                         cancellation.clone(),
                         |_, job| {
                             snapshot.pause_supported = progress_control.pause_supported();
-                            if let Some(view) =
-                                snapshot.jobs.iter_mut().find(|view| view.id == job.id())
-                            {
-                                *view = DownloadView::from_job(job);
-                                publish(&sender, &ctx, snapshot.clone());
-                            }
+                            update_job_view(&mut snapshot, job);
+                            publish(&sender, &ctx, snapshot.clone());
                         },
                     )
                     .await;
@@ -311,7 +341,9 @@ async fn run(
                 }
 
                 let delay_seconds = 1_u64 << (attempts - 1);
-                snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
+                if let Some(job) = manager.job(id) {
+                    update_job_view(&mut snapshot, job);
+                }
                 snapshot.notice = Some(format!(
                     "Connection problem. Trying again in {delay_seconds} seconds…"
                 ));
@@ -327,13 +359,22 @@ async fn run(
             if let Ok(mut slot) = active.lock() {
                 *slot = None;
             }
-            snapshot.jobs = manager.jobs().map(DownloadView::from_job).collect();
             match result {
-                Err(DownloadManagerError::CompletionNotPersisted { destination, .. }) => {
-                    if let Some(view) = snapshot.jobs.iter_mut().find(|view| view.id == id) {
-                        view.output = Some(destination.final_path().to_owned());
-                    }
-                    snapshot.notice = Some("The file was saved, but its status may be out of date. Check the destination before trying again.".into());
+                Err(DownloadManagerError::CompletionNotPersisted {
+                    destination,
+                    written_bytes,
+                    cleanup_pending,
+                    ..
+                }) => {
+                    pending_outputs.insert(
+                        id,
+                        ExecutionOutput {
+                            destination,
+                            written_bytes,
+                            cleanup_pending,
+                        },
+                    );
+                    snapshot.notice = Some("The file was saved. Use Save status to update its download record without downloading again.".into());
                 }
                 Err(_) => {
                     snapshot.notice =
@@ -347,8 +388,51 @@ async fn run(
         snapshot.busy = false;
         snapshot.active = None;
         snapshot.pause_supported = false;
+        snapshot.jobs = idle_views(&manager, &executor, &pending_outputs).await;
         publish(&sender, &ctx, snapshot.clone());
     }
+}
+
+fn update_job_view(snapshot: &mut Snapshot, job: &DownloadJob) {
+    let updated = DownloadView::from_job(job);
+    if let Some(view) = snapshot.jobs.iter_mut().find(|view| view.id == job.id()) {
+        *view = updated;
+    } else {
+        snapshot.jobs.push(updated);
+    }
+}
+
+async fn idle_views(
+    manager: &DownloadManager<SqliteDownloadRepository>,
+    executor: &HttpExecutor,
+    pending_outputs: &BTreeMap<DownloadId, ExecutionOutput>,
+) -> Vec<DownloadView> {
+    let mut views = Vec::new();
+    for job in manager.jobs() {
+        let mut view = DownloadView::from_job(job);
+        let availability = executor.can_resume(job).await;
+        view.resume_available = matches!(availability, Ok(true));
+        if let Some(output) = pending_outputs.get(&job.id()) {
+            view.output = Some(output.destination.final_path().to_owned());
+            if let Some(name) = output.destination.final_path().file_name() {
+                view.name = name.to_string_lossy().into_owned();
+            }
+            view.completion_pending = true;
+        } else if matches!(
+            job.state(),
+            gunda_core::download::DownloadState::Paused
+                | gunda_core::download::DownloadState::Interrupted
+        ) && !view.resume_available
+        {
+            view.error = Some(if availability.is_err() {
+                "Could not check saved progress. Check the application data folder and try again."
+            } else {
+                "Saved progress is unavailable. Use Restart to download again from zero."
+            }.into());
+        }
+        views.push(view);
+    }
+    views
 }
 
 pub fn validate_url(value: &str) -> Result<Url, &'static str> {
@@ -377,6 +461,8 @@ mod tests {
         net::TcpListener,
         time::{Duration, timeout},
     };
+
+    mod recovery;
 
     async fn wait_for(backend: &mut Backend, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
         timeout(Duration::from_secs(10), async {

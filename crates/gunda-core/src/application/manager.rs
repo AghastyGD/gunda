@@ -7,8 +7,9 @@ use time::OffsetDateTime;
 
 use super::{
     DownloadCancellation, DownloadControlRequest, DownloadEvent, DownloadExecutor,
-    DownloadManagerError, DownloadRepository, ExecutionInput, ExecutionReport, PreparedTransfer,
-    RepositoryError, RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
+    DownloadManagerError, DownloadRepository, ExecutionInput, ExecutionOutput, ExecutionReport,
+    PreparedTransfer, RepositoryError, RepositoryErrorKind, StagedTransfer, TransferOutcome,
+    TransferProgress,
 };
 
 use crate::{
@@ -488,11 +489,10 @@ where
             )));
         }
 
-        job.resolve_destination(output.destination.clone(), OffsetDateTime::now_utc());
-
-        execution_transition(&mut job, DownloadState::Completed).map_err(completion_error)?;
-
-        self.commit_job(job).await.map_err(completion_error)?;
+        let event = self
+            .confirm_published_output(id, &output)
+            .await
+            .map_err(completion_error)?;
 
         tracing::info!(
             cleanup_pending = output.cleanup_pending,
@@ -500,11 +500,40 @@ where
         );
 
         Ok(ExecutionReport {
-            event: DownloadEvent::Completed {
-                id,
-                destination: output.destination,
-            },
+            event,
             cleanup_pending: output.cleanup_pending,
+        })
+    }
+
+    /// Persists completion using an executor's successful publication result.
+    #[tracing::instrument(name = "manager.confirm_completion", skip_all, fields(download_id = id.value()))]
+    pub async fn confirm_published_output(
+        &mut self,
+        id: DownloadId,
+        output: &ExecutionOutput,
+    ) -> Result<DownloadEvent, RepositoryError> {
+        let mut job = self.jobs.get(&id).cloned().ok_or_else(|| {
+            RepositoryError::new(
+                RepositoryErrorKind::NotFound,
+                "published download does not exist",
+            )
+        })?;
+        // The caller must retain the actual publication result, not infer it from a file's size.
+        if job.state() != DownloadState::Finalizing
+            || job.progress().downloaded_bytes() != output.written_bytes
+        {
+            return Err(invalid_repository_data(
+                "published output does not match the finalizing job",
+            ));
+        }
+        let updated_at = OffsetDateTime::now_utc();
+        job.resolve_destination(output.destination.clone(), updated_at);
+        job.transition_to(DownloadState::Completed, updated_at)
+            .map_err(|_| invalid_repository_data("published job cannot be completed"))?;
+        self.commit_job(job).await?;
+        Ok(DownloadEvent::Completed {
+            id,
+            destination: output.destination.clone(),
         })
     }
 
@@ -1821,6 +1850,79 @@ mod tests {
                 expected_calls,
             );
         }
+    }
+
+    #[tokio::test]
+    async fn published_completion_can_be_retried_without_executing_again() {
+        let (mut manager, executor, id) =
+            execution_fixture(Some(DownloadState::Completed), None).await;
+        let error = match manager.execute(id, &executor).await {
+            Err(error) => error,
+            Ok(_) => panic!("completion save must fail"),
+        };
+        let DownloadManagerError::CompletionNotPersisted {
+            destination,
+            written_bytes,
+            cleanup_pending,
+            ..
+        } = error
+        else {
+            panic!("publication must precede the failed save");
+        };
+        let output = ExecutionOutput {
+            destination,
+            written_bytes,
+            cleanup_pending,
+        };
+        let calls = executor.calls.lock().unwrap().clone();
+        assert!(manager.confirm_published_output(id, &output).await.is_err());
+        assert_eq!(manager.job(id).unwrap().state(), DownloadState::Finalizing);
+        manager.repository.fail_save_at = None;
+        let event = manager.confirm_published_output(id, &output).await.unwrap();
+        assert!(
+            event
+                == DownloadEvent::Completed {
+                    id,
+                    destination: output.destination.clone()
+                }
+        );
+        assert_eq!(manager.job(id).unwrap().state(), DownloadState::Completed);
+        assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == manager.job(id));
+        assert_eq!(*executor.calls.lock().unwrap(), calls);
+    }
+
+    #[tokio::test]
+    async fn published_completion_rejects_mismatched_counts_and_nonfinalizing_jobs() {
+        let (mut manager, executor, id) =
+            execution_fixture(Some(DownloadState::Completed), None).await;
+        let error = match manager.execute(id, &executor).await {
+            Err(error) => error,
+            Ok(_) => panic!("completion save must fail"),
+        };
+        let DownloadManagerError::CompletionNotPersisted {
+            destination,
+            written_bytes,
+            ..
+        } = error
+        else {
+            panic!("publication must precede the failed save");
+        };
+        manager.repository.fail_save_at = None;
+        let original = manager.job(id).unwrap().clone();
+        let saves = manager.repository.save_calls.load(Ordering::Relaxed);
+        let mut output = ExecutionOutput {
+            destination,
+            written_bytes: written_bytes + 1,
+            cleanup_pending: false,
+        };
+        assert!(manager.confirm_published_output(id, &output).await.is_err());
+        assert!(manager.job(id) == Some(&original));
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), saves);
+        output.written_bytes = written_bytes;
+        manager.confirm_published_output(id, &output).await.unwrap();
+        let saves = manager.repository.save_calls.load(Ordering::Relaxed);
+        assert!(manager.confirm_published_output(id, &output).await.is_err());
+        assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), saves);
     }
 
     #[tokio::test]

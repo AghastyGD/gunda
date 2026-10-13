@@ -312,10 +312,12 @@ impl Desktop {
                             {
                                 self.send(Command::Restart(view.id));
                             }
-                            if (view.can_resume() || view.can_retry())
+                            if (view.completion_pending || view.can_resume() || view.can_retry())
                                 && ui.add_enabled(
                                     !self.busy(),
-                                    egui::Button::new(RichText::new(if view.can_retry() {
+                                    egui::Button::new(RichText::new(if view.completion_pending {
+                                        "Save status"
+                                    } else if view.can_retry() {
                                         "Retry"
                                     } else {
                                         "Resume"
@@ -324,7 +326,9 @@ impl Desktop {
                                         .min_size(egui::vec2(88.0, 32.0)),
                                 ).clicked()
                             {
-                                self.send(if view.can_retry() {
+                                self.send(if view.completion_pending {
+                                    Command::SaveStatus(view.id)
+                                } else if view.can_retry() {
                                     Command::Retry(view.id)
                                 } else {
                                     Command::Resume(view.id)

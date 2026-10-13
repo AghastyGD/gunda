@@ -28,6 +28,7 @@ pub enum FileOperation {
     Seek,
     Sync,
     Truncate,
+    Remove,
 }
 
 /// Failure while transferring HTTP content into a partial file.
@@ -420,6 +421,11 @@ async fn stream_to_partial(
             }
 
             Some(Err(error)) => {
+                if resume_state.is_none() {
+                    drop(file);
+                    discard_owned_partial(&path, &identity).await?;
+                    return Err(error.into());
+                }
                 sync_checkpoint(
                     &mut file,
                     id,
@@ -498,6 +504,19 @@ async fn stream_to_partial(
     }))
 }
 
+async fn discard_owned_partial(path: &Path, identity: &Handle) -> Result<(), PartialDownloadError> {
+    if !path_matches_identity(path, identity)
+        .await
+        .map_err(|error| file_error(FileOperation::Remove, error))?
+    {
+        return Err(PartialDownloadError::InvalidPartial);
+    }
+    // As with restart cleanup, the selected directory must remain under the user's control.
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|error| file_error(FileOperation::Remove, error))
+}
+
 async fn sync_checkpoint(
     file: &mut File,
     id: DownloadId,
@@ -552,5 +571,30 @@ fn file_error(operation: FileOperation, error: io::Error) -> PartialDownloadErro
     PartialDownloadError::File {
         operation,
         kind: error.kind(),
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cleanup_does_not_delete_a_substituted_partial() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("partial");
+        std::fs::write(&path, b"owned bytes").unwrap();
+        let file = File::open(&path).await.unwrap();
+        let identity = file_identity(&file).await.unwrap();
+        drop(file);
+        let moved = directory.path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"unrelated bytes").unwrap();
+
+        assert_eq!(
+            discard_owned_partial(&path, &identity).await,
+            Err(PartialDownloadError::InvalidPartial)
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"unrelated bytes");
+        assert_eq!(std::fs::read(&moved).unwrap(), b"owned bytes");
     }
 }

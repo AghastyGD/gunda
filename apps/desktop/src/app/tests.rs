@@ -71,6 +71,50 @@ fn stopped_transfer_dialog_keeps_restart_separate_from_resume_and_retry() {
 }
 
 #[test]
+fn published_output_offers_save_status_instead_of_transfer_actions() {
+    for dark in [false, true] {
+        let ctx = egui::Context::default();
+        let mut view = crate::view::tests::sample(DownloadState::Finalizing);
+        view.completion_pending = true;
+        view.output = Some(std::path::PathBuf::from("Downloads/file.bin"));
+        let id = view.id;
+        let mut desktop = desktop(Snapshot {
+            ready: true,
+            jobs: vec![view],
+            ..Default::default()
+        });
+        desktop.update();
+        desktop.transfer = Some(id);
+        desktop.dark = dark;
+        desktop.theme(&ctx);
+        for frame in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| desktop.transfer_dialog(ui.ctx()),
+            );
+            if frame == 1 {
+                let has_label = |label: &str| {
+                    output.shapes.iter().any(|shape|
+                    matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == label))
+                };
+                assert!(has_label("Save status"));
+                assert!(has_label("File saved"));
+                assert!(!has_label("Resume"));
+                assert!(!has_label("Retry"));
+                assert!(!has_label("Restart"));
+            }
+            output.textures_delta.clear();
+        }
+    }
+}
+
+#[test]
 fn filters_separate_running_interrupted_and_completed_rows() {
     let view = crate::view::tests::sample(DownloadState::Interrupted);
     assert!(Filter::Interrupted.matches(&view, None));

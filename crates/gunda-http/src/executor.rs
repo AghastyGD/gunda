@@ -7,8 +7,8 @@ use gunda_core::application::{
     RepositoryErrorKind, StagedTransfer, TransferOutcome, TransferProgress,
 };
 use gunda_core::download::{
-    DownloadDestination, DownloadFailure, DownloadId, FailureKind, ResolvedDestination,
-    ResourceDescriptor, ResourceKind,
+    DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadState, FailureKind,
+    ResolvedDestination, ResourceDescriptor, ResourceKind,
 };
 
 use crate::HttpResumeStore;
@@ -85,6 +85,43 @@ impl HttpExecutor {
                 .map_err(|error| RestartResetError::ResumeStorage(error.kind()))?;
         }
         Ok(())
+    }
+
+    /// Checks saved metadata and the local partial before offering Resume.
+    pub async fn can_resume(&self, job: &DownloadJob) -> Result<bool, DownloadFailure> {
+        if !matches!(
+            job.state(),
+            DownloadState::Paused | DownloadState::Interrupted
+        ) || !matches!(job.request().url().scheme(), "http" | "https")
+            || job
+                .resource()
+                .is_some_and(|resource| resource.kind() != ResourceKind::File)
+        {
+            return Ok(false);
+        }
+        let Some(store) = &self.resume_store else {
+            return Ok(false);
+        };
+        let Some(state) = store
+            .find_state(job.id())
+            .await
+            .map_err(|_| storage_failure("could not inspect HTTP resume state"))?
+        else {
+            return Ok(false);
+        };
+        if job.progress().total_bytes() != Some(state.total_bytes()) {
+            return Ok(false);
+        }
+        let Some(destination) = job.resolved_destination() else {
+            return Ok(false);
+        };
+        Ok(inspect_resume_candidate(
+            &partial_path(job.destination().directory(), job.id()),
+            (state.durable_bytes() == state.total_bytes()).then(|| destination.final_path()),
+            state.durable_bytes(),
+        )
+        .await
+        .is_ok())
     }
 }
 

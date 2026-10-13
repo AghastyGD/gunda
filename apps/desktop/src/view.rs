@@ -15,6 +15,8 @@ pub struct DownloadView {
     pub output: Option<PathBuf>,
     pub error: Option<String>,
     pub retryable: bool,
+    pub resume_available: bool,
+    pub completion_pending: bool,
 }
 
 impl DownloadView {
@@ -69,14 +71,17 @@ impl DownloadView {
                 && job
                     .last_failure()
                     .is_some_and(gunda_core::download::DownloadFailure::is_retryable),
+            resume_available: false,
+            completion_pending: false,
         }
     }
 
     pub fn can_resume(&self) -> bool {
-        matches!(
-            self.state,
-            DownloadState::Paused | DownloadState::Interrupted
-        )
+        self.resume_available
+            && matches!(
+                self.state,
+                DownloadState::Paused | DownloadState::Interrupted
+            )
     }
 
     pub fn can_retry(&self) -> bool {
@@ -97,6 +102,9 @@ impl DownloadView {
     }
 
     pub fn label(&self, active: bool) -> &'static str {
+        if self.completion_pending {
+            return "File saved";
+        }
         if active && self.state == DownloadState::Queued {
             return "Preparing";
         }
@@ -161,6 +169,8 @@ pub(crate) mod tests {
             output: None,
             error: None,
             retryable: false,
+            resume_available: matches!(state, DownloadState::Paused | DownloadState::Interrupted),
+            completion_pending: false,
         }
     }
 
@@ -188,6 +198,20 @@ pub(crate) mod tests {
         ] {
             assert!(!sample(state).can_resume());
         }
+    }
+
+    #[test]
+    fn resume_requires_worker_verified_recovery_data() {
+        for state in [DownloadState::Paused, DownloadState::Interrupted] {
+            let mut view = sample(state);
+            view.resume_available = false;
+            assert!(!view.can_resume());
+            assert!(view.can_restart());
+        }
+        let mut view = sample(DownloadState::Finalizing);
+        view.completion_pending = true;
+        assert_eq!(view.label(false), "File saved");
+        assert!(!view.can_resume());
     }
 
     #[test]

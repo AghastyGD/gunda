@@ -9,8 +9,9 @@ use gunda_core::application::{
     StagedTransfer, TransferOutcome,
 };
 use gunda_core::download::{
-    DownloadDestination, DownloadId, DownloadProgress, FailureKind, FileConflictPolicy,
-    RequestContext, ResolvedDestination, ResourceDescriptor, ResourceKind,
+    DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadProgress, DownloadState,
+    FailureKind, FileConflictPolicy, NewDownload, RequestContext, ResolvedDestination,
+    ResourceDescriptor, ResourceKind,
 };
 use gunda_http::{
     HttpClient, HttpExecutor, HttpResumeState, HttpResumeStore, RestartResetError, StrongEntityTag,
@@ -78,6 +79,71 @@ impl HttpResumeStore for TestResumeStore {
 
 fn test_id() -> DownloadId {
     DownloadId::new(77).expect("ID must be valid")
+}
+
+#[tokio::test]
+async fn resume_availability_checks_metadata_and_partial_without_truncating_it() {
+    let directory = tempdir().unwrap();
+    let id = test_id();
+    let original = DownloadJob::new(
+        id,
+        NewDownload::new(
+            RequestContext::new(
+                Url::parse("https://example.com/file.bin").unwrap(),
+                Vec::new(),
+            ),
+            DownloadDestination::new(
+                directory.path().into(),
+                Some("file.bin".into()),
+                FileConflictPolicy::Fail,
+            ),
+            DownloadOrigin::Desktop,
+        ),
+        time::OffsetDateTime::now_utc(),
+    );
+    let mut snapshot = original.snapshot();
+    snapshot.state = DownloadState::Interrupted;
+    snapshot.progress = DownloadProgress::new(5, Some(10)).unwrap();
+    snapshot.resource = Some(ResourceDescriptor::new(ResourceKind::File, None, None));
+    snapshot.resolved_destination =
+        Some(ResolvedDestination::new(directory.path().join("file.bin")));
+    let job = DownloadJob::restore(snapshot.clone());
+    let executor =
+        HttpExecutor::with_resume_store(HttpClient::new().unwrap(), TestResumeStore::at(5));
+    let partial = partial_path(directory.path(), id);
+    assert!(!executor.can_resume(&job).await.unwrap());
+    std::fs::write(&partial, b"abc").unwrap();
+    assert!(!executor.can_resume(&job).await.unwrap());
+    std::fs::write(&partial, b"hello-uncheckpointed").unwrap();
+    assert!(executor.can_resume(&job).await.unwrap());
+    assert_eq!(std::fs::read(&partial).unwrap(), b"hello-uncheckpointed");
+    snapshot.state = DownloadState::Paused;
+    assert!(
+        executor
+            .can_resume(&DownloadJob::restore(snapshot.clone()))
+            .await
+            .unwrap()
+    );
+    snapshot.progress = DownloadProgress::new(5, Some(11)).unwrap();
+    assert!(
+        !executor
+            .can_resume(&DownloadJob::restore(snapshot.clone()))
+            .await
+            .unwrap()
+    );
+    snapshot.progress = DownloadProgress::new(5, Some(10)).unwrap();
+    snapshot.resolved_destination = None;
+    assert!(
+        !executor
+            .can_resume(&DownloadJob::restore(snapshot))
+            .await
+            .unwrap()
+    );
+    let without_store = HttpExecutor::new(HttpClient::new().unwrap());
+    assert!(!without_store.can_resume(&job).await.unwrap());
+    std::fs::remove_file(&partial).unwrap();
+    std::fs::create_dir(&partial).unwrap();
+    assert!(!executor.can_resume(&job).await.unwrap());
 }
 
 fn resume_input(url: Url, directory: &Path) -> ExecutionInput {
