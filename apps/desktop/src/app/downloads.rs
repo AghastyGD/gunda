@@ -138,6 +138,7 @@ impl Desktop {
     }
 
     pub(super) fn table(&mut self, ui: &mut egui::Ui) {
+        ui.style_mut().interaction.selectable_labels = false;
         ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
         if let Some(message) = self.error.as_ref().or(self.snapshot.notice.as_ref()) {
@@ -238,8 +239,7 @@ impl Desktop {
                                         stroke,
                                     );
                                 }
-                                ui.add(egui::Label::new(RichText::new(&view.name)).truncate())
-                                    .on_hover_text(&view.name);
+                                ui.add(egui::Label::new(RichText::new(&view.name)).truncate());
                             });
                         });
                         row.col(|ui| {

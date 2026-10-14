@@ -115,6 +115,119 @@ fn published_output_offers_save_status_instead_of_transfer_actions() {
 }
 
 #[test]
+fn filename_hover_has_one_tooltip_and_rows_use_the_arrow_cursor() {
+    for dark in [false, true] {
+        let ctx = egui::Context::default();
+        let mut view = crate::view::tests::sample(DownloadState::Completed);
+        view.name = "a-very-long-download-filename-that-does-not-fit-inside-the-file-name-column-and-must-be-truncated.mp4".into();
+        let name = view.name.clone();
+        let id = view.id;
+        let mut desktop = desktop(Snapshot {
+            ready: true,
+            jobs: vec![view],
+            ..Default::default()
+        });
+        desktop.update();
+        desktop.dark = dark;
+        desktop.theme(&ctx);
+        let theme = if dark {
+            egui::Theme::Dark
+        } else {
+            egui::Theme::Light
+        };
+        ctx.style_mut_of(theme, |style| style.interaction.tooltip_delay = 0.0);
+        {
+            let mut render = |time: f64, events: Vec<egui::Event>| {
+                ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 300.0),
+                        )),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| desktop.table(ui),
+                )
+            };
+            let mut initial = render(0.0, Vec::new());
+            let filename = initial
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == name => {
+                        assert!(text.galley.elided);
+                        Some(text.pos + egui::vec2(10.0, 5.0))
+                    }
+                    _ => None,
+                })
+                .expect("filename must be visible");
+            let status = initial
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "Completed" => {
+                        Some(text.pos + egui::vec2(10.0, 5.0))
+                    }
+                    _ => None,
+                })
+                .expect("status must be visible");
+            initial.textures_delta.clear();
+            let mut hovered = render(1.0, vec![egui::Event::PointerMoved(filename)]);
+            assert_eq!(
+                hovered.platform_output.cursor_icon,
+                egui::CursorIcon::Default
+            );
+            hovered.textures_delta.clear();
+            let mut tooltip = render(2.0, Vec::new());
+            let full_names = tooltip.shapes.iter().filter(|shape|
+            matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == name && !text.galley.elided)).count();
+            assert_eq!(
+                full_names, 1,
+                "truncated filename must have exactly one tooltip"
+            );
+            tooltip.textures_delta.clear();
+            let mut status_hover = render(3.0, vec![egui::Event::PointerMoved(status)]);
+            assert_eq!(
+                status_hover.platform_output.cursor_icon,
+                egui::CursorIcon::Default
+            );
+            status_hover.textures_delta.clear();
+            for (time, pressed) in [(4.0, true), (4.1, false), (4.2, true), (4.3, false)] {
+                let mut clicked = render(
+                    time,
+                    vec![
+                        egui::Event::PointerMoved(filename),
+                        egui::Event::PointerButton {
+                            pos: filename,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                clicked.textures_delta.clear();
+            }
+        }
+        assert_eq!(
+            desktop.selected,
+            Some(id),
+            "filename clicks must still select the row"
+        );
+        assert_eq!(
+            desktop.transfer,
+            Some(id),
+            "filename double-click must still open details"
+        );
+        assert!(
+            ctx.style_of(theme).interaction.selectable_labels,
+            "table settings must not change other panels"
+        );
+    }
+}
+
+#[test]
 fn filters_separate_running_interrupted_and_completed_rows() {
     let view = crate::view::tests::sample(DownloadState::Interrupted);
     assert!(Filter::Interrupted.matches(&view, None));
