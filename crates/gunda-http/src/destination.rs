@@ -5,7 +5,12 @@ use url::Url;
 use crate::FinalizeError;
 use crate::finalize::validate_filename;
 
-pub(crate) fn plan_destination(
+/// Chooses the publication name for a download.
+///
+/// This is shared policy, not an HTTP detail: every engine must derive the same
+/// final filename for the same job, so protocol engines call it directly instead
+/// of reimplementing the naming rules.
+pub fn plan_destination(
     id: DownloadId,
     url: &Url,
     destination: &DownloadDestination,
@@ -15,7 +20,7 @@ pub(crate) fn plan_destination(
             validate_filename(filename)?;
             filename.to_owned()
         }
-        None => filename_from_url(url).unwrap_or_else(|| format!("download-{}.bin", id.value())),
+        None => url_filename(url).unwrap_or_else(|| format!("download-{}.bin", id.value())),
     };
 
     let resolved = ResolvedDestination::new(destination.directory().join(&filename));
@@ -29,7 +34,13 @@ pub(crate) fn plan_destination(
     Ok((publication, resolved))
 }
 
-fn filename_from_url(url: &Url) -> Option<String> {
+/// The filename a URL implies, when it implies a usable one.
+///
+/// Shared because a download does not always publish the resource it addressed:
+/// a stream is downloaded from segments and published under the name of the
+/// presentation, so the caller needs the same validated stem the namer would
+/// have used.
+pub fn url_filename(url: &Url) -> Option<String> {
     let segment = url.path_segments()?.next_back()?;
 
     // Decode only the final segment so encoded separators cannot create a path.

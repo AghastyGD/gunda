@@ -12,6 +12,7 @@ mod validator;
 
 pub use body::HttpBody;
 pub use client::{HttpClient, HttpInspection};
+pub use destination::{plan_destination, url_filename};
 pub use error::HttpError;
 pub use executor::{HttpExecutor, HttpPreparedTransfer, HttpStagedTransfer, RestartResetError};
 pub use finalize::{FinalizeError, FinalizeFailure, FinalizedDownload, finalize_download};

@@ -218,3 +218,129 @@ async fn redirected_range_preserves_checkpoint_headers() {
     assert!(received.contains("range: bytes=5-\r\n"));
     assert!(received.contains("if-range: \"version-73\"\r\n"));
 }
+
+#[tokio::test]
+async fn byte_range_requests_exactly_the_requested_interval() {
+    let (url, server) = serve_once(
+        "HTTP/1.1 206 Partial Content\r\n\
+         Content-Range: bytes 5-9/10\r\n\
+         Content-Length: 5\r\n\
+         Connection: close\r\n\
+         \r\n\
+         world",
+    )
+    .await;
+
+    let client = HttpClient::new().expect("client must build");
+    let request = RequestContext::new(url, Vec::new());
+
+    let mut body = client
+        .open_byte_range(&request, 5, 9)
+        .await
+        .expect("byte range must open");
+
+    assert_eq!(body.range().start(), 5);
+    assert_eq!(body.range().end(), 9);
+    assert_eq!(body.range().total(), 10);
+    assert_eq!(body.metadata().content_length(), Some(5));
+
+    let mut contents = Vec::new();
+
+    while let Some(chunk) = body.next_chunk().await.expect("body must be readable") {
+        contents.extend_from_slice(&chunk);
+    }
+
+    assert_eq!(contents, b"world");
+    assert!(body.is_finished());
+
+    let received = server
+        .await
+        .expect("server task must succeed")
+        .to_ascii_lowercase();
+
+    assert!(received.contains("range: bytes=5-9\r\n"));
+    // The interval is absolute, not a resumption, so no validator is required.
+    assert!(!received.contains("if-range:"));
+}
+
+#[tokio::test]
+async fn byte_range_rejects_whole_resource_and_mismatched_intervals() {
+    // A server that ignores Range answers with the whole resource; storing that
+    // where one interval was asked for would corrupt the output.
+    let (url, server) = serve_once(
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\
+         Connection: close\r\n\r\nhello",
+    )
+    .await;
+
+    let client = HttpClient::new().expect("client must build");
+    let request = RequestContext::new(url, Vec::new());
+
+    assert!(matches!(
+        client.open_byte_range(&request, 5, 9).await,
+        Err(HttpError::UnexpectedStatus(200))
+    ));
+
+    server.await.expect("server task must succeed");
+
+    for (headers, description) in [
+        (
+            "Content-Range: bytes 4-8/10\r\nContent-Length: 5\r\n",
+            "a different interval",
+        ),
+        (
+            "Content-Range: bytes 5-8/10\r\nContent-Length: 4\r\n",
+            "a shorter interval",
+        ),
+        (
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 4\r\n",
+            "a length that disagrees with Content-Range",
+        ),
+        (
+            "Content-Range: bytes */10\r\nContent-Length: 0\r\n",
+            "an unsatisfied range",
+        ),
+        (
+            "Content-Range: bytes 5-9/10\r\nContent-Length: 5\r\n\
+             Content-Type: multipart/byteranges; boundary=test\r\n",
+            "several intervals in one body",
+        ),
+    ] {
+        let response = format!(
+            "HTTP/1.1 206 Partial Content\r\n\
+             {headers}Connection: close\r\n\r\nhello"
+        );
+
+        let (url, server) = serve_once(&response).await;
+
+        let client = HttpClient::new().expect("client must build");
+        let request = RequestContext::new(url, Vec::new());
+
+        assert!(
+            matches!(
+                client.open_byte_range(&request, 5, 9).await,
+                Err(HttpError::InvalidMetadata)
+            ),
+            "unexpected result for {description}"
+        );
+
+        server.await.expect("server task must succeed");
+    }
+}
+
+#[tokio::test]
+async fn inverted_byte_interval_is_rejected_before_any_request() {
+    let (url, _server) = serve_once(
+        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await;
+
+    let client = HttpClient::new().expect("client must build");
+    let request = RequestContext::new(url, Vec::new());
+
+    assert!(matches!(
+        client.open_byte_range(&request, 9, 5).await,
+        Err(HttpError::InvalidRequest)
+    ));
+}

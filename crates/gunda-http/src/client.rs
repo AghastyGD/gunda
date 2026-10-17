@@ -47,6 +47,18 @@ impl HttpInspection {
             strong_etag: Some(strong_etag),
         }
     }
+
+    /// Describes a staging file written by another engine.
+    ///
+    /// There is no remote validator for such a file, so the strong entity tag is
+    /// absent and resumption against the origin is unavailable by construction.
+    pub(crate) fn staged(total_bytes: u64, content_type: Option<String>) -> Self {
+        Self {
+            content_length: Some(total_bytes),
+            content_type,
+            strong_etag: None,
+        }
+    }
 }
 
 /// Reusable HTTP client with explicit request policy.
@@ -196,15 +208,7 @@ impl HttpClient {
             return Err(HttpError::InvalidMetadata);
         }
 
-        if metadata.content_type.as_deref().is_some_and(|value| {
-            value.split(';').next().is_some_and(|media_type| {
-                media_type
-                    .trim()
-                    .eq_ignore_ascii_case("multipart/byteranges")
-            })
-        }) {
-            return Err(HttpError::InvalidMetadata);
-        }
+        ensure_single_interval(&metadata)?;
 
         if response_headers.contains_key(ETAG) && metadata.strong_etag.as_ref() != Some(validator) {
             return Err(HttpError::InvalidMetadata);
@@ -215,6 +219,89 @@ impl HttpClient {
 
         Ok(HttpRangeBody::new(HttpBody::new(response, metadata), range))
     }
+
+    /// Opens an explicit byte interval of a resource.
+    ///
+    /// Unlike [`Self::open_range`], which resumes from an offset to the end of
+    /// a representation and requires a strong validator, this requests exactly
+    /// `first..=last` and needs no `If-Range`: the interval comes from the
+    /// resource's own manifest, so absolute positions are meaningful, and the
+    /// response is rejected unless the server returns precisely that interval.
+    ///
+    /// A server that ignores `Range` answers `200 OK` with the whole resource.
+    /// Accepting that would append an entire file where one segment was asked
+    /// for, so it is reported as an unexpected status instead.
+    pub async fn open_byte_range(
+        &self,
+        request: &RequestContext,
+        first: u64,
+        last: u64,
+    ) -> Result<HttpRangeBody, HttpError> {
+        validate_url(request)?;
+
+        if last < first {
+            return Err(HttpError::InvalidRequest);
+        }
+
+        let mut headers = request_headers(request)?;
+
+        let range_value = HeaderValue::from_str(&format!("bytes={first}-{last}"))
+            .map_err(|_| HttpError::InvalidRequest)?;
+
+        headers.insert(RANGE, range_value);
+
+        let response = self.send_redirected(request, Method::GET, headers).await?;
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(HttpError::UnexpectedStatus(response.status().as_u16()));
+        }
+
+        let response_headers = response.headers();
+
+        let range = single_header(response_headers, CONTENT_RANGE)?
+            .ok_or(HttpError::InvalidMetadata)
+            .and_then(ContentRange::parse)?;
+
+        if range.start() != first || range.end() != last {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        let mut metadata = inspect_headers(response_headers)?;
+
+        if metadata
+            .content_length
+            .is_some_and(|length| length != range.body_length())
+        {
+            return Err(HttpError::InvalidMetadata);
+        }
+
+        ensure_single_interval(&metadata)?;
+
+        // Content-Range also establishes the expected length for chunked bodies.
+        metadata.content_length = Some(range.body_length());
+
+        Ok(HttpRangeBody::new(HttpBody::new(response, metadata), range))
+    }
+}
+
+/// Rejects metadata that cannot describe one byte interval.
+///
+/// A `multipart/byteranges` body carries several intervals at once;
+/// concatenating it as though it were a single interval corrupts the output.
+fn ensure_single_interval(metadata: &HttpInspection) -> Result<(), HttpError> {
+    let multipart = metadata.content_type.as_deref().is_some_and(|value| {
+        value.split(';').next().is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("multipart/byteranges")
+        })
+    });
+
+    if multipart {
+        return Err(HttpError::InvalidMetadata);
+    }
+
+    Ok(())
 }
 
 fn validate_redirect(current: &url::Url, next: &url::Url) -> Result<(), HttpError> {

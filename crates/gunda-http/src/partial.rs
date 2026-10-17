@@ -113,6 +113,60 @@ impl PartialDownload {
     pub(crate) async fn path_matches_open_file(&self) -> io::Result<bool> {
         path_matches_identity(&self.path, &self.identity).await
     }
+
+    /// Adopts a staging file that another engine wrote.
+    ///
+    /// Protocol engines stage their own output, but publication must still go
+    /// through the single validated filename and conflict-handling path in
+    /// `finalize_download`, which only accepts a `PartialDownload`. Adoption
+    /// verifies that the file is a regular file of exactly `written_bytes`
+    /// length and records its identity, so a file swapped underneath the caller
+    /// is rejected at publication time.
+    ///
+    /// The path is derived from the download identifier, never from remote
+    /// input, and an existing file is never replaced.
+    pub async fn adopt(
+        id: DownloadId,
+        directory: &Path,
+        written_bytes: u64,
+        content_type: Option<String>,
+    ) -> Result<Self, PartialDownloadError> {
+        let path = partial_path(directory, id);
+
+        let file = File::open(&path)
+            .await
+            .map_err(|error| PartialDownloadError::File {
+                operation: FileOperation::Open,
+                kind: error.kind(),
+            })?;
+
+        let metadata = file
+            .metadata()
+            .await
+            .map_err(|error| PartialDownloadError::File {
+                operation: FileOperation::Open,
+                kind: error.kind(),
+            })?;
+
+        if !metadata.is_file() || metadata.len() != written_bytes {
+            return Err(PartialDownloadError::InvalidPartial);
+        }
+
+        let identity = file_identity(&file)
+            .await
+            .map_err(|error| PartialDownloadError::File {
+                operation: FileOperation::Open,
+                kind: error.kind(),
+            })?;
+
+        Ok(Self {
+            id,
+            path,
+            written_bytes,
+            metadata: HttpInspection::staged(written_bytes, content_type),
+            identity: Box::new(identity),
+        })
+    }
 }
 
 /// Computes the initiual staging path using only a local download identifier.
