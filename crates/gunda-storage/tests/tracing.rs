@@ -195,7 +195,7 @@ async fn successful_operations_emit_context_without_request_data() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rejected_requests_log_categories_without_credentials_or_browser_context() {
+async fn rejected_requests_log_categories_and_accepted_captures_log_no_page_context() {
     let output = capture_logs(async {
         let repository = SqliteDownloadRepository::open_in_memory()
             .await
@@ -210,19 +210,19 @@ async fn rejected_requests_log_categories_without_credentials_or_browser_context
             page_title: Some("private-title-marker".to_owned()),
         };
 
-        for input in [
-            request(DownloadOrigin::Desktop, true),
-            request(browser, false),
-        ] {
-            let error = match manager.create(input).await {
-                Ok(_) => panic!("request must be rejected"),
-                Err(error) => error,
-            };
+        let error = match manager.create(request(DownloadOrigin::Desktop, true)).await {
+            Ok(_) => panic!("a request with sensitive headers must be rejected"),
+            Err(error) => error,
+        };
 
-            assert_eq!(error.kind(), RepositoryErrorKind::SensitiveDataUnsupported);
-        }
+        assert_eq!(error.kind(), RepositoryErrorKind::SensitiveDataUnsupported);
 
-        assert!(manager.is_empty());
+        manager
+            .create(request(browser, false))
+            .await
+            .expect("a capture must be accepted");
+
+        assert_eq!(manager.len(), 1);
         manager.into_repository().close().await;
     })
     .await;
@@ -232,8 +232,11 @@ async fn rejected_requests_log_categories_without_credentials_or_browser_context
     assert!(output.contains("manager operation failed"));
     assert!(output.contains("repository operation failed"));
 
-    assert!(!output.contains("download registered"));
-    assert!(!output.contains("download committed"));
+    // The capture is accepted, and even so its page never reaches a log.
+    assert!(output.contains("download registered"));
+    assert!(output.contains("download committed"));
+    assert!(!output.contains("private-page-marker"));
+    assert!(!output.contains("private-title-marker"));
 
     assert_no_private_data(&output);
 }

@@ -722,13 +722,11 @@ fn ensure_persistable(download: &NewDownload) -> Result<(), RepositoryError> {
         ));
     }
 
-    if matches!(download.origin(), DownloadOrigin::Browser { .. }) {
-        return Err(RepositoryError::new(
-            RepositoryErrorKind::SensitiveDataUnsupported,
-            "browser-origin downloads cannot be persisted yet",
-        ));
-    }
-
+    // A browser-origin download used to be refused here, on the grounds that it
+    // implies the browser's session. It does not: the capture channel carries a
+    // URL, a content type, and a page title, and never a cookie or a request
+    // header. A capture is therefore exactly as sensitive as any other job, and
+    // the page it came from is what makes it useful to keep.
     Ok(())
 }
 
@@ -1103,21 +1101,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_origin_is_rejected_until_secure_storage_exists() {
+    async fn browser_origin_is_persisted_with_the_page_it_came_from() {
         let repository = SqliteDownloadRepository::open_in_memory()
             .await
             .expect("repository must open");
 
-        let result = repository
+        let created = repository
             .create(browser_download(), OffsetDateTime::UNIX_EPOCH)
-            .await;
+            .await
+            .expect("a capture must be persisted");
 
-        let error = match result {
-            Ok(_) => panic!("browser origin must be rejected"),
-            Err(error) => error,
+        let stored = repository
+            .find_by_id(created.id())
+            .await
+            .expect("download query must succeed")
+            .expect("the capture must exist");
+
+        let DownloadOrigin::Browser {
+            page_url,
+            page_title,
+        } = stored.origin()
+        else {
+            panic!("a capture keeps its browser origin");
         };
 
-        assert_eq!(error.kind(), RepositoryErrorKind::SensitiveDataUnsupported);
+        assert_eq!(page_url.as_str(), "https://example.com/watch");
+        assert_eq!(page_title.as_deref(), Some("Example video"));
     }
 
     #[tokio::test]
