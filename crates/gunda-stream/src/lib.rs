@@ -8,6 +8,8 @@
 
 mod container;
 mod error;
+mod executor;
+mod presentation;
 mod ts;
 mod xml;
 
@@ -19,10 +21,12 @@ pub mod plan;
 pub use container::{Container, SNIFF_BYTES, detect, sniff};
 pub use dash::TrackKind;
 pub use error::{ManifestError, UnsupportedFeature};
+pub use executor::{StreamExecutor, StreamPreparedTransfer, StreamStagedTransfer, output_filename};
 pub use mux::{MuxError, mux_mp4};
 pub use plan::{
     HlsOutcome, StreamKind, StreamResource, TrackPlan, plan_dash, plan_hls, substitute_template,
 };
+pub use presentation::{Presentation, PresentationTrack, TrackSize, inspect};
 
 /// Maximum number of segments accepted from one manifest.
 ///
