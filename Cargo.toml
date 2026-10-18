@@ -3,6 +3,7 @@ members = [
     "crates/gunda-core",
     "crates/gunda-storage",
     "crates/gunda-http",
+    "crates/gunda-stream",
     "apps/desktop",
 ]
 resolver = "3"

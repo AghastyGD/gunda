@@ -1717,6 +1717,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gunda-stream"
+version = "0.1.0"
+dependencies = [
+ "gunda-core",
+ "gunda-http",
+ "tempfile",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

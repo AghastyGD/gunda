@@ -1,0 +1,17 @@
+[package]
+name = "gunda-stream"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+gunda-core = { path = "../gunda-core" }
+gunda-http = { path = "../gunda-http" }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
