@@ -140,7 +140,7 @@ pub struct HttpPreparedTransfer {
 enum HttpPreparedBody {
     Fresh(HttpBody),
     Resumed {
-        body: ResumeBody,
+        body: Box<ResumeBody>,
         state: HttpResumeState,
         partial: ResumePartial,
     },
@@ -289,7 +289,7 @@ impl DownloadExecutor for HttpExecutor {
 
         Ok(HttpPreparedTransfer {
             body: HttpPreparedBody::Resumed {
-                body,
+                body: Box::new(body),
                 state: resume_state.clone(),
                 partial,
             },
@@ -367,7 +367,7 @@ impl PreparedTransfer for HttpPreparedTransfer {
 
                 resume_body_to_partial(
                     ResumeTransfer {
-                        body,
+                        body: *body,
                         metadata,
                         state,
                         partial,

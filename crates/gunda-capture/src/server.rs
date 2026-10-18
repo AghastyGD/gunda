@@ -89,13 +89,11 @@ impl CatalogView {
         &self.candidates
     }
 
-    /// How many candidates are held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.candidates.len()
     }
 
-    /// Whether there are no candidates.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()

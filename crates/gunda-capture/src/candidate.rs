@@ -101,31 +101,26 @@ impl Candidate {
         self.id
     }
 
-    /// The media URL to fetch.
     #[must_use]
     pub const fn url(&self) -> &Url {
         &self.url
     }
 
-    /// The resource category the report was classified as.
     #[must_use]
     pub const fn kind(&self) -> ResourceKind {
         self.kind
     }
 
-    /// The response content type, when the extension saw one.
     #[must_use]
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
 
-    /// The page the resource was found on.
     #[must_use]
     pub const fn page_url(&self) -> &Url {
         &self.page_url
     }
 
-    /// The page title, when the extension had one.
     #[must_use]
     pub fn page_title(&self) -> Option<&str> {
         self.page_title.as_deref()
@@ -149,19 +144,16 @@ impl Candidate {
         }
     }
 
-    /// When the resource was first reported.
     #[must_use]
     pub const fn first_seen(&self) -> Instant {
         self.first_seen
     }
 
-    /// When the resource was last reported.
     #[must_use]
     pub const fn last_seen(&self) -> Instant {
         self.last_seen
     }
 
-    /// How many times the resource was reported.
     #[must_use]
     pub const fn seen(&self) -> u32 {
         self.seen
@@ -171,9 +163,7 @@ impl Candidate {
 /// The result of recording a report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recorded {
-    /// The candidate the report belongs to.
     pub id: CandidateId,
-    /// Whether the candidate was already known.
     pub duplicate: bool,
 }
 
@@ -255,25 +245,21 @@ impl Catalog {
         }
     }
 
-    /// The candidates, newest first.
     #[must_use]
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
     }
 
-    /// How many candidates are held.
     #[must_use]
     pub fn len(&self) -> usize {
         self.candidates.len()
     }
 
-    /// Whether the catalog is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
     }
 
-    /// The largest number of candidates that will be held.
     #[must_use]
     pub const fn capacity(&self) -> usize {
         self.capacity
@@ -285,7 +271,6 @@ impl Catalog {
         self.candidates.iter().find(|candidate| candidate.id == id)
     }
 
-    /// Forgets a candidate.
     pub fn remove(&mut self, id: CandidateId) -> bool {
         let before = self.candidates.len();
         self.candidates.retain(|candidate| candidate.id != id);
@@ -293,7 +278,6 @@ impl Catalog {
         self.candidates.len() != before
     }
 
-    /// Forgets every candidate.
     pub fn clear(&mut self) {
         self.candidates.clear();
     }

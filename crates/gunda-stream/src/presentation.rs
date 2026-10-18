@@ -37,7 +37,6 @@ impl Presentation {
         &self.tracks
     }
 
-    /// Whether the presentation carries nothing the user can choose.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tracks.is_empty()
