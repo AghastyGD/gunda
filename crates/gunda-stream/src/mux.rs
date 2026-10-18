@@ -1999,8 +1999,10 @@ mod tests {
     fn values(body: &[u8]) -> Vec<u32> {
         body.get(8..)
             .unwrap_or_default()
-            .chunks_exact(4)
-            .map(|value| u32::from_be_bytes(value.try_into().expect("four bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| u32::from_be_bytes(*value))
             .collect()
     }
 
@@ -2013,7 +2015,9 @@ mod tests {
     /// The runs of a table that holds (count, value) pairs.
     fn runs(body: &[u8]) -> Vec<(u32, u32)> {
         values(body)
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| (pair[0], pair[1]))
             .collect()
     }
