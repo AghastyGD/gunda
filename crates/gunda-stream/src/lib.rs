@@ -8,15 +8,18 @@
 
 mod container;
 mod error;
+mod ts;
 mod xml;
 
 pub mod dash;
 pub mod hls;
+pub mod mux;
 pub mod plan;
 
 pub use container::{Container, SNIFF_BYTES, detect, sniff};
 pub use dash::TrackKind;
 pub use error::{ManifestError, UnsupportedFeature};
+pub use mux::{MuxError, mux_mp4};
 pub use plan::{
     HlsOutcome, StreamKind, StreamResource, TrackPlan, plan_dash, plan_hls, substitute_template,
 };
