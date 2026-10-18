@@ -1,3 +1,4 @@
+mod capture;
 mod dialogs;
 mod downloads;
 mod theme;
@@ -28,6 +29,7 @@ pub struct Desktop {
     filter: Filter,
     search: String,
     dark: bool,
+    capture_open: bool,
     add_open: bool,
     url: String,
     destination: Option<PathBuf>,
@@ -53,6 +55,7 @@ impl Desktop {
             filter: Filter::All,
             search: String::new(),
             dark,
+            capture_open: false,
             add_open: false,
             url: String::new(),
             destination: directories::UserDirs::new()
@@ -168,6 +171,8 @@ impl Desktop {
                 }
             });
             ui.menu_button("View", |ui| {
+                ui.checkbox(&mut self.capture_open, "Browser capture panel");
+                ui.separator();
                 let previous = self.dark;
                 ui.selectable_value(&mut self.dark, false, "Light mode");
                 ui.selectable_value(&mut self.dark, true, "Dark mode");
@@ -385,6 +390,23 @@ impl Desktop {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(RichText::new("HTTP / HTTPS").small().weak());
+                        ui.separator();
+                        if let Some(status) = &self.snapshot.capture {
+                            let found = self.snapshot.captures.len();
+                            let text = if found == 0 {
+                                "Browser capture: ready".to_owned()
+                            } else {
+                                format!("Browser capture: {found} found")
+                            };
+                            ui.label(RichText::new(text).small().weak())
+                                .on_hover_text(format!(
+                                    "Listening at {}. Open View > Browser capture panel.",
+                                    status.endpoint
+                                ));
+                        } else if self.snapshot.capture_problem.is_some() {
+                            ui.label(RichText::new("Browser capture: unavailable").small().weak())
+                                .on_hover_text(self.snapshot.capture_problem.unwrap_or_default());
+                        }
                     });
                 });
             });
@@ -399,6 +421,21 @@ impl Desktop {
                     .inner_margin(8),
             )
             .show(ui, |ui| self.sidebar(ui));
+        if self.capture_open {
+            egui::Panel::right("capture")
+                .resizable(true)
+                .default_size(280.0)
+                .size_range(220.0..=460.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(colors.surface)
+                        .stroke(border)
+                        .inner_margin(8),
+                )
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| self.capture(ui));
+                });
+        }
         egui::Panel::bottom("inspector")
             .resizable(true)
             .default_size(160.0)

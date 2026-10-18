@@ -6,9 +6,11 @@ license.workspace = true
 publish = false
 
 [dependencies]
+gunda-capture = { path = "../../crates/gunda-capture" }
 gunda-core = { path = "../../crates/gunda-core" }
 gunda-http = { path = "../../crates/gunda-http" }
 gunda-storage = { path = "../../crates/gunda-storage" }
+gunda-stream = { path = "../../crates/gunda-stream" }
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11", "persistence", "accesskit"] }
 egui_extras = { version = "0.36.2", default-features = false }
 rfd = "0.17.2"

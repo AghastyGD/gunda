@@ -10,6 +10,7 @@ fn desktop(snapshot: Snapshot) -> Desktop {
         filter: Filter::All,
         search: String::new(),
         dark: true,
+        capture_open: false,
         add_open: false,
         url: String::new(),
         destination: None,
@@ -469,4 +470,157 @@ fn selected_rows_and_progress_keep_readable_text_in_both_themes() {
             }), "missing readable text: {text}, dark={dark}");
         }
     }
+}
+
+#[test]
+fn capture_panel_shows_the_pairing_and_the_captured_resources() {
+    use std::sync::Arc;
+
+    use crate::backend::{CaptureStatus, CaptureView};
+
+    let ctx = egui::Context::default();
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        capture: Some(Arc::new(CaptureStatus {
+            endpoint: "ws://127.0.0.1:48123/capture".into(),
+            token: "0123456789abcdef".repeat(4),
+        })),
+        captures: vec![CaptureView {
+            id: 7,
+            url: "https://cdn.example.com/movie.mp4".into(),
+            kind: "File",
+            content_type: Some("video/mp4".into()),
+            page_title: Some("A movie page".into()),
+            seen: 2,
+            segmented: false,
+        }],
+        ..Default::default()
+    });
+    desktop.update();
+
+    let labels = capture_labels(&ctx, &mut desktop);
+    let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
+
+    assert!(has("BROWSER CAPTURE"), "missing panel heading: {labels:?}");
+    assert!(has("Endpoint"), "missing endpoint label: {labels:?}");
+    assert!(has("Token"), "missing token label: {labels:?}");
+    assert!(has("Copy endpoint"), "missing endpoint copy: {labels:?}");
+    assert!(has("video/mp4"), "missing content type: {labels:?}");
+    assert!(has("A movie page"), "missing page title: {labels:?}");
+    assert!(
+        has("Download") && has("Dismiss"),
+        "missing row actions: {labels:?}"
+    );
+}
+
+#[test]
+fn capture_panel_offers_the_qualities_of_a_presentation() {
+    use std::sync::Arc;
+
+    use url::Url;
+
+    use crate::backend::{CaptureStatus, CaptureTracks, CaptureView, TrackView};
+
+    let ctx = egui::Context::default();
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        capture: Some(Arc::new(CaptureStatus {
+            endpoint: "ws://127.0.0.1:48123/capture".into(),
+            token: "0123456789abcdef".repeat(4),
+        })),
+        captures: vec![CaptureView {
+            id: 3,
+            url: "https://cdn.example.com/master.m3u8".into(),
+            kind: "HLS",
+            content_type: Some("application/vnd.apple.mpegurl".into()),
+            page_title: Some("A film".into()),
+            seen: 1,
+            segmented: true,
+        }],
+        capture_tracks: Some(CaptureTracks {
+            id: 3,
+            tracks: vec![
+                TrackView {
+                    label: "1920x1080 (5.0 Mbps)".into(),
+                    details: "video · 1.2 GiB".into(),
+                    url: Url::parse("https://cdn.example.com/1080/index.m3u8")
+                        .expect("the URL is valid"),
+                    filename: Some("master.mp4".into()),
+                },
+                TrackView {
+                    label: "English (en)".into(),
+                    details: "audio · 128.0 MiB".into(),
+                    url: Url::parse("https://cdn.example.com/audio/index.m3u8")
+                        .expect("the URL is valid"),
+                    filename: Some("master.mp4".into()),
+                },
+            ],
+            problem: None,
+        }),
+        ..Default::default()
+    });
+    desktop.update();
+
+    let labels = capture_labels(&ctx, &mut desktop);
+    let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
+
+    assert!(has("Qualities"), "missing quality action: {labels:?}");
+    assert!(
+        has("1920x1080 (5.0 Mbps)"),
+        "missing video quality: {labels:?}"
+    );
+    assert!(has("video · 1.2 GiB"), "missing video details: {labels:?}");
+    assert!(has("English (en)"), "missing audio track: {labels:?}");
+    assert!(
+        has("audio · 128.0 MiB"),
+        "missing audio details: {labels:?}"
+    );
+}
+
+#[test]
+fn capture_panel_reports_a_channel_that_did_not_start() {
+    let ctx = egui::Context::default();
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        capture_problem: Some("The browser capture channel could not be started."),
+        ..Default::default()
+    });
+    desktop.update();
+
+    let labels = capture_labels(&ctx, &mut desktop);
+
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.contains("could not be started")),
+        "missing problem message: {labels:?}"
+    );
+    assert!(
+        !labels.iter().any(|label| label.contains("Copy token")),
+        "pairing offered without a channel: {labels:?}"
+    );
+}
+
+/// Renders the capture panel alone and returns every text it drew.
+fn capture_labels(ctx: &egui::Context, desktop: &mut Desktop) -> Vec<String> {
+    let mut output = ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(320.0, 600.0),
+            )),
+            ..Default::default()
+        },
+        |ui| desktop.capture(ui),
+    );
+    output.textures_delta.clear();
+
+    output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+            _ => None,
+        })
+        .collect()
 }

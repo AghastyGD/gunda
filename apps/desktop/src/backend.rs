@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeMap,
-    path::PathBuf,
+    net::{Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -9,20 +10,28 @@ use std::{
 };
 
 use eframe::egui;
+use gunda_capture::{
+    Candidate, CandidateId, CaptureError, CaptureHandle, CaptureServer, load_or_create_token,
+    token_path,
+};
 use gunda_core::{
-    application::{DownloadCancellation, DownloadManager, DownloadManagerError, ExecutionOutput},
+    application::{
+        DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError,
+        ExecutionOutput,
+    },
     download::{
         DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, FileConflictPolicy,
-        NewDownload, RequestContext,
+        NewDownload, RequestContext, ResourceDescriptor, ResourceKind,
     },
 };
 use gunda_http::{HttpClient, HttpExecutor};
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
+use gunda_stream::{PresentationTrack, StreamExecutor, TrackKind, TrackSize};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use url::Url;
 
-use crate::view::DownloadView;
+use crate::view::{DownloadView, bytes};
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -31,11 +40,70 @@ pub struct Snapshot {
     pub active: Option<DownloadId>,
     pub pause_supported: bool,
     pub jobs: Vec<DownloadView>,
+    pub captures: Vec<CaptureView>,
+    pub capture_tracks: Option<CaptureTracks>,
+    pub capture: Option<Arc<CaptureStatus>>,
+    pub capture_problem: Option<&'static str>,
     pub notice: Option<String>,
 }
 
+/// A media resource the browser reported.
+#[derive(Clone)]
+pub struct CaptureView {
+    pub id: CandidateId,
+    pub url: String,
+    pub kind: &'static str,
+    pub content_type: Option<String>,
+    pub page_title: Option<String>,
+    pub seen: u32,
+    /// Whether the resource is a presentation whose tracks can be listed.
+    pub segmented: bool,
+}
+
+/// The tracks one captured presentation offers, once they have been read.
+#[derive(Clone)]
+pub struct CaptureTracks {
+    pub id: CandidateId,
+    pub tracks: Vec<TrackView>,
+    pub problem: Option<&'static str>,
+}
+
+/// One quality or track the user can choose.
+#[derive(Clone)]
+pub struct TrackView {
+    pub label: String,
+    pub details: String,
+    pub url: Url,
+    pub filename: Option<String>,
+}
+
+/// A chosen track, carried from the panel to the backend.
+#[derive(Clone)]
+pub struct TrackChoice {
+    pub url: Url,
+    pub filename: Option<String>,
+}
+
+/// What the user needs to pair the browser with this application.
+#[derive(Clone)]
+pub struct CaptureStatus {
+    pub endpoint: String,
+    pub token: String,
+}
+
 pub enum Command {
-    Start { url: Url, directory: PathBuf },
+    Start {
+        url: Url,
+        directory: PathBuf,
+    },
+    Capture {
+        id: CandidateId,
+        directory: PathBuf,
+        track: Option<TrackChoice>,
+    },
+    Inspect(CandidateId),
+    DismissCapture(CandidateId),
+    ClearCaptures,
     Resume(DownloadId),
     Retry(DownloadId),
     Restart(DownloadId),
@@ -158,16 +226,30 @@ fn publish(sender: &watch::Sender<Snapshot>, ctx: &egui::Context, snapshot: Snap
     ctx.request_repaint();
 }
 
-async fn initialize(
-    directory: PathBuf,
-) -> Result<
-    (
-        RuntimeLease,
-        DownloadManager<SqliteDownloadRepository>,
-        HttpExecutor,
-    ),
-    &'static str,
-> {
+/// The port the capture listener prefers, so a pairing survives a restart.
+const CAPTURE_PORT: u16 = 48_123;
+
+/// Everything the command loop needs, once the application can run.
+struct Initialized {
+    _lease: RuntimeLease,
+    manager: DownloadManager<SqliteDownloadRepository>,
+    engines: Engines,
+    capture: Option<CaptureHandle>,
+    capture_problem: Option<&'static str>,
+}
+
+/// The engines a download can be executed with.
+///
+/// A job is executed by exactly one of them: the plain HTTP engine fetches one
+/// representation, and the segmented engine reads a manifest and then its
+/// segments. Which one applies is a property of the resource, not of the user,
+/// so it is decided once, from the URL and from what capture already knew.
+struct Engines {
+    http: HttpExecutor,
+    stream: StreamExecutor,
+}
+
+async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
     std::fs::create_dir_all(&directory).map_err(|_| "Could not create Gunda's data folder.")?;
     let lease = RuntimeLease::acquire(directory.join("gunda.runtime.lock"))
         .map_err(|_| "Could not open Gunda's data folder. Close any other Gunda window and check folder permissions.")?;
@@ -179,11 +261,64 @@ async fn initialize(
         .await
         .map_err(|_| "Could not load saved downloads.")?;
     let client = HttpClient::new().map_err(|_| "Could not start the download service.")?;
-    Ok((
-        lease,
+    let stream_client =
+        HttpClient::new().map_err(|_| "Could not start the segmented download service.")?;
+    let (capture, capture_problem) = start_capture(&directory).await;
+
+    Ok(Initialized {
+        _lease: lease,
         manager,
-        HttpExecutor::with_resume_store(client, store),
-    ))
+        engines: Engines {
+            http: HttpExecutor::with_resume_store(client, store),
+            stream: StreamExecutor::new(stream_client),
+        },
+        capture,
+        capture_problem,
+    })
+}
+
+/// Starts the capture listener, preferring a port the browser already knows.
+///
+/// A failure here is not fatal: downloads and the rest of the application work
+/// without a browser, and the interface says what is missing.
+async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<&'static str>) {
+    let token = match load_or_create_token(&token_path(directory)) {
+        Ok(token) => token,
+        Err(_) => {
+            return (
+                None,
+                Some(
+                    "The browser capture channel could not be set up. Check the application data folder.",
+                ),
+            );
+        }
+    };
+
+    let preferred = CaptureServer::bind_to(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
+        token.clone(),
+    )
+    .await;
+
+    let bound = match preferred {
+        Ok(bound) => Ok(bound),
+        // The preferred port is taken. Any free loopback port will do, and the
+        // endpoint shown to the user is the one that was actually bound, so the
+        // only cost is pairing again.
+        Err(_) => CaptureServer::bind(token).await,
+    };
+
+    match bound {
+        Ok((server, handle)) => {
+            tokio::spawn(server.run());
+
+            (Some(handle), None)
+        }
+        Err(_) => (
+            None,
+            Some("The browser capture channel could not be started."),
+        ),
+    }
 }
 
 async fn run(
@@ -194,7 +329,13 @@ async fn run(
     closing: Arc<AtomicBool>,
     ctx: egui::Context,
 ) {
-    let (_lease, mut manager, executor) = match initialize(directory).await {
+    let Initialized {
+        _lease,
+        mut manager,
+        engines,
+        capture,
+        capture_problem,
+    } = match initialize(directory).await {
         Ok(initialized) => initialized,
         Err(message) => {
             publish(
@@ -211,18 +352,51 @@ async fn run(
     let mut pending_outputs = BTreeMap::new();
     let mut snapshot = Snapshot {
         ready: true,
-        jobs: idle_views(&manager, &executor, &pending_outputs).await,
+        jobs: idle_views(&manager, &engines.http, &pending_outputs).await,
+        captures: capture_views(capture.as_ref()),
+        capture: capture.as_ref().map(capture_status),
+        capture_problem,
         ..Default::default()
     };
     publish(&sender, &ctx, snapshot.clone());
-    while let Some(command) = commands.recv().await {
+
+    // Watching the catalog is separate from holding it: `changed` needs the
+    // handle mutably, while the loop body reads the candidates as they stand.
+    let mut watcher = capture.clone();
+
+    loop {
+        enum Wake {
+            Command(Option<Command>),
+            Catalog { stopped: bool },
+        }
+
+        let wake = tokio::select! {
+            command = commands.recv() => Wake::Command(command),
+            result = catalog_changed(&mut watcher) => Wake::Catalog { stopped: result.is_err() },
+        };
+
+        let command = match wake {
+            Wake::Catalog { stopped } => {
+                if stopped {
+                    watcher = None;
+                }
+                snapshot.captures = capture_views(capture.as_ref());
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            Wake::Command(command) => command,
+        };
+
+        let Some(command) = command else {
+            break;
+        };
         if closing.load(Ordering::Acquire) {
             break;
         }
         snapshot.busy = true;
         snapshot.notice = None;
         publish(&sender, &ctx, snapshot.clone());
-        let id = match command {
+        let (id, engine) = match command {
             Command::SaveStatus(id) => {
                 if let Some(output) = pending_outputs.get(&id) {
                     if manager.confirm_published_output(id, output).await.is_ok() {
@@ -233,51 +407,135 @@ async fn run(
                 } else {
                     snapshot.notice = Some("There is no saved file status to update.".into());
                 }
-                snapshot.jobs = idle_views(&manager, &executor, &pending_outputs).await;
+                snapshot.jobs = idle_views(&manager, &engines.http, &pending_outputs).await;
                 snapshot.busy = false;
                 publish(&sender, &ctx, snapshot.clone());
                 continue;
             }
-            Command::Start { url, directory } => manager
-                .create(NewDownload::new(
-                    RequestContext::new(url, Vec::new()),
-                    DownloadDestination::new(directory, None, FileConflictPolicy::Rename),
-                    DownloadOrigin::Desktop,
-                ))
-                .await
-                .map(|event| event.download_id())
-                .map_err(|_| "Could not save the new download."),
+            Command::ClearCaptures => {
+                if let Some(handle) = &capture
+                    && handle.clear().await.is_err()
+                {
+                    snapshot.notice = Some("The capture list could not be cleared.".into());
+                }
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            Command::DismissCapture(id) => {
+                if let Some(handle) = &capture
+                    && handle.remove(id).await.is_err()
+                {
+                    snapshot.notice = Some("The capture could not be dismissed.".into());
+                }
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            Command::Start { url, directory } => (
+                manager
+                    .create(NewDownload::new(
+                        RequestContext::new(url.clone(), Vec::new()),
+                        DownloadDestination::new(directory, None, FileConflictPolicy::Rename),
+                        DownloadOrigin::Desktop,
+                    ))
+                    .await
+                    .map(|event| event.download_id())
+                    .map_err(|_| "Could not save the new download."),
+                engine_for(&url, None),
+            ),
+            Command::Inspect(id) => {
+                snapshot.capture_tracks =
+                    Some(inspect_capture(&engines.stream, capture.as_ref(), id).await);
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            Command::Capture {
+                id,
+                directory,
+                track,
+            } => match captured(capture.as_ref(), id) {
+                Some(Ok(captured)) => {
+                    let engine = captured.engine;
+
+                    // A chosen track is one playlist of the same presentation,
+                    // so the same engine executes it, and it is still named
+                    // after the presentation rather than after its playlist.
+                    let (url, filename) = match track {
+                        Some(track) => (track.url, track.filename),
+                        None => (captured.url, None),
+                    };
+
+                    snapshot.capture_tracks = None;
+
+                    (
+                        manager
+                            .create(NewDownload::new(
+                                RequestContext::new(url, Vec::new()),
+                                DownloadDestination::new(
+                                    directory,
+                                    filename,
+                                    FileConflictPolicy::Rename,
+                                ),
+                                captured.origin,
+                            ))
+                            .await
+                            .map(|event| event.download_id())
+                            .map_err(|_| "Could not save the new download."),
+                        engine,
+                    )
+                }
+                Some(Err(message)) => (Err(message), JobEngine::Http),
+                None => (
+                    Err("That capture is no longer in the list."),
+                    JobEngine::Http,
+                ),
+            },
             Command::Resume(id) => {
+                let engine = engine_of(&manager, id);
                 let available = match manager.job(id) {
-                    Some(job) => executor.can_resume(job).await,
+                    Some(job) => engines.http.can_resume(job).await,
                     None => Ok(false),
                 };
-                match available {
-                    Ok(true) => manager
-                        .resume(id)
-                        .await
-                        .map(|_| id)
-                        .map_err(|_| "This download cannot be resumed."),
-                    Ok(false) => Err(
-                        "Saved progress is unavailable. Use Restart to download again from zero.",
-                    ),
-                    Err(_) => Err(
-                        "Could not check saved progress. Check the application data folder and try again.",
-                    ),
-                }
+                (
+                    match available {
+                        Ok(true) => manager
+                            .resume(id)
+                            .await
+                            .map(|_| id)
+                            .map_err(|_| "This download cannot be resumed."),
+                        Ok(false) => Err(
+                            "Saved progress is unavailable. Use Restart to download again from zero.",
+                        ),
+                        Err(_) => Err(
+                            "Could not check saved progress. Check the application data folder and try again.",
+                        ),
+                    },
+                    engine,
+                )
             }
-            Command::Retry(id) => manager
-                .retry(id)
-                .await
-                .map(|_| id)
-                .map_err(|_| "This download cannot be retried."),
+            Command::Retry(id) => (
+                manager
+                    .retry(id)
+                    .await
+                    .map(|_| id)
+                    .map_err(|_| "This download cannot be retried."),
+                engine_of(&manager, id),
+            ),
             Command::Restart(id) => {
+                let engine = engine_of(&manager, id);
                 let directory = manager
                     .job(id)
                     .filter(|job| job.state().can_restart())
                     .map(|job| job.destination().directory().to_path_buf());
-                if let Some(directory) = directory {
-                    if executor.reset_for_restart(id, &directory).await.is_err() {
+                let restarted = if let Some(directory) = directory {
+                    if engines
+                        .http
+                        .reset_for_restart(id, &directory)
+                        .await
+                        .is_err()
+                    {
                         Err("The previous download data could not be cleared safely.")
                     } else {
                         manager
@@ -288,7 +546,8 @@ async fn run(
                     }
                 } else {
                     Err("This download cannot be restarted.")
-                }
+                };
+                (restarted, engine)
             }
         };
         if let Ok(id) = id {
@@ -306,56 +565,37 @@ async fn run(
                 update_job_view(&mut snapshot, job);
             }
             publish(&sender, &ctx, snapshot.clone());
-            let progress_control = cancellation.clone();
-            let mut attempts = 0;
-            let result = loop {
-                attempts += 1;
-                let result = manager
-                    .execute_controlled_with_updates(
-                        id,
-                        &executor,
-                        cancellation.clone(),
-                        |_, job| {
-                            snapshot.pause_supported = progress_control.pause_supported();
-                            update_job_view(&mut snapshot, job);
-                            publish(&sender, &ctx, snapshot.clone());
-                        },
-                    )
-                    .await;
+            let result = {
+                let mut publisher = Publisher {
+                    snapshot: &mut snapshot,
+                    sender: &sender,
+                    ctx: &ctx,
+                };
 
-                let can_retry = matches!(
-                    &result,
-                    Ok(report)
-                        if matches!(
-                            &report.event,
-                            gunda_core::application::DownloadEvent::Failed { failure, .. }
-                                if failure.is_retryable()
+                match engine {
+                    JobEngine::Http => {
+                        execute_job(
+                            &mut manager,
+                            &engines.http,
+                            id,
+                            cancellation.clone(),
+                            &mut publisher,
                         )
-                );
-                if !can_retry || attempts >= MAX_AUTOMATIC_ATTEMPTS {
-                    break result;
+                        .await
+                    }
+                    JobEngine::Stream => {
+                        execute_job(
+                            &mut manager,
+                            &engines.stream,
+                            id,
+                            cancellation.clone(),
+                            &mut publisher,
+                        )
+                        .await
+                    }
                 }
-
-                if let Err(error) = manager.retry(id).await {
-                    break Err(error);
-                }
-
-                let delay_seconds = 1_u64 << (attempts - 1);
-                if let Some(job) = manager.job(id) {
-                    update_job_view(&mut snapshot, job);
-                }
-                snapshot.notice = Some(format!(
-                    "Connection problem. Trying again in {delay_seconds} seconds…"
-                ));
-                publish(&sender, &ctx, snapshot.clone());
-
-                tokio::select! {
-                    biased;
-                    _ = cancellation.stopped() => {}
-                    _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
-                }
-                snapshot.notice = None;
             };
+
             if let Ok(mut slot) = active.lock() {
                 *slot = None;
             }
@@ -388,8 +628,301 @@ async fn run(
         snapshot.busy = false;
         snapshot.active = None;
         snapshot.pause_supported = false;
-        snapshot.jobs = idle_views(&manager, &executor, &pending_outputs).await;
+        snapshot.jobs = idle_views(&manager, &engines.http, &pending_outputs).await;
         publish(&sender, &ctx, snapshot.clone());
+    }
+}
+
+/// The parts of the command loop that publishing a snapshot needs.
+struct Publisher<'a> {
+    snapshot: &'a mut Snapshot,
+    sender: &'a watch::Sender<Snapshot>,
+    ctx: &'a egui::Context,
+}
+
+impl Publisher<'_> {
+    /// Publishes the snapshot and wakes the interface.
+    fn publish(&self) {
+        publish(self.sender, self.ctx, self.snapshot.clone());
+    }
+}
+
+/// Runs one job to a conclusion, retrying a failure that is worth retrying.
+///
+/// This is generic over the engine on purpose: the retry policy, the progress
+/// publication, and the pause handling are the same whether a job is one HTTP
+/// response or a manifest and a hundred segments.
+async fn execute_job<E: DownloadExecutor>(
+    manager: &mut DownloadManager<SqliteDownloadRepository>,
+    executor: &E,
+    id: DownloadId,
+    cancellation: DownloadCancellation,
+    publisher: &mut Publisher<'_>,
+) -> Result<gunda_core::application::ExecutionReport, DownloadManagerError> {
+    let progress_control = cancellation.clone();
+    let mut attempts = 0;
+
+    loop {
+        attempts += 1;
+
+        let result = manager
+            .execute_controlled_with_updates(id, executor, cancellation.clone(), |_, job| {
+                publisher.snapshot.pause_supported = progress_control.pause_supported();
+                update_job_view(publisher.snapshot, job);
+                publisher.publish();
+            })
+            .await;
+
+        let can_retry = matches!(
+            &result,
+            Ok(report)
+                if matches!(
+                    &report.event,
+                    gunda_core::application::DownloadEvent::Failed { failure, .. }
+                        if failure.is_retryable()
+                )
+        );
+        if !can_retry || attempts >= MAX_AUTOMATIC_ATTEMPTS {
+            return result;
+        }
+
+        manager.retry(id).await?;
+
+        let delay_seconds = 1_u64 << (attempts - 1);
+        if let Some(job) = manager.job(id) {
+            update_job_view(publisher.snapshot, job);
+        }
+        publisher.snapshot.notice = Some(format!(
+            "Connection problem. Trying again in {delay_seconds} seconds…"
+        ));
+        publisher.publish();
+
+        tokio::select! {
+            biased;
+            _ = cancellation.stopped() => {}
+            _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
+        }
+
+        publisher.snapshot.notice = None;
+    }
+}
+
+/// The engine that can execute a download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobEngine {
+    /// One request, one file.
+    Http,
+    /// A manifest, then its segments.
+    Stream,
+}
+
+/// What a captured candidate becomes when the user downloads it.
+struct CapturedJob {
+    url: Url,
+    origin: DownloadOrigin,
+    engine: JobEngine,
+}
+
+/// Copies everything a job needs out of a captured candidate.
+///
+/// The copy is taken here because the catalog can evict a candidate while the
+/// command waits in the queue.
+fn captured(
+    capture: Option<&CaptureHandle>,
+    id: CandidateId,
+) -> Option<Result<CapturedJob, &'static str>> {
+    let handle = capture?;
+    let view = handle.view();
+    let candidate = view.get(id)?;
+
+    let engine = match capture_engine(candidate) {
+        Ok(engine) => engine,
+        Err(message) => return Some(Err(message)),
+    };
+
+    Some(Ok(CapturedJob {
+        url: candidate.url().clone(),
+        origin: candidate.origin(),
+        engine,
+    }))
+}
+
+/// Checks that a captured resource can be executed by the engine it needs.
+///
+/// The segmented engine finds the manifest it needs from the URL. A capture
+/// whose URL does not name its format is refused here rather than handed to the
+/// plain HTTP engine, which would quietly save a playlist as a file.
+fn capture_engine(candidate: &Candidate) -> Result<JobEngine, &'static str> {
+    match candidate.kind() {
+        ResourceKind::File => Ok(JobEngine::Http),
+        ResourceKind::Hls | ResourceKind::Dash => {
+            if looks_segmented(candidate.url()) {
+                Ok(JobEngine::Stream)
+            } else {
+                Err(
+                    "This capture is a segmented stream whose URL does not name its format, and the segmented engine cannot be pointed at it yet.",
+                )
+            }
+        }
+        ResourceKind::Unknown => Err("This capture is not something Gunda can download."),
+    }
+}
+
+/// Picks the engine from the recorded resource, or from the URL when unknown.
+fn engine_for(url: &Url, resource: Option<ResourceKind>) -> JobEngine {
+    match resource {
+        Some(ResourceKind::Hls | ResourceKind::Dash) => JobEngine::Stream,
+        Some(_) => JobEngine::Http,
+        None if looks_segmented(url) => JobEngine::Stream,
+        None => JobEngine::Http,
+    }
+}
+
+/// The engine a job already in the manager is executed with.
+fn engine_of(manager: &DownloadManager<SqliteDownloadRepository>, id: DownloadId) -> JobEngine {
+    manager
+        .job(id)
+        .map(|job| {
+            engine_for(
+                job.request().url(),
+                job.resource().map(ResourceDescriptor::kind),
+            )
+        })
+        .unwrap_or(JobEngine::Http)
+}
+
+/// Whether a URL names a segmented-stream manifest.
+fn looks_segmented(url: &Url) -> bool {
+    let path = url.path().to_ascii_lowercase();
+
+    path.ends_with(".m3u8") || path.ends_with(".mpd")
+}
+
+/// Waits until the capture catalog changes.
+///
+/// With no capture channel there is nothing to wait for, so the future never
+/// completes and its branch in the command loop stays quiet.
+async fn catalog_changed(capture: &mut Option<CaptureHandle>) -> Result<(), CaptureError> {
+    match capture {
+        Some(handle) => handle.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Describes the tracks a captured presentation offers.
+///
+/// A capture carries one URL, and a presentation reached that way usually
+/// carries several qualities and tracks. Reading them is a deliberate step
+/// because it costs requests, so it only happens when the user asks.
+async fn inspect_capture(
+    stream: &StreamExecutor,
+    capture: Option<&CaptureHandle>,
+    id: CandidateId,
+) -> CaptureTracks {
+    let unavailable = |problem| CaptureTracks {
+        id,
+        tracks: Vec::new(),
+        problem: Some(problem),
+    };
+
+    match captured(capture, id) {
+        Some(Ok(captured)) => {
+            let request = RequestContext::new(captured.url, Vec::new());
+
+            match stream.inspect(&request).await {
+                Ok(presentation) => CaptureTracks {
+                    id,
+                    tracks: presentation
+                        .tracks()
+                        .iter()
+                        .map(TrackView::from_track)
+                        .collect(),
+                    problem: None,
+                },
+                Err(_) => unavailable("The qualities of this presentation could not be read."),
+            }
+        }
+        Some(Err(message)) => unavailable(message),
+        None => unavailable("That capture is no longer in the list."),
+    }
+}
+
+impl TrackView {
+    fn from_track(track: &PresentationTrack) -> Self {
+        Self {
+            label: track.label().to_owned(),
+            details: format!("{} · {}", kind_name(track.kind()), size_hint(track.size())),
+            url: track.url().clone(),
+            filename: track.filename().map(str::to_owned),
+        }
+    }
+}
+
+/// A short name for what a track carries.
+fn kind_name(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Video => "video",
+        TrackKind::Audio => "audio",
+        TrackKind::Text => "text",
+        TrackKind::Unknown => "media",
+    }
+}
+
+/// What is known about a track's final size.
+///
+/// An estimate is marked as one: the total a download shows is measured, and
+/// the two must not be mistaken for each other.
+fn size_hint(size: TrackSize) -> String {
+    match size {
+        TrackSize::Exact(total) => bytes(total),
+        TrackSize::Estimated(total) => format!("~{}", bytes(total)),
+        TrackSize::Unknown => "size unknown".to_owned(),
+    }
+}
+
+/// Copies the catalog into the shape the interface renders.
+fn capture_views(capture: Option<&CaptureHandle>) -> Vec<CaptureView> {
+    let Some(handle) = capture else {
+        return Vec::new();
+    };
+
+    handle
+        .view()
+        .candidates()
+        .iter()
+        .map(CaptureView::from_candidate)
+        .collect()
+}
+
+impl CaptureView {
+    fn from_candidate(candidate: &Candidate) -> Self {
+        Self {
+            id: candidate.id(),
+            url: candidate.url().as_str().to_owned(),
+            kind: kind_label(candidate.kind()),
+            content_type: candidate.content_type().map(str::to_owned),
+            page_title: candidate.page_title().map(str::to_owned),
+            seen: candidate.seen(),
+            segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
+        }
+    }
+}
+
+/// How to pair the browser with this application.
+fn capture_status(handle: &CaptureHandle) -> Arc<CaptureStatus> {
+    Arc::new(CaptureStatus {
+        endpoint: handle.endpoint(),
+        token: handle.token().as_str().to_owned(),
+    })
+}
+
+/// A short label for a captured resource.
+fn kind_label(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Hls => "HLS",
+        ResourceKind::Dash => "DASH",
+        ResourceKind::File => "File",
+        ResourceKind::Unknown => "Unknown",
     }
 }
 
@@ -462,6 +995,7 @@ mod tests {
         time::{Duration, timeout},
     };
 
+    mod capture;
     mod recovery;
 
     async fn wait_for(backend: &mut Backend, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
