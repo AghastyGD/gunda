@@ -6,14 +6,20 @@
 //! downloads reuse the same lifecycle, progress, cancellation, staging and
 //! finalization machinery as plain file downloads.
 
+mod container;
 mod error;
 mod xml;
 
 pub mod dash;
 pub mod hls;
+pub mod plan;
 
+pub use container::{Container, SNIFF_BYTES, detect, sniff};
 pub use dash::TrackKind;
 pub use error::{ManifestError, UnsupportedFeature};
+pub use plan::{
+    HlsOutcome, StreamKind, StreamResource, TrackPlan, plan_dash, plan_hls, substitute_template,
+};
 
 /// Maximum number of segments accepted from one manifest.
 ///
