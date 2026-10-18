@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Gunda Capture",
+  "version": "0.1.0",
+  "description": "Reports the media a page plays to the Gunda desktop application.",
+  "minimum_chrome_version": "116",
+
+  "permissions": ["webRequest", "storage", "tabs", "alarms"],
+
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+
+  "options_page": "options.html"
+}
