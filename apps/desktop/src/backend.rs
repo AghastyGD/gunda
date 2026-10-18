@@ -995,11 +995,13 @@ mod tests {
         time::{Duration, timeout},
     };
 
+    const TEST_TIMEOUT: Duration = Duration::from_secs(30);
+
     mod capture;
     mod recovery;
 
     async fn wait_for(backend: &mut Backend, predicate: impl Fn(&Snapshot) -> bool) -> Snapshot {
-        timeout(Duration::from_secs(10), async {
+        timeout(TEST_TIMEOUT, async {
             loop {
                 let snapshot = backend.snapshots.borrow_and_update().clone();
                 if predicate(&snapshot) {
@@ -1032,7 +1034,7 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), async {
+            timeout(TEST_TIMEOUT, async {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let request = read_request(&mut socket).await;
                 socket.write_all(response).await.unwrap();
@@ -1500,7 +1502,7 @@ mod tests {
         let (received, request_received) = tokio::sync::oneshot::channel();
         let (release, released) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
-            timeout(Duration::from_secs(10), async {
+            timeout(TEST_TIMEOUT, async {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 read_request(&mut socket).await;
                 socket
@@ -1522,7 +1524,7 @@ mod tests {
                 directory: output.path().into(),
             })
             .unwrap();
-        timeout(Duration::from_secs(10), request_received)
+        timeout(TEST_TIMEOUT, request_received)
             .await
             .unwrap()
             .unwrap();

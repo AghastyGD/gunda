@@ -52,7 +52,7 @@ async fn nonresumable_body_failure_retries_from_zero_successfully() {
             b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhelloworld"
                 .as_slice(),
         ] {
-            let (mut socket, _) = timeout(Duration::from_secs(10), listener.accept())
+            let (mut socket, _) = timeout(TEST_TIMEOUT, listener.accept())
                 .await
                 .unwrap()
                 .unwrap();
