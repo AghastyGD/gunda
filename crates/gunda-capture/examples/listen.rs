@@ -7,10 +7,12 @@
 //! cargo run -p gunda-capture --example listen
 //! ```
 
+use std::error::Error;
+
 use gunda_capture::{CaptureServer, load_or_create_token, token_path};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let directory = std::env::temp_dir().join("gunda-capture-example");
     let token = load_or_create_token(&token_path(&directory))?;
 

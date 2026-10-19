@@ -234,7 +234,7 @@ async fn migrations_from_0002_preserve_jobs_and_execution_metadata() {
             .fetch_all(&pool)
             .await
             .expect("migration bookkeeping must remain readable");
-    assert_eq!(applied_after, vec![1, 2, 3]);
+    assert_eq!(applied_after, vec![1, 2, 3, 4, 5]);
     pool.close().await;
 }
 
@@ -257,6 +257,28 @@ async fn reopening_current_database_preserves_existing_records() {
     .execute(&pool)
     .await
     .expect("resume fixture must be inserted");
+
+    sqlx::query(
+        r#"
+        INSERT INTO stream_resume_state (download_id, plan_fingerprint, track_count)
+        VALUES ($1, $2, 1)
+        "#,
+    )
+    .bind(DOWNLOAD_ID)
+    .bind([3_u8; 16].as_slice())
+    .execute(&pool)
+    .await
+    .expect("stream resume fixture must be inserted");
+    sqlx::query(
+        r#"
+        INSERT INTO stream_resume_tracks (download_id, track, next_resource, durable_bytes)
+        VALUES ($1, 0, 2, 8)
+        "#,
+    )
+    .bind(DOWNLOAD_ID)
+    .execute(&pool)
+    .await
+    .expect("stream track fixture must be inserted");
     pool.close().await;
 
     let repository = SqliteDownloadRepository::open(&database_path)
@@ -418,7 +440,17 @@ async fn deleting_download_cascades_to_headers_and_resume_state() {
         .fetch_one(&pool)
         .await
         .expect("resume count must be readable");
+    let stream_states: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stream_resume_state")
+        .fetch_one(&pool)
+        .await
+        .expect("stream resume count must be readable");
+    let stream_tracks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stream_resume_tracks")
+        .fetch_one(&pool)
+        .await
+        .expect("stream track count must be readable");
     assert_eq!(headers, 0);
     assert_eq!(resume_states, 0);
+    assert_eq!(stream_states, 0);
+    assert_eq!(stream_tracks, 0);
     pool.close().await;
 }

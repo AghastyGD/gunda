@@ -1,7 +1,8 @@
 use gunda_core::application::{DownloadManager, DownloadRepository};
 use gunda_core::download::{
-    DownloadDestination, DownloadOrigin, DownloadProgress, DownloadState, FileConflictPolicy,
-    NewDownload, RequestContext, ResolvedDestination, ResourceDescriptor, ResourceKind,
+    DownloadDestination, DownloadOrigin, DownloadProgress, DownloadState, ExecutionSelection,
+    FileConflictPolicy, NewDownload, RequestContext, ResolvedDestination, ResourceDescriptor,
+    ResourceKind,
 };
 use gunda_http::partial_path;
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
@@ -154,4 +155,46 @@ async fn startup_recovery_is_durable_and_preservers_files_and_metadata() {
     }
 
     manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn execution_selection_survives_storage_and_restart() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let db_path = directory.path().join("gunda.sqlite3");
+    let repository = SqliteDownloadRepository::open(&db_path)
+        .await
+        .expect("repository must open");
+    let selection = ExecutionSelection::new("hls:1:2:2000000:1280:720").unwrap();
+    let request = RequestContext::new(
+        Url::parse("https://example.com/master.m3u8").expect("test URL must be valid"),
+        Vec::new(),
+    )
+    .with_selection(selection.clone());
+    let job = repository
+        .create(
+            NewDownload::new(
+                request,
+                DownloadDestination::new(
+                    directory.path().to_path_buf(),
+                    None,
+                    FileConflictPolicy::Rename,
+                ),
+                DownloadOrigin::Desktop,
+            ),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .await
+        .expect("job must be created");
+    repository.close().await;
+
+    let repository = SqliteDownloadRepository::open(&db_path)
+        .await
+        .expect("repository must reopen");
+    let loaded = repository
+        .find_by_id(job.id())
+        .await
+        .expect("download lookup must succeed")
+        .expect("download must exist");
+
+    assert_eq!(loaded.request().selection(), Some(&selection));
 }

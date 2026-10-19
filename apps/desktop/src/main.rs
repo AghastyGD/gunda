@@ -2,10 +2,13 @@ mod app;
 mod backend;
 mod view;
 
+use std::env;
+use std::error::Error;
+use std::io;
 use std::path::PathBuf;
 
 fn data_directory() -> Result<PathBuf, &'static str> {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = env::args_os().skip(1);
     if let Some(argument) = args.next() {
         if argument != "--data-dir" {
             return Err("Usage: gunda-desktop [--data-dir PATH]");
@@ -24,8 +27,8 @@ fn data_directory() -> Result<PathBuf, &'static str> {
         .ok_or("Could not find the application data folder.")
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = data_directory().map_err(std::io::Error::other)?;
+fn main() -> Result<(), Box<dyn Error>> {
+    let directory = data_directory().map_err(io::Error::other)?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 780.0])
@@ -39,7 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         options,
         Box::new(move |cc| {
             let backend = backend::Backend::start(directory, cc.egui_ctx.clone())
-                .map_err(|_| std::io::Error::other("Could not start Gunda."))?;
+                .map_err(|_| io::Error::other("Could not start Gunda."))?;
             Ok(Box::new(app::Desktop::new(cc, backend)))
         }),
     )?;

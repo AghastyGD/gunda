@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -20,8 +21,8 @@ use gunda_core::{
         ExecutionOutput,
     },
     download::{
-        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, FileConflictPolicy,
-        NewDownload, RequestContext, ResourceDescriptor, ResourceKind,
+        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, ExecutionSelection,
+        FileConflictPolicy, NewDownload, RequestContext, ResourceDescriptor, ResourceKind,
     },
 };
 use gunda_http::{HttpClient, HttpExecutor};
@@ -75,6 +76,7 @@ pub struct TrackView {
     pub details: String,
     pub url: Url,
     pub filename: Option<String>,
+    pub selection: Option<ExecutionSelection>,
 }
 
 /// A chosen track, carried from the panel to the backend.
@@ -82,6 +84,7 @@ pub struct TrackView {
 pub struct TrackChoice {
     pub url: Url,
     pub filename: Option<String>,
+    pub selection: Option<ExecutionSelection>,
 }
 
 /// What the user needs to pair the browser with this application.
@@ -135,7 +138,7 @@ impl Backend {
         }
     }
 
-    pub fn start(directory: PathBuf, ctx: egui::Context) -> std::io::Result<Self> {
+    pub fn start(directory: PathBuf, ctx: egui::Context) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel(4);
         let (sender, snapshots) = watch::channel(Snapshot::default());
         let active = Arc::new(Mutex::new(None));
@@ -257,6 +260,7 @@ async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
         .await
         .map_err(|_| "Could not open saved downloads. Check the application data folder.")?;
     let store = repository.http_resume_store();
+    let stream_store = repository.stream_resume_store();
     let manager = DownloadManager::start(repository)
         .await
         .map_err(|_| "Could not load saved downloads.")?;
@@ -270,7 +274,7 @@ async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
         manager,
         engines: Engines {
             http: HttpExecutor::with_resume_store(client, store),
-            stream: StreamExecutor::new(stream_client),
+            stream: StreamExecutor::with_resume_store(stream_client, stream_store),
         },
         capture,
         capture_problem,
@@ -352,7 +356,7 @@ async fn run(
     let mut pending_outputs = BTreeMap::new();
     let mut snapshot = Snapshot {
         ready: true,
-        jobs: idle_views(&manager, &engines.http, &pending_outputs).await,
+        jobs: idle_views(&manager, &engines, &pending_outputs).await,
         captures: capture_views(capture.as_ref()),
         capture: capture.as_ref().map(capture_status),
         capture_problem,
@@ -407,7 +411,7 @@ async fn run(
                 } else {
                     snapshot.notice = Some("There is no saved file status to update.".into());
                 }
-                snapshot.jobs = idle_views(&manager, &engines.http, &pending_outputs).await;
+                snapshot.jobs = idle_views(&manager, &engines, &pending_outputs).await;
                 snapshot.busy = false;
                 publish(&sender, &ctx, snapshot.clone());
                 continue;
@@ -459,20 +463,24 @@ async fn run(
                 Some(Ok(captured)) => {
                     let engine = captured.engine;
 
-                    // A chosen track is one playlist of the same presentation,
-                    // so the same engine executes it, and it is still named
-                    // after the presentation rather than after its playlist.
-                    let (url, filename) = match track {
-                        Some(track) => (track.url, track.filename),
-                        None => (captured.url, None),
+                    // The stream engine re-reads the presentation and resolves
+                    // the selector, so the output keeps the presentation's name
+                    // rather than a variant playlist's name.
+                    let (url, filename, selection) = match track {
+                        Some(track) => (track.url, track.filename, track.selection),
+                        None => (captured.url, None, None),
                     };
 
                     snapshot.capture_tracks = None;
+                    let mut request = RequestContext::new(url, Vec::new());
+                    if let Some(selection) = selection {
+                        request = request.with_selection(selection);
+                    }
 
                     (
                         manager
                             .create(NewDownload::new(
-                                RequestContext::new(url, Vec::new()),
+                                request,
                                 DownloadDestination::new(
                                     directory,
                                     filename,
@@ -495,7 +503,10 @@ async fn run(
             Command::Resume(id) => {
                 let engine = engine_of(&manager, id);
                 let available = match manager.job(id) {
-                    Some(job) => engines.http.can_resume(job).await,
+                    Some(job) => match engine {
+                        JobEngine::Http => engines.http.can_resume(job).await,
+                        JobEngine::Stream => engines.stream.can_resume(job).await,
+                    },
                     None => Ok(false),
                 };
                 (
@@ -530,12 +541,20 @@ async fn run(
                     .filter(|job| job.state().can_restart())
                     .map(|job| job.destination().directory().to_path_buf());
                 let restarted = if let Some(directory) = directory {
-                    if engines
-                        .http
-                        .reset_for_restart(id, &directory)
-                        .await
-                        .is_err()
-                    {
+                    let reset = match engine {
+                        JobEngine::Http => engines
+                            .http
+                            .reset_for_restart(id, &directory)
+                            .await
+                            .is_err(),
+                        JobEngine::Stream => engines
+                            .stream
+                            .reset_for_restart(id, &directory)
+                            .await
+                            .is_err(),
+                    };
+
+                    if reset {
                         Err("The previous download data could not be cleared safely.")
                     } else {
                         manager
@@ -628,7 +647,7 @@ async fn run(
         snapshot.busy = false;
         snapshot.active = None;
         snapshot.pause_supported = false;
-        snapshot.jobs = idle_views(&manager, &engines.http, &pending_outputs).await;
+        snapshot.jobs = idle_views(&manager, &engines, &pending_outputs).await;
         publish(&sender, &ctx, snapshot.clone());
     }
 }
@@ -854,6 +873,7 @@ impl TrackView {
             details: format!("{} · {}", kind_name(track.kind()), size_hint(track.size())),
             url: track.url().clone(),
             filename: track.filename().map(str::to_owned),
+            selection: track.selection().cloned(),
         }
     }
 }
@@ -937,13 +957,16 @@ fn update_job_view(snapshot: &mut Snapshot, job: &DownloadJob) {
 
 async fn idle_views(
     manager: &DownloadManager<SqliteDownloadRepository>,
-    executor: &HttpExecutor,
+    engines: &Engines,
     pending_outputs: &BTreeMap<DownloadId, ExecutionOutput>,
 ) -> Vec<DownloadView> {
     let mut views = Vec::new();
     for job in manager.jobs() {
         let mut view = DownloadView::from_job(job);
-        let availability = executor.can_resume(job).await;
+        let availability = match engine_of(manager, job.id()) {
+            JobEngine::Http => engines.http.can_resume(job).await,
+            JobEngine::Stream => engines.stream.can_resume(job).await,
+        };
         view.resume_available = matches!(availability, Ok(true));
         if let Some(output) = pending_outputs.get(&job.id()) {
             view.output = Some(output.destination.final_path().to_owned());

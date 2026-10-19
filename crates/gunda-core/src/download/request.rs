@@ -2,6 +2,8 @@ use std::fmt;
 
 use url::Url;
 
+use super::ExecutionSelection;
+
 /// Defines how a request header value must be handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderSensitivity {
@@ -80,12 +82,25 @@ impl fmt::Debug for RequestHeader {
 pub struct RequestContext {
     url: Url,
     headers: Vec<RequestHeader>,
+    selection: Option<ExecutionSelection>,
 }
 
 impl RequestContext {
     #[must_use]
     pub fn new(url: Url, headers: Vec<RequestHeader>) -> Self {
-        Self { url, headers }
+        Self {
+            url,
+            headers,
+            selection: None,
+        }
+    }
+
+    /// The executing engine owns the meaning.
+    #[must_use]
+    pub fn with_selection(mut self, selection: ExecutionSelection) -> Self {
+        self.selection = Some(selection);
+
+        self
     }
 
     #[must_use]
@@ -99,6 +114,11 @@ impl RequestContext {
     }
 
     #[must_use]
+    pub const fn selection(&self) -> Option<&ExecutionSelection> {
+        self.selection.as_ref()
+    }
+
+    #[must_use]
     pub fn has_sensitive_headers(&self) -> bool {
         self.headers.iter().any(RequestHeader::is_sensitive)
     }
@@ -106,7 +126,7 @@ impl RequestContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{HeaderSensitivity, RequestContext, RequestHeader};
+    use super::{ExecutionSelection, HeaderSensitivity, RequestContext, RequestHeader};
     use url::Url;
 
     #[test]
@@ -137,5 +157,17 @@ mod tests {
 
         assert!(request.has_sensitive_headers());
         assert_eq!(request.headers().len(), 1);
+    }
+
+    #[test]
+    fn request_context_carries_an_engine_selection() {
+        let selection = ExecutionSelection::new("dash:1:0:1:2000000:1:0:128000").unwrap();
+        let request = RequestContext::new(
+            Url::parse("https://example.com/manifest.mpd").expect("URL must be valid"),
+            Vec::new(),
+        )
+        .with_selection(selection.clone());
+
+        assert_eq!(request.selection(), Some(&selection));
     }
 }

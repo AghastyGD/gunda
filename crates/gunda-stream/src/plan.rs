@@ -4,7 +4,7 @@
 //! in order, to produce one output file: initialization segments interleaved
 //! with media segments, exactly as a player would consume them.
 
-use gunda_core::download::ResourceKind;
+use gunda_core::download::{ExecutionSelection, ResourceKind};
 use url::Url;
 
 use crate::MAX_SEGMENTS;
@@ -12,8 +12,8 @@ use crate::container::Container;
 use crate::dash::{self, Mpd, MpdKind, RepresentationAddressing, TrackKind};
 use crate::error::{ManifestError, UnsupportedFeature};
 use crate::hls::{self, ByteRange, Playlist};
+use crate::selection;
 
-/// The segmented-stream flavor a plan came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
     Hls,
@@ -217,19 +217,14 @@ impl TrackPlan {
             .map_or(0, |track| usize::from(track) + 1)
     }
 
-    /// The resources of one track, in the order they must be fetched and
-    /// appended.
     pub fn resources_of(&self, track: u8) -> impl Iterator<Item = &StreamResource> {
         self.resources
             .iter()
             .filter(move |resource| resource.track() == track)
     }
 
-    /// Moves every resource of this plan to another track of a download.
-    ///
-    /// The audio playlist of a presentation is planned exactly like the video
-    /// one; its resources only differ in which file they have to be fetched
-    /// into.
+    /// An audio playlist is planned like the video one; only its staging file
+    /// differs.
     #[must_use]
     pub fn retracked(mut self, track: u8) -> Self {
         for resource in &mut self.resources {
@@ -239,8 +234,6 @@ impl TrackPlan {
         self
     }
 
-    /// Adds the audio track that belongs with this plan's video track.
-    ///
     /// A presentation that keeps its audio in a track of its own can only
     /// become one file by being muxed. ISO base media tracks are carried over
     /// as they stand; a transport stream or an ADTS audio file is demuxed
@@ -273,10 +266,8 @@ impl TrackPlan {
     }
 }
 
-/// The outcome of planning from a playlist that may still need a second fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HlsOutcome {
-    /// The playlist is a master playlist; fetch this variant and plan again.
     FetchVariant {
         url: Url,
         label: Option<String>,
@@ -284,12 +275,9 @@ pub enum HlsOutcome {
         /// carries no audio of its own.
         audio: Option<Url>,
     },
-    /// The plan is complete.
     Ready(TrackPlan),
 }
 
-/// Selects the variant to download from a master playlist.
-///
 /// Bandwidth is the only ordering signal a master playlist always provides, but
 /// it is not the only one that matters when the sound lives in a rendition of
 /// its own: the same picture is often offered with stereo AAC and with surround
@@ -326,7 +314,6 @@ fn select_variant(master: &hls::MasterPlaylist) -> Option<&hls::Variant> {
     master.best_variant()
 }
 
-/// Whether a `CODECS` attribute declares AAC audio.
 fn declares_aac(codecs: Option<&str>) -> bool {
     codecs.is_some_and(|codecs| {
         codecs
@@ -335,14 +322,23 @@ fn declares_aac(codecs: Option<&str>) -> bool {
     })
 }
 
-/// Plans an HLS playlist.
-///
 /// `base` must be the URL the playlist was fetched from, so relative segment
 /// references resolve as a player would resolve them.
 pub fn plan_hls(base: &Url, playlist: &Playlist) -> Result<HlsOutcome, ManifestError> {
+    plan_hls_selected(base, playlist, None)
+}
+
+pub fn plan_hls_selected(
+    base: &Url,
+    playlist: &Playlist,
+    selection: Option<&ExecutionSelection>,
+) -> Result<HlsOutcome, ManifestError> {
     match playlist {
         Playlist::Master(master) => {
-            let variant = select_variant(master).ok_or(ManifestError::Malformed)?;
+            let variant = match selection {
+                Some(selection) => selected_variant(master, selection)?,
+                None => select_variant(master).ok_or(ManifestError::Malformed)?,
+            };
 
             let url = resolve(base, variant.uri(), None)?.url;
 
@@ -363,8 +359,28 @@ pub fn plan_hls(base: &Url, playlist: &Playlist) -> Result<HlsOutcome, ManifestE
                 audio,
             })
         }
-        Playlist::Media(media) => plan_media_playlist(base, media, 0).map(HlsOutcome::Ready),
+        Playlist::Media(media) if selection.is_none() => {
+            plan_media_playlist(base, media, 0).map(HlsOutcome::Ready)
+        }
+        Playlist::Media(_) => Err(ManifestError::SelectionUnavailable),
     }
+}
+
+fn selected_variant<'a>(
+    master: &'a hls::MasterPlaylist,
+    selection: &ExecutionSelection,
+) -> Result<&'a hls::Variant, ManifestError> {
+    let selected = selection::parse_hls(selection)?;
+    let variant = master
+        .variants()
+        .get(selected.variant)
+        .ok_or(ManifestError::SelectionUnavailable)?;
+
+    if variant.bandwidth() != selected.bandwidth || variant.resolution() != selected.resolution {
+        return Err(ManifestError::SelectionUnavailable);
+    }
+
+    Ok(variant)
 }
 
 fn plan_media_playlist(
@@ -439,7 +455,7 @@ pub(crate) fn label_for_variant(variant: &hls::Variant) -> Option<String> {
     }
 }
 
-fn bandwidth_hint(bandwidth: u64) -> String {
+pub(crate) fn bandwidth_hint(bandwidth: u64) -> String {
     if bandwidth >= 1_000_000 {
         format!("{:.1} Mbps", bandwidth as f64 / 1_000_000.0)
     } else {
@@ -447,7 +463,6 @@ fn bandwidth_hint(bandwidth: u64) -> String {
     }
 }
 
-/// One track of an MPEG-DASH presentation, planned on its own.
 struct PlannedSet {
     resources: Vec<StreamResource>,
     label: Option<String>,
@@ -455,73 +470,169 @@ struct PlannedSet {
     duration_millis: Option<u64>,
 }
 
-/// Plans an MPEG-DASH presentation.
-///
 /// A presentation that splits video from audio is planned as both tracks. They
 /// cannot be concatenated into one file, so they are fetched side by side and
 /// muxed; leaving the audio out would publish a silently silent video.
 pub fn plan_dash(base: &Url, mpd: &Mpd) -> Result<TrackPlan, ManifestError> {
+    plan_dash_selected(base, mpd, None)
+}
+
+pub fn plan_dash_selected(
+    base: &Url,
+    mpd: &Mpd,
+    selection: Option<&ExecutionSelection>,
+) -> Result<TrackPlan, ManifestError> {
     if mpd.kind() == MpdKind::Dynamic {
         return Err(UnsupportedFeature::IncompletePresentation.into());
     }
 
     let period = mpd.media_period()?;
-    let set = select_set(period).ok_or(ManifestError::Malformed)?;
+    let tracks = match selection {
+        Some(selection) => selected_dash_tracks(period, selection)?,
+        None => default_dash_tracks(period)?,
+    };
+
+    let video_plan = tracks
+        .video
+        .map(|(set, representation)| plan_dash_track(base, mpd, period, set, representation))
+        .transpose()?;
+    let audio_plan = tracks
+        .audio
+        .map(|(set, representation)| plan_dash_track(base, mpd, period, set, representation))
+        .transpose()?;
+
+    match (video_plan, audio_plan) {
+        (Some(video), Some(audio)) => video.with_audio(audio),
+        (Some(video), None) => Ok(video),
+        (None, Some(audio)) => Ok(audio),
+        (None, None) => Err(ManifestError::Malformed),
+    }
+}
+
+struct DashTracks {
+    video: Option<(usize, usize)>,
+    audio: Option<(usize, usize)>,
+}
+
+fn default_dash_tracks(period: &dash::Period) -> Result<DashTracks, ManifestError> {
+    let video_set = select_set_index(period).ok_or(ManifestError::Malformed)?;
+    let representation = best_representation_index(&period.adaptation_sets()[video_set])
+        .ok_or(ManifestError::Malformed)?;
+    let video = (video_set, representation);
+    let audio = if period.adaptation_sets()[video_set].kind() == TrackKind::Video {
+        audio_set_index(period).and_then(|set| {
+            best_representation_index(&period.adaptation_sets()[set]).map(|rep| (set, rep))
+        })
+    } else {
+        None
+    };
+
+    Ok(DashTracks {
+        video: Some(video),
+        audio,
+    })
+}
+
+fn selected_dash_tracks(
+    period: &dash::Period,
+    selection: &ExecutionSelection,
+) -> Result<DashTracks, ManifestError> {
+    let selected = selection::parse_dash(selection)?;
+
+    let video = match (selected.video_set, selected.video_representation) {
+        (Some(set), Some(representation)) => {
+            validate_dash_choice(
+                period,
+                set,
+                representation,
+                TrackKind::Video,
+                selected.video_bandwidth,
+            )?;
+            Some((set, representation))
+        }
+        (None, None) => None,
+        _ => return Err(ManifestError::SelectionUnavailable),
+    };
+    let audio = match (selected.audio_set, selected.audio_representation) {
+        (Some(set), Some(representation)) => {
+            validate_dash_choice(
+                period,
+                set,
+                representation,
+                TrackKind::Audio,
+                selected.audio_bandwidth,
+            )?;
+            Some((set, representation))
+        }
+        (None, None) => None,
+        _ => return Err(ManifestError::SelectionUnavailable),
+    };
+
+    Ok(DashTracks { video, audio })
+}
+
+fn validate_dash_choice(
+    period: &dash::Period,
+    set_index: usize,
+    representation_index: usize,
+    kind: TrackKind,
+    bandwidth: Option<u64>,
+) -> Result<(), ManifestError> {
+    let set = period
+        .adaptation_sets()
+        .get(set_index)
+        .ok_or(ManifestError::SelectionUnavailable)?;
+
+    if set.kind() != kind {
+        return Err(ManifestError::SelectionUnavailable);
+    }
+
+    let representation = set
+        .representations()
+        .get(representation_index)
+        .ok_or(ManifestError::SelectionUnavailable)?;
+
+    if representation.bandwidth() != bandwidth {
+        return Err(ManifestError::SelectionUnavailable);
+    }
+
+    Ok(())
+}
+
+fn plan_dash_track(
+    base: &Url,
+    mpd: &Mpd,
+    period: &dash::Period,
+    set_index: usize,
+    representation_index: usize,
+) -> Result<TrackPlan, ManifestError> {
+    let set = period
+        .adaptation_sets()
+        .get(set_index)
+        .ok_or(ManifestError::SelectionUnavailable)?;
 
     let PlannedSet {
         resources,
         label,
         container,
         duration_millis,
-    } = plan_set(base, mpd, period, set)?;
+    } = plan_set(base, mpd, period, set, representation_index)?;
 
-    let mut plan = TrackPlan::new(StreamKind::Dash, resources, duration_millis, label)?
-        .with_container_hint(container);
-
-    // Only a picture needs a sound paired with it; an audio-only presentation
-    // is already whole.
-    let audio = if set.kind() == TrackKind::Video {
-        audio_set(period)
-    } else {
-        None
-    };
-
-    if let Some(audio) = audio {
-        let PlannedSet {
-            resources,
-            label,
-            container,
-            duration_millis,
-        } = plan_set(base, mpd, period, audio)?;
-
-        let audio = TrackPlan::new(StreamKind::Dash, resources, duration_millis, label)?
-            .with_container_hint(container);
-
-        plan = plan.with_audio(audio)?;
-    }
-
-    Ok(plan)
+    TrackPlan::new(StreamKind::Dash, resources, duration_millis, label)
+        .map(|plan| plan.with_container_hint(container))
 }
 
-/// Plans one adaptation set: the representation a download would take, and
-/// every resource that representation is made of.
 fn plan_set(
     base: &Url,
     mpd: &Mpd,
     period: &dash::Period,
     set: &dash::AdaptationSet,
+    representation_index: usize,
 ) -> Result<PlannedSet, ManifestError> {
     let representation = set
         .representations()
-        .iter()
-        .max_by_key(|representation| {
-            (
-                representation.bandwidth().unwrap_or(0),
-                representation.resolution().map_or(0, |(width, _)| width),
-                representation.resolution().map_or(0, |(_, height)| height),
-            )
-        })
-        .ok_or(ManifestError::Malformed)?;
+        .get(representation_index)
+        .ok_or(ManifestError::SelectionUnavailable)?;
 
     let mut resolved = base.clone();
 
@@ -646,49 +757,58 @@ fn plan_set(
     })
 }
 
-/// The audio adaptation set that belongs with the chosen video, when the
-/// presentation keeps its audio in a set of its own.
-///
-/// Several sets mean several languages; the loudest one is the one a player
-/// would pick by default, which is what a download should follow.
-fn audio_set(period: &dash::Period) -> Option<&dash::AdaptationSet> {
+/// Index of the audio adaptation set a player would pick by default.
+pub(crate) fn audio_set_index(period: &dash::Period) -> Option<usize> {
     period
         .adaptation_sets()
         .iter()
-        .filter(|set| set.kind() == TrackKind::Audio && !set.representations().is_empty())
-        .max_by_key(|set| {
-            set.representations()
-                .iter()
-                .map(|representation| representation.bandwidth().unwrap_or(0))
-                .max()
-                .unwrap_or(0)
-        })
+        .enumerate()
+        .filter(|(_, set)| set.kind() == TrackKind::Audio && !set.representations().is_empty())
+        .max_by_key(|(_, set)| best_bandwidth(set))
+        .map(|(index, _)| index)
 }
 
-fn select_set(period: &dash::Period) -> Option<&dash::AdaptationSet> {
+/// Index of the adaptation set a download uses when no quality was chosen.
+pub(crate) fn select_set_index(period: &dash::Period) -> Option<usize> {
     let populated = || {
         period
             .adaptation_sets()
             .iter()
-            .filter(|set| !set.representations().is_empty())
-    };
-
-    let best_bandwidth = |set: &dash::AdaptationSet| {
-        set.representations()
-            .iter()
-            .map(|representation| representation.bandwidth().unwrap_or(0))
-            .max()
-            .unwrap_or(0)
+            .enumerate()
+            .filter(|(_, set)| !set.representations().is_empty())
     };
 
     populated()
-        .filter(|set| set.kind() == TrackKind::Video)
-        .max_by_key(|set| best_bandwidth(set))
+        .filter(|(_, set)| set.kind() == TrackKind::Video)
+        .max_by_key(|(_, set)| best_bandwidth(set))
         .or_else(|| {
             populated()
-                .filter(|set| set.kind() != TrackKind::Text)
-                .max_by_key(|set| best_bandwidth(set))
+                .filter(|(_, set)| set.kind() != TrackKind::Text)
+                .max_by_key(|(_, set)| best_bandwidth(set))
         })
+        .map(|(index, _)| index)
+}
+
+pub(crate) fn best_representation_index(set: &dash::AdaptationSet) -> Option<usize> {
+    set.representations()
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, representation)| {
+            (
+                representation.bandwidth().unwrap_or(0),
+                representation.resolution().map_or(0, |(width, _)| width),
+                representation.resolution().map_or(0, |(_, height)| height),
+            )
+        })
+        .map(|(index, _)| index)
+}
+
+fn best_bandwidth(set: &dash::AdaptationSet) -> u64 {
+    set.representations()
+        .iter()
+        .map(|representation| representation.bandwidth().unwrap_or(0))
+        .max()
+        .unwrap_or(0)
 }
 
 fn segment_count(
@@ -824,9 +944,13 @@ fn resolve(
 
 #[cfg(test)]
 mod tests {
+    use gunda_core::download::ExecutionSelection;
     use url::Url;
 
-    use super::{Container, HlsOutcome, StreamKind, plan_dash, plan_hls, substitute_template};
+    use super::{
+        Container, HlsOutcome, StreamKind, plan_dash, plan_dash_selected, plan_hls,
+        plan_hls_selected, substitute_template,
+    };
     use crate::dash;
     use crate::error::{ManifestError, UnsupportedFeature};
     use crate::hls;
@@ -857,6 +981,104 @@ mod tests {
             }
             HlsOutcome::Ready(_) => panic!("expected a variant fetch"),
         }
+    }
+
+    #[test]
+    fn a_selected_hls_variant_is_planned_with_its_paired_audio() {
+        let playlist = hls::parse(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO=\"aac\"\n\
+             low.m3u8\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=2400000,RESOLUTION=1920x1080,AUDIO=\"aac\"\n\
+             high.m3u8\n",
+        )
+        .expect("playlist must parse");
+        let selection = ExecutionSelection::new("hls:1:0:800000:640:360").unwrap();
+
+        let outcome = plan_hls_selected(
+            &url("https://cdn.example/vod/master.m3u8"),
+            &playlist,
+            Some(&selection),
+        )
+        .expect("planning must succeed");
+
+        match outcome {
+            HlsOutcome::FetchVariant { url, audio, .. } => {
+                assert_eq!(url.as_str(), "https://cdn.example/vod/low.m3u8");
+                assert_eq!(
+                    audio
+                        .expect("the paired rendition is part of the download")
+                        .as_str(),
+                    "https://cdn.example/vod/audio.m3u8"
+                );
+            }
+            HlsOutcome::Ready(_) => panic!("expected a variant fetch"),
+        }
+    }
+
+    #[test]
+    fn a_selection_whose_variant_changed_is_refused() {
+        let playlist = hls::parse(
+            "#EXTM3U\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360\n\
+             low.m3u8\n",
+        )
+        .expect("playlist must parse");
+        let selection = ExecutionSelection::new("hls:1:0:2400000:640:360").unwrap();
+
+        assert!(matches!(
+            plan_hls_selected(
+                &url("https://cdn.example/vod/master.m3u8"),
+                &playlist,
+                Some(&selection)
+            ),
+            Err(ManifestError::SelectionUnavailable)
+        ));
+    }
+
+    #[test]
+    fn a_selected_dash_representation_is_planned_with_the_chosen_audio() {
+        let mpd = dash::parse(
+            r#"<MPD type="static" mediaPresentationDuration="PT4S">
+                 <Period>
+                   <AdaptationSet contentType="video" mimeType="video/mp4">
+                     <SegmentTemplate timescale="1000" duration="4000"
+                                      initialization="$RepresentationID$/init.mp4"
+                                      media="$RepresentationID$/$Number$.m4s"/>
+                     <Representation id="v0" bandwidth="800000" width="640" height="360"/>
+                     <Representation id="v1" bandwidth="2400000" width="1920" height="1080"/>
+                   </AdaptationSet>
+                   <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="en">
+                     <SegmentTemplate timescale="1000" duration="4000"
+                                      initialization="$RepresentationID$/init.mp4"
+                                      media="$RepresentationID$/$Number$.m4s"/>
+                     <Representation id="a0" bandwidth="128000"/>
+                   </AdaptationSet>
+                 </Period>
+               </MPD>"#,
+        )
+        .expect("manifest must parse");
+        let selection = ExecutionSelection::new("dash:1:0:0:800000:1:0:128000").unwrap();
+
+        let plan = plan_dash_selected(
+            &url("https://cdn.example/dash/manifest.mpd"),
+            &mpd,
+            Some(&selection),
+        )
+        .expect("planning must succeed");
+
+        let urls: Vec<&str> = plan
+            .resources()
+            .iter()
+            .map(|resource| resource.url().as_str())
+            .collect();
+
+        assert!(urls.contains(&"https://cdn.example/dash/v0/init.mp4"));
+        assert!(urls.contains(&"https://cdn.example/dash/v0/1.m4s"));
+        assert!(urls.contains(&"https://cdn.example/dash/a0/init.mp4"));
+        assert!(!urls.iter().any(|url| url.contains("/v1/")));
+        assert_eq!(plan.track_count(), 2);
     }
 
     #[test]

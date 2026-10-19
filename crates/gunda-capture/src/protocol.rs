@@ -11,6 +11,8 @@
 //! download that needs a session cookie is out of scope until there is a
 //! deliberate place to keep one.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::CaptureError;
@@ -38,8 +40,8 @@ pub enum Refusal {
     UnsupportedVersion,
 }
 
-impl std::fmt::Display for Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self {
             Self::UnsupportedUrl => "the media URL is not an absolute HTTP URL",
             Self::UnsupportedMedia => "the resource is not downloadable media",

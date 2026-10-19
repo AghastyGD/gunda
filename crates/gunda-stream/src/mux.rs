@@ -23,7 +23,10 @@
 //! readers open without a manifest to guide them.
 
 use std::cmp::Ordering;
+use std::error::Error;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use tokio::fs::File;
@@ -60,7 +63,7 @@ const IDENTITY_MATRIX: [u8; 36] = [
 #[derive(Debug)]
 pub enum MuxError {
     /// A track file could not be read or the output could not be written.
-    Io(std::io::Error),
+    Io(io::Error),
 
     /// A track is not shaped the way its format requires.
     Malformed(&'static str),
@@ -83,8 +86,8 @@ impl fmt::Display for MuxError {
     }
 }
 
-impl std::error::Error for MuxError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl Error for MuxError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
             _ => None,
@@ -196,7 +199,7 @@ impl Drop for TemporaryTracks {
         for path in &self.paths {
             // Best effort: a leftover elementary file wastes space, but failing
             // a completed download over one would be worse.
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
     }
 }

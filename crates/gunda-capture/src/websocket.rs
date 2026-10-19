@@ -10,6 +10,7 @@
 //! channel with exactly one client type, so this is deliberately small and
 //! tested against the handshake example in RFC 6455 section 1.3.
 
+use std::error::Error;
 use std::fmt;
 use std::io;
 
@@ -67,7 +68,7 @@ impl fmt::Display for WebSocketError {
     }
 }
 
-impl std::error::Error for WebSocketError {}
+impl Error for WebSocketError {}
 
 /// The opening handshake of an accepted connection.
 ///

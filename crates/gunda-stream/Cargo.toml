@@ -14,4 +14,5 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+time.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time"] }

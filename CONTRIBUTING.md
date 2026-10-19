@@ -42,6 +42,18 @@ Changes involving persistence should test what happens after reopening the repos
 
 Gunda supports native filesystem paths, so avoid assuming paths are always valid UTF-8.
 
+## Rust style
+
+Keep new code consistent with the module around it. A change should look like it belongs in the file, not like it was appended in a different style.
+
+- Put imports at the top, grouped as standard library, external crates, workspace crates, and local modules.
+- Use imported names in impl blocks and bodies: `impl fmt::Display`, `impl Error`, `io::ErrorKind`, and `fs::read` rather than fully qualified `std::...` paths when the module is already imported.
+- Avoid `unwrap` and `expect` in production code. Prefer `?`, `let-else`, or explicit branches. Tests may use them when the fixture is expected to be valid.
+- Prefer early returns over deep nesting, and keep helpers close to their only caller.
+- Mark pure constructors and getters `#[must_use]`; make trivial ones `const fn`.
+- Keep comments focused on why something is done, invariants, ordering, or security boundaries. Do not restate what a name or operation already says.
+- Name tests as behavior statements and keep them deterministic with local fixtures.
+
 ## A few project rules
 
 The Rust core should stay independent of egui and presentation code.

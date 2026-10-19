@@ -1732,6 +1732,7 @@ version = "0.1.0"
 dependencies = [
  "gunda-core",
  "gunda-http",
+ "gunda-stream",
  "sqlx",
  "tempfile",
  "time",
@@ -1748,6 +1749,7 @@ dependencies = [
  "gunda-core",
  "gunda-http",
  "tempfile",
+ "time",
  "tokio",
  "url",
 ]

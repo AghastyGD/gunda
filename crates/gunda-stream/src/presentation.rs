@@ -6,7 +6,10 @@
 //! read to describe a track, that playlist — so the choice can be made before a
 //! byte of media is fetched.
 
-use gunda_core::download::{DownloadFailure, RequestContext, RequestHeader};
+use std::cmp::Reverse;
+use std::str;
+
+use gunda_core::download::{DownloadFailure, ExecutionSelection, RequestContext, RequestHeader};
 use gunda_http::HttpClient;
 use url::Url;
 
@@ -16,7 +19,11 @@ use crate::executor::{
     manifest_failure, not_textual, open_manifest, output_filename, segment_request,
 };
 use crate::hls::{self, Playlist};
-use crate::plan::{HlsOutcome, TrackPlan, label_for_variant, plan_dash, plan_hls};
+use crate::plan::{
+    HlsOutcome, TrackPlan, audio_set_index, bandwidth_hint, best_representation_index,
+    label_for_variant, plan_dash_selected, plan_hls, select_set_index,
+};
+use crate::selection::{dash_selection, hls_selection};
 
 /// Most variants described by one inspection.
 ///
@@ -24,14 +31,13 @@ use crate::plan::{HlsOutcome, TrackPlan, label_for_variant, plan_dash, plan_hls}
 /// is remote input, so the work is bounded the same way the plan itself is.
 const MAX_DESCRIBED_VARIANTS: usize = 24;
 
-/// What a presentation offers.
 #[derive(Debug, Clone)]
 pub struct Presentation {
     tracks: Vec<PresentationTrack>,
 }
 
 impl Presentation {
-    /// The tracks the user can choose between, best first.
+    /// Best first.
     #[must_use]
     pub fn tracks(&self) -> &[PresentationTrack] {
         &self.tracks
@@ -43,7 +49,6 @@ impl Presentation {
     }
 }
 
-/// One quality or track of a presentation.
 #[derive(Debug, Clone)]
 pub struct PresentationTrack {
     label: String,
@@ -56,22 +61,20 @@ pub struct PresentationTrack {
     duration_millis: Option<u64>,
     size: TrackSize,
     container: Option<Container>,
+    selection: Option<ExecutionSelection>,
 }
 
 impl PresentationTrack {
-    /// A short description of the track for the user to choose by.
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
     }
 
-    /// Whether the track carries video, audio or neither.
     #[must_use]
     pub const fn kind(&self) -> TrackKind {
         self.kind
     }
 
-    /// The URL that downloads exactly this track.
     #[must_use]
     pub fn url(&self) -> &Url {
         &self.url
@@ -87,44 +90,43 @@ impl PresentationTrack {
         self.filename.as_deref()
     }
 
-    /// The declared frame size, when the manifest gives one.
     #[must_use]
     pub const fn resolution(&self) -> Option<(u32, u32)> {
         self.resolution
     }
 
-    /// The declared bitrate in bits per second, when the manifest gives one.
     #[must_use]
     pub const fn bandwidth(&self) -> Option<u64> {
         self.bandwidth
     }
 
-    /// The declared codec list, when the manifest gives one.
     #[must_use]
     pub fn codecs(&self) -> Option<&str> {
         self.codecs.as_deref()
     }
 
-    /// How long the track plays for.
     #[must_use]
     pub const fn duration_millis(&self) -> Option<u64> {
         self.duration_millis
     }
 
-    /// What is known about the track's final size.
     #[must_use]
     pub const fn size(&self) -> TrackSize {
         self.size
     }
 
-    /// The container the track's media is in, when it is known.
     #[must_use]
     pub const fn container(&self) -> Option<Container> {
         self.container
     }
+
+    /// Core stores it; the stream engine interprets it.
+    #[must_use]
+    pub const fn selection(&self) -> Option<&ExecutionSelection> {
+        self.selection.as_ref()
+    }
 }
 
-/// What is known about a track's final size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackSize {
     /// Every part declares its length, so the total is exactly known.
@@ -137,7 +139,6 @@ pub enum TrackSize {
 }
 
 impl TrackSize {
-    /// The byte count, when there is one.
     #[must_use]
     pub const fn bytes(self) -> Option<u64> {
         match self {
@@ -153,8 +154,6 @@ impl TrackSize {
     }
 }
 
-/// Reads a presentation and describes the tracks it offers.
-///
 /// Nothing is downloaded: the manifest is read, and each variant's playlist is
 /// read to report its duration and size. A presentation whose entry point is
 /// already one media playlist has exactly one track.
@@ -164,18 +163,12 @@ pub async fn inspect(
 ) -> Result<Presentation, DownloadFailure> {
     let (bytes, _) = open_manifest(client, request).await?;
     let base = request.url().clone();
-    let text = std::str::from_utf8(&bytes).map_err(|_| not_textual())?;
+    let text = str::from_utf8(&bytes).map_err(|_| not_textual())?;
 
     if !text.trim_start().starts_with("#EXTM3U") {
         let mpd = dash::parse(text).map_err(manifest_failure)?;
-        let plan = plan_dash(&base, &mpd).map_err(manifest_failure)?;
 
-        // A DASH presentation is addressed as a whole and the plan has already
-        // chosen the track, so this describes what a download would produce
-        // rather than a menu of representations.
-        return Ok(Presentation {
-            tracks: vec![track_from_plan(&base, &base, &plan)],
-        });
+        return described_dash_presentation(client, request, &base, &mpd).await;
     }
 
     let playlist = hls::parse(text).map_err(manifest_failure)?;
@@ -187,47 +180,15 @@ pub async fn inspect(
         Playlist::Master(master) => {
             let mut tracks = Vec::new();
 
-            // A variant whose audio is a rendition of its own carries no sound
-            // itself, and only the presentation knows which rendition belongs
-            // with which quality. Such a presentation is offered as a whole:
-            // its qualities cannot be downloaded one by one without each of
-            // them losing its sound.
-            let split = master
+            for (index, variant) in master
                 .variants()
                 .iter()
-                .any(|variant| master.default_audio_rendition(variant).is_some());
-
-            if split {
-                if let Some(track) = described_presentation(&base, client, request, master).await {
-                    tracks.push(track);
-                }
-            } else {
-                for (index, variant) in master
-                    .variants()
-                    .iter()
-                    .take(MAX_DESCRIBED_VARIANTS)
-                    .enumerate()
+                .take(MAX_DESCRIBED_VARIANTS)
+                .enumerate()
+            {
+                if let Some(track) =
+                    described_variant(client, request, &base, master, index, variant).await
                 {
-                    let Ok(url) = base.join(variant.uri()) else {
-                        continue;
-                    };
-
-                    let mut track = PresentationTrack {
-                        label: label_for_variant(variant)
-                            .unwrap_or_else(|| format!("Variant {}", index + 1)),
-                        kind: TrackKind::Video,
-                        url,
-                        filename: output_filename(&base, None),
-                        resolution: variant.resolution(),
-                        bandwidth: variant.bandwidth(),
-                        codecs: variant.codecs().map(str::to_owned),
-                        duration_millis: None,
-                        size: TrackSize::Unknown,
-                        container: None,
-                    };
-
-                    enrich(client, &base, request.headers(), &mut track).await;
-
                     tracks.push(track);
                 }
             }
@@ -251,7 +212,7 @@ pub async fn inspect(
                 let mut track = PresentationTrack {
                     label: rendition_label(rendition),
                     kind: TrackKind::Audio,
-                    url,
+                    url: url.clone(),
                     filename: output_filename(&base, None),
                     resolution: None,
                     bandwidth: None,
@@ -259,82 +220,284 @@ pub async fn inspect(
                     duration_millis: None,
                     size: TrackSize::Unknown,
                     container: None,
+                    selection: None,
                 };
 
-                enrich(client, &base, request.headers(), &mut track).await;
+                enrich(client, &base, &url, request.headers(), &mut track).await;
 
                 tracks.push(track);
             }
+
+            sort_tracks(&mut tracks);
 
             Ok(Presentation { tracks })
         }
     }
 }
 
-/// Describes a presentation whose variants carry no audio of their own.
-///
-/// The best variant is read to report what the presentation amounts to, and the
-/// audio rendition that belongs with it is read too, because both are part of
-/// the download and the size of one without the other would be a lie.
-async fn described_presentation(
-    base: &Url,
+async fn described_variant(
     client: &HttpClient,
     request: &RequestContext,
+    manifest: &Url,
     master: &hls::MasterPlaylist,
+    index: usize,
+    variant: &hls::Variant,
 ) -> Option<PresentationTrack> {
-    let variant = master.best_variant()?;
-    let headers = request.headers();
-
+    let playlist_url = manifest.join(variant.uri()).ok()?;
+    let audio_url = master
+        .default_audio_rendition(variant)
+        .and_then(hls::Rendition::uri)
+        .and_then(|uri| manifest.join(uri).ok());
+    let selection = hls_selection(index, variant).ok()?;
     let mut track = PresentationTrack {
-        label: label_for_variant(variant).unwrap_or_else(|| "Best quality".to_owned()),
+        label: label_for_variant(variant).unwrap_or_else(|| format!("Variant {}", index + 1)),
         kind: TrackKind::Video,
-        url: base.join(variant.uri()).ok()?,
-        filename: output_filename(base, None),
+        url: manifest.clone(),
+        filename: output_filename(manifest, None),
         resolution: variant.resolution(),
         bandwidth: variant.bandwidth(),
         codecs: variant.codecs().map(str::to_owned),
         duration_millis: None,
         size: TrackSize::Unknown,
         container: None,
+        selection: Some(selection),
     };
 
-    enrich(client, base, headers, &mut track).await;
+    enrich(
+        client,
+        manifest,
+        &playlist_url,
+        request.headers(),
+        &mut track,
+    )
+    .await;
 
-    if let Some(uri) = master
-        .default_audio_rendition(variant)
-        .and_then(hls::Rendition::uri)
-    {
+    if let Some(audio_url) = audio_url {
         let mut audio = PresentationTrack {
             label: String::new(),
             kind: TrackKind::Audio,
-            url: base.join(uri).ok()?,
-            filename: output_filename(base, None),
+            url: audio_url.clone(),
+            filename: output_filename(manifest, None),
             resolution: None,
             bandwidth: None,
             codecs: None,
             duration_millis: None,
             size: TrackSize::Unknown,
             container: None,
+            selection: None,
         };
 
-        enrich(client, base, headers, &mut audio).await;
+        enrich(client, manifest, &audio_url, request.headers(), &mut audio).await;
 
         track.size = combine_sizes(track.size, audio.size);
         track.duration_millis = track.duration_millis.max(audio.duration_millis);
+        track.label = format!("{} with audio", track.label);
     }
 
-    // The download is the whole presentation, because a variant's own playlist
-    // would fetch the picture without its sound.
-    track.label = format!("{} with audio", track.label);
-    track.url = base.clone();
-    track.filename = output_filename(base, track.container);
+    track.filename = output_filename(manifest, track.container);
 
     Some(track)
 }
 
-/// Combines the size of a picture with the size of the sound that belongs with
-/// it.
-///
+async fn described_dash_presentation(
+    _client: &HttpClient,
+    _request: &RequestContext,
+    base: &Url,
+    mpd: &dash::Mpd,
+) -> Result<Presentation, DownloadFailure> {
+    let period = mpd.media_period().map_err(manifest_failure)?;
+
+    if mpd.kind() == dash::MpdKind::Dynamic {
+        return Err(manifest_failure(
+            crate::error::UnsupportedFeature::IncompletePresentation.into(),
+        ));
+    }
+
+    let duration = period.duration_millis().or_else(|| mpd.duration_millis());
+    let mut video_set = None;
+    let mut audio_set = audio_set_index(period);
+
+    if let Some(index) = select_set_index(period) {
+        if period.adaptation_sets()[index].kind() == TrackKind::Video {
+            video_set = Some(index);
+        } else {
+            audio_set = Some(index);
+        }
+    }
+
+    if video_set.is_none() && audio_set.is_none() {
+        return Err(manifest_failure(crate::error::ManifestError::Malformed));
+    }
+
+    let mut tracks = Vec::new();
+    let audio_choice = audio_set.and_then(|set| {
+        best_representation_index(&period.adaptation_sets()[set]).map(|representation| {
+            (
+                set,
+                representation,
+                period.adaptation_sets()[set].representations()[representation].bandwidth(),
+            )
+        })
+    });
+
+    if let Some(set_index) = video_set {
+        let set = &period.adaptation_sets()[set_index];
+
+        for (index, representation) in set
+            .representations()
+            .iter()
+            .take(MAX_DESCRIBED_VARIANTS)
+            .enumerate()
+        {
+            let selection = dash_selection(
+                Some((set_index, index, representation.bandwidth())),
+                audio_choice,
+            )
+            .map_err(manifest_failure)?;
+            let plan = plan_dash_selected(base, mpd, Some(&selection)).ok();
+            let mut track = described_dash_track(DashTrackDescription {
+                base,
+                representation,
+                kind: TrackKind::Video,
+                label: dash_video_label(representation),
+                selection,
+                plan: plan.as_ref(),
+                duration,
+                estimate_bandwidth: combined_bandwidth(representation.bandwidth(), audio_choice),
+            });
+
+            if audio_choice.is_some() {
+                track.label = format!("{} with audio", track.label);
+            }
+
+            tracks.push(track);
+        }
+    }
+
+    if let Some(set_index) = audio_set {
+        let set = &period.adaptation_sets()[set_index];
+
+        for (index, representation) in set
+            .representations()
+            .iter()
+            .take(MAX_DESCRIBED_VARIANTS)
+            .enumerate()
+        {
+            let selection =
+                dash_selection(None, Some((set_index, index, representation.bandwidth())))
+                    .map_err(manifest_failure)?;
+            let plan = plan_dash_selected(base, mpd, Some(&selection)).ok();
+
+            tracks.push(described_dash_track(DashTrackDescription {
+                base,
+                representation,
+                kind: TrackKind::Audio,
+                label: dash_audio_label(set, representation),
+                selection,
+                plan: plan.as_ref(),
+                duration,
+                estimate_bandwidth: representation.bandwidth(),
+            }));
+        }
+    }
+
+    sort_tracks(&mut tracks);
+
+    Ok(Presentation { tracks })
+}
+
+/// Puts video qualities first, best first, and keeps audio-only tracks after.
+fn sort_tracks(tracks: &mut [PresentationTrack]) {
+    tracks.sort_by_key(|track| {
+        (
+            u8::from(track.kind() != TrackKind::Video),
+            Reverse(track.bandwidth().unwrap_or(0)),
+        )
+    });
+}
+
+struct DashTrackDescription<'a> {
+    base: &'a Url,
+    representation: &'a dash::Representation,
+    kind: TrackKind,
+    label: String,
+    selection: ExecutionSelection,
+    plan: Option<&'a TrackPlan>,
+    duration: Option<u64>,
+    estimate_bandwidth: Option<u64>,
+}
+
+fn described_dash_track(description: DashTrackDescription<'_>) -> PresentationTrack {
+    let DashTrackDescription {
+        base,
+        representation,
+        kind,
+        label,
+        selection,
+        plan,
+        duration,
+        estimate_bandwidth,
+    } = description;
+    let container = plan.and_then(TrackPlan::container_hint);
+    let duration_millis = plan.and_then(TrackPlan::duration_millis).or(duration);
+    let size = plan
+        .and_then(TrackPlan::known_total_bytes)
+        .map(TrackSize::Exact)
+        .unwrap_or_else(|| match (estimate_bandwidth, duration_millis) {
+            (Some(bandwidth), Some(duration)) => {
+                TrackSize::Estimated(bandwidth.saturating_mul(duration) / 8000)
+            }
+            _ => TrackSize::Unknown,
+        });
+
+    PresentationTrack {
+        label,
+        kind,
+        url: base.clone(),
+        filename: output_filename(base, container),
+        resolution: representation.resolution(),
+        bandwidth: representation.bandwidth(),
+        codecs: representation.codecs().map(str::to_owned),
+        duration_millis,
+        size,
+        container,
+        selection: Some(selection),
+    }
+}
+
+fn combined_bandwidth(
+    video: Option<u64>,
+    audio: Option<(usize, usize, Option<u64>)>,
+) -> Option<u64> {
+    match (video, audio.and_then(|(_, _, bandwidth)| bandwidth)) {
+        (Some(video), Some(audio)) => Some(video.saturating_add(audio)),
+        (Some(video), None) => Some(video),
+        (None, Some(audio)) => Some(audio),
+        (None, None) => None,
+    }
+}
+
+fn dash_video_label(representation: &dash::Representation) -> String {
+    match (representation.resolution(), representation.id()) {
+        (Some((width, height)), Some(id)) => format!("{width}x{height} ({id})"),
+        (Some((width, height)), None) => format!("{width}x{height}"),
+        (None, Some(id)) => id.to_owned(),
+        (None, None) => "Video".to_owned(),
+    }
+}
+
+fn dash_audio_label(set: &dash::AdaptationSet, representation: &dash::Representation) -> String {
+    let label = set.language().map_or_else(
+        || "Audio".to_owned(),
+        |language| format!("Audio ({language})"),
+    );
+
+    match representation.bandwidth() {
+        Some(bandwidth) => format!("{label} · {}", bandwidth_hint(bandwidth)),
+        None => label,
+    }
+}
+
 /// A sum is only exact when both halves are; anything less would report a
 /// precision the parts do not have.
 fn combine_sizes(video: TrackSize, audio: TrackSize) -> TrackSize {
@@ -354,8 +517,6 @@ fn combine_sizes(video: TrackSize, audio: TrackSize) -> TrackSize {
     }
 }
 
-/// Describes a presentation whose entry point is a single playlist.
-///
 /// The playlist has already been parsed by the caller, so it is planned from
 /// that rather than read a second time.
 fn described_playlist(base: &Url, playlist: &Playlist) -> PresentationTrack {
@@ -375,11 +536,11 @@ fn described_playlist(base: &Url, playlist: &Playlist) -> PresentationTrack {
             duration_millis: None,
             size: TrackSize::Unknown,
             container: None,
+            selection: None,
         },
     }
 }
 
-/// Describes what a plan would download, as one selectable track.
 fn track_from_plan(manifest: &Url, url: &Url, plan: &TrackPlan) -> PresentationTrack {
     let container = plan.container_hint();
     let kind = kind_of(container);
@@ -397,43 +558,42 @@ fn track_from_plan(manifest: &Url, url: &Url, plan: &TrackPlan) -> PresentationT
         duration_millis: plan.duration_millis(),
         size: size_of(plan, None, plan.duration_millis()),
         container,
+        selection: None,
     }
 }
 
-/// Reads a variant's media playlist and fills in what it says about the track.
-///
 /// A playlist that cannot be read or planned leaves the track described by its
 /// variant declaration alone. That is deliberate: the download reports the
 /// reason a track cannot be fetched, and hiding an option the user might still
 /// want would be worse than listing one that may fail.
 async fn enrich(
     client: &HttpClient,
-    base: &Url,
+    manifest: &Url,
+    playlist_url: &Url,
     headers: &[RequestHeader],
     track: &mut PresentationTrack,
 ) {
-    let request = segment_request(&track.url, base, headers);
+    let request = segment_request(playlist_url, manifest, headers);
 
     let Ok((bytes, _)) = open_manifest(client, &request).await else {
         return;
     };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
+    let Ok(text) = str::from_utf8(&bytes) else {
         return;
     };
     let Ok(playlist) = hls::parse(text) else {
         return;
     };
-    let Ok(HlsOutcome::Ready(plan)) = plan_hls(&track.url, &playlist) else {
+    let Ok(HlsOutcome::Ready(plan)) = plan_hls(playlist_url, &playlist) else {
         return;
     };
 
     track.duration_millis = plan.duration_millis();
     track.container = plan.container_hint();
-    track.filename = output_filename(base, track.container);
+    track.filename = output_filename(manifest, track.container);
     track.size = size_of(&plan, track.bandwidth, track.duration_millis);
 }
 
-/// What a track's size is, given what the plan and the bitrate say.
 fn size_of(plan: &TrackPlan, bandwidth: Option<u64>, duration_millis: Option<u64>) -> TrackSize {
     if let Some(total) = plan.known_total_bytes() {
         return TrackSize::Exact(total);
@@ -450,7 +610,6 @@ fn size_of(plan: &TrackPlan, bandwidth: Option<u64>, duration_millis: Option<u64
     }
 }
 
-/// The media kind a container implies.
 fn kind_of(container: Option<Container>) -> TrackKind {
     match container {
         Some(Container::M4a | Container::Aac | Container::Mp3) => TrackKind::Audio,
@@ -461,7 +620,6 @@ fn kind_of(container: Option<Container>) -> TrackKind {
     }
 }
 
-/// A name for a track kind.
 fn kind_label(kind: TrackKind) -> &'static str {
     match kind {
         TrackKind::Video => "Video",
@@ -471,7 +629,7 @@ fn kind_label(kind: TrackKind) -> &'static str {
     }
 }
 
-/// A name for an audio rendition, preferring the one the manifest gives it.
+/// Prefers the name and language the manifest gives the rendition.
 fn rendition_label(rendition: &hls::Rendition) -> String {
     match (rendition.name(), rendition.language()) {
         (Some(name), Some(language)) => format!("{name} ({language})"),

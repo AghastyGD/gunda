@@ -179,11 +179,15 @@ fn row(
     .on_hover_text(details);
 
     ui.horizontal(|ui| {
-        if ui.button("Download").clicked() {
+        if capture.segmented {
+            if ui.button("Qualities").clicked() {
+                actions.inspect = Some(capture.id);
+            }
+            if ui.button("Best quality").clicked() {
+                actions.download = Some(capture.id);
+            }
+        } else if ui.button("Download").clicked() {
             actions.download = Some(capture.id);
-        }
-        if capture.segmented && ui.button("Qualities").clicked() {
-            actions.inspect = Some(capture.id);
         }
         if ui.button("Dismiss").clicked() {
             actions.dismiss = Some(capture.id);
@@ -230,6 +234,7 @@ fn tracks_of(
                         TrackChoice {
                             url: track.url.clone(),
                             filename: track.filename.clone(),
+                            selection: track.selection.clone(),
                         },
                     ));
                 }

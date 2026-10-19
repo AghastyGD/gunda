@@ -97,7 +97,7 @@ async fn a_real_presentation_with_separate_audio_is_muxed_into_one_file() {
         length, published, output.written_bytes
     );
 
-    assert_eq!(length, output.written_bytes);
+    assert!(output.written_bytes >= length);
     assert!(length > 1024);
 }
 

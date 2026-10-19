@@ -8,6 +8,7 @@
 use super::*;
 
 use gunda_capture::{Catalog, Report};
+use gunda_stream::StreamResumeStore;
 
 /// A master playlist offering one quality, so the choice is unambiguous.
 const TRACK_MASTER: &str = "#EXTM3U\n\
@@ -19,6 +20,30 @@ const TRACK_VARIANT: &str = "#EXTM3U\n\
 #EXT-X-MAP:URI=\"init.mp4\"\n\
 #EXTINF:4,\n\
 s0.m4s\n\
+#EXT-X-ENDLIST\n";
+
+const QUALITY_MASTER: &str = "#EXTM3U\n\
+#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\n\
+low.m3u8\n\
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080\n\
+high.m3u8\n";
+
+const LOW_VARIANT: &str = "#EXTM3U\n\
+#EXT-X-MAP:URI=\"low-init.mp4\"\n\
+#EXTINF:4,\n\
+low0.m4s\n\
+#EXT-X-ENDLIST\n";
+
+const HIGH_VARIANT: &str = "#EXTM3U\n\
+#EXT-X-MAP:URI=\"high-init.mp4\"\n\
+#EXTINF:4,\n\
+high0.m4s\n\
+#EXT-X-ENDLIST\n";
+
+const SPLIT_PLAYLIST: &str = "#EXTM3U\n\
+#EXTINF:1,\ns0.ts\n\
+#EXTINF:1,\ns1.ts\n\
+#EXTINF:1,\ns2.ts\n\
 #EXT-X-ENDLIST\n";
 
 #[test]
@@ -235,7 +260,8 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
         track.details
     );
     assert_eq!(track.filename.as_deref(), Some("master.mp4"));
-    assert!(track.url.as_str().ends_with("/low.m3u8"));
+    assert_eq!(track.url, master);
+    assert!(track.selection.is_some());
 
     backend
         .send(Command::Capture {
@@ -244,6 +270,7 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
             track: Some(TrackChoice {
                 url: track.url.clone(),
                 filename: track.filename.clone(),
+                selection: track.selection.clone(),
             }),
         })
         .unwrap();
@@ -264,6 +291,172 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
     assert_eq!(written.file_name().unwrap(), "master.mp4");
     assert_eq!(std::fs::read(written).unwrap(), b"INITSEG0");
     assert!(completed.capture_tracks.is_none());
+}
+
+#[tokio::test]
+async fn choosing_a_lower_quality_downloads_that_variant() {
+    let data = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let base = serve_routes(&[
+        (
+            "/master.m3u8",
+            "application/vnd.apple.mpegurl",
+            QUALITY_MASTER.as_bytes(),
+        ),
+        (
+            "/low.m3u8",
+            "application/vnd.apple.mpegurl",
+            LOW_VARIANT.as_bytes(),
+        ),
+        (
+            "/high.m3u8",
+            "application/vnd.apple.mpegurl",
+            HIGH_VARIANT.as_bytes(),
+        ),
+        ("/low-init.mp4", "video/mp4", b"LOWINIT"),
+        ("/low0.m4s", "video/mp4", b"LOWSEG"),
+        ("/high-init.mp4", "video/mp4", b"HIGHINIT"),
+        ("/high0.m4s", "video/mp4", b"HIGHSEG"),
+    ])
+    .await;
+    let master = base.join("master.m3u8").unwrap();
+
+    let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+    wait_for(&mut backend, |snapshot| {
+        snapshot.ready && snapshot.capture.is_some()
+    })
+    .await;
+    let status = backend.snapshots.borrow().capture.clone().unwrap();
+    let mut extension = Extension::connect(&status.endpoint).await;
+
+    extension.greet(&status.token).await;
+    extension
+        .report(master.as_str(), "application/vnd.apple.mpegurl")
+        .await;
+
+    let captured = wait_for(&mut backend, |snapshot| !snapshot.captures.is_empty()).await;
+    let view = &captured.captures[0];
+    backend.send(Command::Inspect(view.id)).unwrap();
+
+    let inspected = wait_for(&mut backend, |snapshot| snapshot.capture_tracks.is_some()).await;
+    let tracks = &inspected.capture_tracks.as_ref().unwrap().tracks;
+
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].label, "1920x1080 (5.0 Mbps)");
+    assert_eq!(tracks[1].label, "640x360 (1.0 Mbps)");
+
+    let chosen = tracks[1].clone();
+    backend
+        .send(Command::Capture {
+            id: view.id,
+            directory: output.path().into(),
+            track: Some(TrackChoice {
+                url: chosen.url,
+                filename: chosen.filename,
+                selection: chosen.selection,
+            }),
+        })
+        .unwrap();
+
+    let completed = wait_for(&mut backend, |snapshot| {
+        !snapshot.busy
+            && snapshot
+                .jobs
+                .first()
+                .is_some_and(|view| view.state == DownloadState::Completed)
+    })
+    .await;
+    let job = &completed.jobs[0];
+    let written = job.output.as_ref().expect("the download is published");
+
+    assert_eq!(std::fs::read(written).unwrap(), b"LOWINITLOWSEG");
+
+    let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
+        .await
+        .unwrap();
+    let saved = repository.find_by_id(job.id).await.unwrap().unwrap();
+
+    assert!(saved.request().selection().is_some());
+}
+
+#[tokio::test]
+async fn a_segmented_download_pauses_and_resumes_from_its_checkpoint() {
+    let data = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let base = serve_delayed_routes(
+        &[
+            (
+                "/media.m3u8",
+                "application/vnd.apple.mpegurl",
+                SPLIT_PLAYLIST.as_bytes(),
+            ),
+            ("/s0.ts", "video/mp2t", b"SEG0"),
+            ("/s1.ts", "video/mp2t", b"SEG1"),
+            ("/s2.ts", "video/mp2t", b"SEG2"),
+        ],
+        "/s1.ts",
+    )
+    .await;
+    let entry = base.join("media.m3u8").unwrap();
+    let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+
+    wait_for(&mut backend, |snapshot| snapshot.ready).await;
+    backend
+        .send(Command::Start {
+            url: entry,
+            directory: output.path().into(),
+        })
+        .unwrap();
+
+    let running = wait_for(&mut backend, |snapshot| {
+        snapshot.jobs.first().is_some_and(|view| view.written >= 4)
+            && snapshot.pause_supported
+            && snapshot.active.is_some()
+    })
+    .await;
+    let id = running.active.expect("the stream is active");
+
+    assert!(backend.pause(id), "the segmented transfer must be pausable");
+
+    let paused = wait_for(&mut backend, |snapshot| {
+        snapshot
+            .jobs
+            .first()
+            .is_some_and(|view| view.state == DownloadState::Paused && view.resume_available)
+    })
+    .await;
+    let paused_job = &paused.jobs[0];
+    assert_eq!(paused_job.written, 4);
+
+    let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
+        .await
+        .unwrap();
+    let state = repository
+        .stream_resume_store()
+        .find(id)
+        .await
+        .unwrap()
+        .expect("the checkpoint survives the pause");
+    assert_eq!(state.tracks()[0].next_resource(), 1);
+    assert_eq!(state.tracks()[0].durable_bytes(), 4);
+    repository.close().await;
+
+    backend.send(Command::Resume(id)).unwrap();
+
+    let completed = wait_for(&mut backend, |snapshot| {
+        !snapshot.busy
+            && snapshot
+                .jobs
+                .first()
+                .is_some_and(|view| view.state == DownloadState::Completed)
+    })
+    .await;
+    let written = completed.jobs[0]
+        .output
+        .as_ref()
+        .expect("the resumed download is published");
+
+    assert_eq!(std::fs::read(written).unwrap(), b"SEG0SEG1SEG2");
 }
 
 /// Serves several paths, as an origin carrying a presentation does.
@@ -297,6 +490,61 @@ async fn serve_routes(routes: &[(&str, &str, &[u8])]) -> Url {
 
             let response = match routes.iter().find(|(route, _, _)| *route == path) {
                 Some((_, content_type, body)) => {
+                    let mut response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .into_bytes();
+
+                    response.extend_from_slice(body);
+                    response
+                }
+                None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
+                          connection: close\r\n\r\n"
+                    .to_vec(),
+            };
+
+            let _ = socket.write_all(&response).await;
+        }
+    });
+
+    Url::parse(&format!("http://{address}/")).unwrap()
+}
+
+/// Serves routes and holds one response body back long enough to pause there.
+async fn serve_delayed_routes(routes: &[(&str, &str, &[u8])], delayed: &str) -> Url {
+    let routes: Vec<(String, String, Vec<u8>, bool)> = routes
+        .iter()
+        .map(|(path, content_type, body)| {
+            (
+                (*path).to_owned(),
+                (*content_type).to_owned(),
+                body.to_vec(),
+                *path == delayed,
+            )
+        })
+        .collect();
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let request = read_request(&mut socket).await;
+            let head = String::from_utf8_lossy(&request);
+            let path = head.split_whitespace().nth(1).unwrap_or("/").to_owned();
+
+            let response = match routes.iter().find(|(route, _, _, _)| *route == path) {
+                Some((_, content_type, body, delayed)) => {
+                    if *delayed {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    }
+
                     let mut response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
                          content-length: {}\r\nconnection: close\r\n\r\n",

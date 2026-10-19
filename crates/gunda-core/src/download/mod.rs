@@ -6,6 +6,7 @@ mod origin;
 mod progress;
 mod request;
 mod resource;
+mod selection;
 mod state;
 
 pub use destination::{DownloadDestination, FileConflictPolicy, ResolvedDestination};
@@ -16,4 +17,5 @@ pub use origin::DownloadOrigin;
 pub use progress::{DownloadProgress, InvalidDownloadProgress};
 pub use request::{HeaderSensitivity, RequestContext, RequestHeader};
 pub use resource::{ResourceDescriptor, ResourceKind};
+pub use selection::{ExecutionSelection, InvalidExecutionSelection};
 pub use state::{DownloadState, InvalidStateTransition};

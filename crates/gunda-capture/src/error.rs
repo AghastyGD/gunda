@@ -1,5 +1,6 @@
 //! Capture failure types.
 
+use std::error::Error;
 use std::fmt;
 use std::io;
 
@@ -45,7 +46,7 @@ impl fmt::Display for CaptureError {
     }
 }
 
-impl std::error::Error for CaptureError {}
+impl Error for CaptureError {}
 
 impl From<WebSocketError> for CaptureError {
     fn from(error: WebSocketError) -> Self {

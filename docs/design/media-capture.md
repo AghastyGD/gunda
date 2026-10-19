@@ -126,12 +126,14 @@ Implemented today:
   larger file is fetched with `bytes=first-last` and only that interval is
   appended, so single-file HLS playlists and DASH `SegmentList` work. A plan of
   two tracks is fetched into `.part.video` and `.part.audio` and then muxed into
-  the partial file (section 3.3); those staging files are removed whatever
-  happens, through `StagingTracks`. Progress is reported as bytes are appended,
-  the staging file is created exclusively (never replacing an existing path),
-  cancellation is checked between resources, and publication goes through
-  `finalize_download` so filename validation and conflict policy are shared with
-  plain HTTP downloads rather than reimplemented.
+  the partial file (section 3.3); those staging files are removed after a
+  successful publication, and kept when a paused transfer can resume. Progress
+  is reported as bytes are appended, a new attempt creates staging exclusively,
+  resume opens it and truncates any uncheckpointed suffix, cancellation is
+  observed while a resource body is arriving and between resources, and
+  publication goes through `finalize_download` so filename validation and
+  conflict policy are shared with plain HTTP downloads rather than
+  reimplemented.
 - `mux`: a fragmented-MP4 demuxer and a plain-MP4 writer, with no codec
   knowledge and no external tool. See section 3.3.
 - `container`: the media's container is read from the media itself. The first
@@ -148,17 +150,16 @@ Implemented today:
   plays rather than what codec it holds. Nothing is guessed: an unrecognised
   stream whose format implies nothing is named `.bin`.
 - `presentation`: `inspect` describes what a presentation offers, without
-  downloading any media — for HLS, one track per `EXT-X-STREAM-INF` variant and
-  per `TYPE=AUDIO` rendition that has a playlist of its own, each with its own
-  URL, resolution, bandwidth, codecs, duration and size. Describing a variant
-  costs one request for its playlist, so the number described is capped
-  (`MAX_DESCRIBED_VARIANTS`). A variant that names an audio rendition carries no
-  sound itself, and only the presentation knows which rendition belongs with
-  which quality: such a presentation is therefore described as **one track** —
-  its best quality with the rendition the presentation pairs it with, sized as
-  the sum of both — because offering the qualities one by one would offer silent
-  downloads. Its separately addressable audio renditions are still tracks of
-  their own.
+  downloading any media. For HLS it describes one track per
+  `EXT-X-STREAM-INF` variant, each with the rendition the presentation pairs
+  with it, plus each `TYPE=AUDIO` rendition that has a playlist of its own. A
+  variant whose sound is a separate rendition is therefore still offered at
+  every quality: its reported size and duration combine both halves, and the
+  download carries a selector rather than the variant's own playlist URL. For
+  DASH it describes every representation of the chosen video adaptation set
+  with the default audio representation, plus audio-only tracks. Describing an
+  HLS variant costs one request for its playlist, so the number described is
+  capped (`MAX_DESCRIBED_VARIANTS`).
 
 Two decisions the naming and sizing rest on:
 
@@ -197,9 +198,12 @@ instead of showing a generic failure.
 Known execution-time limits, which are typed failures rather than silent
 approximation:
 
-- **No resume.** `supports_pause()` is `false`: the engine has no record of
-  which planned resources are already staged, so pausing and resuming would
-  re-download or corrupt output.
+- **Resume is segment-boundary only.** The durable checkpoint records how many
+  resources of each track are complete. Pausing inside a segment truncates its
+  uncheckpointed bytes, so that one segment is fetched again. The plan
+  fingerprint ignores common signing query parameters so rotating signatures do
+  not invalidate a checkpoint; a changed path, non-signature query, byte
+  interval, or track count is refused rather than resumed.
 
 ## 3.1 Seams added to `gunda-http`
 
@@ -422,7 +426,7 @@ Limits, all typed (`MuxError`) rather than approximated:
 | A transport stream carries one track | The demuxer reads the packet stream's single elementary track. A file that holds both picture and sound is refused, so each track is staged on its own before muxing. |
 | Transport streams limited to H.264 and AAC | HEVC (stream type `0x24`), MPEG audio (`0x03`/`0x04`) and Dolby (`0x81`/`0x87`) are refused with a typed message rather than mislabeled. |
 | No Matroska writer yet | `.mkv` remains a later step; MP4 covers what YouTube serves (fMP4 with H.264/HEVC/AV1/VP9 + AAC/Opus). |
-| No separate mux progress | Muxing runs after the last byte arrives and is not reported as its own phase; progress reaches the fetched total and then jumps to the muxed total. |
+| No separate mux progress | Muxing runs after the last byte arrives and is not reported as its own phase; progress counts fetched bytes, while the published file can be smaller because initialization data and container headers are not media. |
 
 ### Evidence that it produces a real file
 
@@ -531,22 +535,22 @@ Done:
    audio), including packed ADTS audio behind ID3v2 tags, so the split HLS that
    YouTube serves is muxed as well. Verified against real presentations with
    Windows' own media stack (section 3.3).
+8. **Track selection inside one manifest:** `inspect` describes each HLS
+   variant with its paired audio rendition and each DASH representation with
+   its audio set. The choice is persisted as a small, URL-free
+   `ExecutionSelection` on the request and re-resolved when the job executes.
+9. **Segmented resume:** `stream_resume_state` and `stream_resume_tracks`
+   persist the plan fingerprint and each track's next resource and durable byte
+   count. Pause keeps staging, cancels and restarts remove it, and resumed
+   downloads truncate any bytes beyond the last checkpoint before continuing.
 
 Next, in order:
 
-1. **Track selection inside one manifest.** A DASH representation or an HLS
-   variant's audio rendition is not separately addressable, so a chosen quality
-   cannot yet be muxed with its own rendition — `inspect` offers the whole
-   presentation instead, which downloads the best quality. Reaching the plan
-   with the chosen variant (a field on `RequestContext`, carried through the
-   browser-origin job) lifts that restriction.
-2. **A Matroska writer** (`.mkv`, EBML with `vp09`/`opus`/`av1`), so a Matroska
+1. **A Matroska writer** (`.mkv`, EBML with `vp09`/`opus`/`av1`), so a Matroska
    pair can be muxed as well; and HEVC in a transport stream, which is currently
    refused.
-3. **64-bit boxes (`co64`)**, lifting the 4 GiB limit on muxed downloads.
-4. Desktop: surface the per-download refusal reason.
-5. Segmented resume: a segment-index checkpoint table following
-   `SqliteHttpResumeStore`, then `supports_pause()` returns `true`.
-6. Optional: AES-128 HLS decryption, live capture for
+2. **64-bit boxes (`co64`)**, lifting the 4 GiB limit on muxed downloads.
+3. Desktop: surface the per-download refusal reason.
+4. Optional: AES-128 HLS decryption, live capture for
    `IncompletePresentation`, a Firefox manifest variant for the extension
    (`background.scripts` instead of a service worker).

@@ -546,6 +546,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                     url: Url::parse("https://cdn.example.com/1080/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
+                    selection: None,
                 },
                 TrackView {
                     label: "English (en)".into(),
@@ -553,6 +554,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                     url: Url::parse("https://cdn.example.com/audio/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
+                    selection: None,
                 },
             ],
             problem: None,

@@ -17,6 +17,8 @@ pub enum ManifestError {
     InvalidByteRange,
     /// A numeric attribute could not be represented.
     InvalidNumber,
+    /// The selected track is no longer present in the manifest.
+    SelectionUnavailable,
     /// A recognized feature that this engine refuses to guess about.
     Unsupported(UnsupportedFeature),
 }
@@ -65,6 +67,9 @@ impl fmt::Display for ManifestError {
             }
             Self::InvalidByteRange => f.write_str("the manifest declares an invalid byte range"),
             Self::InvalidNumber => f.write_str("the manifest declares an invalid number"),
+            Self::SelectionUnavailable => {
+                f.write_str("the selected quality is no longer available")
+            }
             Self::Unsupported(feature) => write!(f, "{feature}"),
         }
     }

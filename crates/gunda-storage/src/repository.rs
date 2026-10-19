@@ -5,9 +5,9 @@ use std::time::Duration;
 use gunda_core::application::{DownloadRepository, RepositoryError, RepositoryErrorKind};
 use gunda_core::download::{
     DownloadDestination, DownloadFailure, DownloadId, DownloadJob, DownloadJobSnapshot,
-    DownloadOrigin, DownloadProgress, DownloadState, FailureKind, FileConflictPolicy,
-    HeaderSensitivity, NewDownload, RequestContext, RequestHeader, ResolvedDestination,
-    ResourceDescriptor, ResourceKind,
+    DownloadOrigin, DownloadProgress, DownloadState, ExecutionSelection, FailureKind,
+    FileConflictPolicy, HeaderSensitivity, NewDownload, RequestContext, RequestHeader,
+    ResolvedDestination, ResourceDescriptor, ResourceKind,
 };
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow};
@@ -83,6 +83,11 @@ impl SqliteDownloadRepository {
     pub fn http_resume_store(&self) -> crate::SqliteHttpResumeStore {
         crate::SqliteHttpResumeStore::new(self.pool.clone())
     }
+
+    #[must_use]
+    pub fn stream_resume_store(&self) -> crate::SqliteStreamResumeStore {
+        crate::SqliteStreamResumeStore::new(self.pool.clone())
+    }
 }
 
 impl DownloadRepository for SqliteDownloadRepository {
@@ -154,7 +159,8 @@ impl DownloadRepository for SqliteDownloadRepository {
                 resource_content_type,
                 last_failure_kind,
                 last_failure_message,
-                last_failure_retryable
+                last_failure_retryable,
+                execution_selection
             FROM downloads
             WHERE id = $1
             "#,
@@ -219,7 +225,8 @@ impl DownloadRepository for SqliteDownloadRepository {
                 resource_content_type,
                 last_failure_kind,
                 last_failure_message,
-                last_failure_retryable
+                last_failure_retryable,
+                execution_selection
             FROM downloads
             ORDER BY id
             "#,
@@ -397,6 +404,7 @@ struct StoredDownload {
     last_failure_kind: Option<String>,
     last_failure_message: Option<String>,
     last_failure_retryable: Option<i64>,
+    execution_selection: Option<String>,
 }
 
 impl StoredDownload {
@@ -423,6 +431,7 @@ impl StoredDownload {
                 last_failure_kind: row.try_get("last_failure_kind")?,
                 last_failure_message: row.try_get("last_failure_message")?,
                 last_failure_retryable: row.try_get("last_failure_retryable")?,
+                execution_selection: row.try_get("execution_selection")?,
             })
         };
 
@@ -443,8 +452,20 @@ impl StoredDownload {
 
         let conflict_policy = decode_conflict_policy(&self.conflict_policy)?;
 
+        let selection = self
+            .execution_selection
+            .as_deref()
+            .map(ExecutionSelection::new)
+            .transpose()
+            .map_err(|_| invalid_data("stored execution selection is invalid"))?;
+
+        let mut request = RequestContext::new(url, headers);
+        if let Some(selection) = selection {
+            request = request.with_selection(selection);
+        }
+
         Ok(NewDownload::new(
-            RequestContext::new(url, headers),
+            request,
             DownloadDestination::new(directory, self.preferred_filename.clone(), conflict_policy),
             origin,
         ))
@@ -585,8 +606,19 @@ async fn insert_download(
     .await
     .map_err(|_| internal_error("could not insert download record"))?;
 
-    DownloadId::new(result.last_insert_rowid())
-        .map_err(|_| invalid_data("database returned an invalid download ID"))
+    let id = DownloadId::new(result.last_insert_rowid())
+        .map_err(|_| invalid_data("database returned an invalid download ID"))?;
+
+    if let Some(selection) = download.request().selection() {
+        sqlx::query("UPDATE downloads SET execution_selection = $1 WHERE id = $2")
+            .bind(selection.as_str())
+            .bind(id.value())
+            .execute(&mut **transaction)
+            .await
+            .map_err(|_| internal_error("could not store the execution selection"))?;
+    }
+
+    Ok(id)
 }
 
 async fn insert_headers(

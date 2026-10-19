@@ -98,6 +98,24 @@ const RANGED_DASH: &str = r#"<MPD type="static">
   </Period>
 </MPD>"#;
 
+const MULTI_DASH: &str = r#"<MPD type="static" mediaPresentationDuration="PT4S">
+  <Period>
+    <AdaptationSet contentType="video" mimeType="video/mp4">
+      <SegmentTemplate timescale="1000" duration="4000"
+                       initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="v0" bandwidth="800000" width="640" height="360"/>
+      <Representation id="v1" bandwidth="2400000" width="1920" height="1080"/>
+    </AdaptationSet>
+    <AdaptationSet contentType="audio" mimeType="audio/mp4" lang="en">
+      <SegmentTemplate timescale="1000" duration="4000"
+                       initialization="$RepresentationID$/init.mp4"
+                       media="$RepresentationID$/$Number$.m4s"/>
+      <Representation id="a0" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
 /// Serves fixed bodies by request path, honouring `Range`, and closes each
 /// connection after one response.
 async fn serve(routes: &[(&str, &str, &[u8])], entry: &str) -> Url {
@@ -382,11 +400,9 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
 
     let tracks = presentation.tracks();
 
-    // The variants carry no audio of their own, so they are not offered one by
-    // one: downloading one of them would produce a silent file. What is offered
-    // is the presentation, from the best quality down, with the rendition the
-    // presentation pairs it with.
-    assert_eq!(tracks.len(), 2);
+    // Each quality is offered together with the rendition the presentation
+    // pairs it with, so choosing a lower quality cannot produce a silent file.
+    assert_eq!(tracks.len(), 3);
 
     assert_eq!(tracks[0].label(), "1920x1080 (5.0 Mbps) with audio");
     assert_eq!(tracks[0].kind(), TrackKind::Video);
@@ -395,18 +411,29 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     assert_eq!(tracks[0].duration_millis(), Some(8000));
     assert_eq!(tracks[0].container(), Some(Container::Mp4));
     assert_eq!(tracks[0].filename(), Some("master.mp4"));
+    assert!(tracks[0].selection().is_some());
 
     // Neither size is declared in full, so the whole is not reported as exact.
     assert_eq!(tracks[0].size(), TrackSize::Unknown);
 
+    assert_eq!(tracks[1].label(), "640x360 (1.0 Mbps) with audio");
+    assert_eq!(tracks[1].kind(), TrackKind::Video);
+    assert_eq!(tracks[1].url(), &entry);
+    assert_eq!(tracks[1].resolution(), Some((640, 360)));
+    assert_eq!(tracks[1].duration_millis(), Some(8000));
+    assert_eq!(tracks[1].container(), Some(Container::Mp4));
+    assert_eq!(tracks[1].filename(), Some("master.mp4"));
+    assert!(tracks[1].selection().is_some());
+    assert_eq!(tracks[1].size(), TrackSize::Unknown);
+
     // An audio-only rendition is separately addressable, so it stays a track of
     // its own, and is still named after the presentation rather than after its
     // own playlist.
-    assert_eq!(tracks[1].label(), "English (en)");
-    assert_eq!(tracks[1].kind(), TrackKind::Audio);
-    assert_eq!(tracks[1].size(), TrackSize::Unknown);
-    assert_eq!(tracks[1].duration_millis(), Some(4000));
-    assert_eq!(tracks[1].filename(), Some("master.ts"));
+    assert_eq!(tracks[2].label(), "English (en)");
+    assert_eq!(tracks[2].kind(), TrackKind::Audio);
+    assert_eq!(tracks[2].size(), TrackSize::Unknown);
+    assert_eq!(tracks[2].duration_millis(), Some(4000));
+    assert_eq!(tracks[2].filename(), Some("master.ts"));
 }
 
 #[tokio::test]
@@ -451,18 +478,19 @@ async fn inspection_describes_every_quality_of_a_presentation_that_carries_its_s
     // playlist of its own, is inside them and is not a track.
     assert_eq!(tracks.len(), 2);
 
-    // The variant that declares every part's length is exactly known.
-    assert_eq!(tracks[0].label(), "640x360 (1.0 Mbps)");
+    assert_eq!(tracks[0].label(), "1920x1080 (5.0 Mbps)");
     assert_eq!(tracks[0].kind(), TrackKind::Video);
-    assert_eq!(tracks[0].size(), TrackSize::Exact(12));
+    assert_eq!(tracks[0].size(), TrackSize::Estimated(5_000_000));
+    assert!(!tracks[0].size().is_exact());
     assert_eq!(tracks[0].container(), Some(Container::Mp4));
     assert_eq!(tracks[0].duration_millis(), Some(8000));
     assert_eq!(tracks[0].filename(), Some("master.mp4"));
 
-    // The one that declares none is only as good as its declared bitrate.
-    assert_eq!(tracks[1].label(), "1920x1080 (5.0 Mbps)");
-    assert_eq!(tracks[1].size(), TrackSize::Estimated(5_000_000));
-    assert!(!tracks[1].size().is_exact());
+    // The variant that declares every part's length is exactly known.
+    assert_eq!(tracks[1].label(), "640x360 (1.0 Mbps)");
+    assert_eq!(tracks[1].size(), TrackSize::Exact(12));
+    assert_eq!(tracks[1].container(), Some(Container::Mp4));
+    assert_eq!(tracks[1].duration_millis(), Some(8000));
     assert_eq!(tracks[1].filename(), Some("master.mp4"));
 }
 
@@ -499,6 +527,43 @@ async fn inspection_of_a_single_playlist_is_one_track() {
     assert_eq!(tracks[0].url(), &entry);
     assert_eq!(tracks[0].duration_millis(), Some(12000));
     assert_eq!(tracks[0].filename(), Some("media.mp4"));
+}
+
+#[tokio::test]
+async fn inspection_lists_every_dash_video_quality_with_its_audio() {
+    let entry = serve(
+        &[(
+            "/manifest.mpd",
+            "application/dash+xml",
+            MULTI_DASH.as_bytes(),
+        )],
+        "/manifest.mpd",
+    )
+    .await;
+    let executor = StreamExecutor::new(HttpClient::new().expect("client must build"));
+
+    let presentation = executor
+        .inspect(&RequestContext::new(entry.clone(), Vec::new()))
+        .await
+        .expect("inspection must succeed");
+    let tracks = presentation.tracks();
+
+    assert_eq!(tracks.len(), 3);
+    assert_eq!(tracks[0].label(), "1920x1080 (v1) with audio");
+    assert_eq!(tracks[0].url(), &entry);
+    assert!(tracks[0].selection().is_some());
+    assert_eq!(tracks[0].resolution(), Some((1920, 1080)));
+    assert_eq!(tracks[0].size(), TrackSize::Estimated(1_264_000));
+
+    assert_eq!(tracks[1].label(), "640x360 (v0) with audio");
+    assert!(tracks[1].selection().is_some());
+    assert_eq!(tracks[1].resolution(), Some((640, 360)));
+    assert_eq!(tracks[1].size(), TrackSize::Estimated(464_000));
+
+    // The audio is also addressable on its own.
+    assert_eq!(tracks[2].label(), "Audio (en) · 128 kbps");
+    assert_eq!(tracks[2].kind(), TrackKind::Audio);
+    assert!(tracks[2].selection().is_some());
 }
 
 #[tokio::test]
@@ -830,16 +895,17 @@ async fn a_presentation_that_keeps_its_sound_apart_is_fetched_and_muxed() {
         panic!("the transfer must finish");
     };
 
-    // What is published is the muxed file, not what was fetched: the
-    // initialization segments describe the tracks but are not media.
-    assert!(staged.written_bytes() < measured);
+    // Progress counts what was fetched; the published file is smaller because
+    // initialization data and container headers are not media.
+    assert_eq!(staged.written_bytes(), measured);
 
     let output = staged.finalize().await.expect("finalize must succeed");
     let bytes = std::fs::read(output.destination.final_path()).expect("output must be readable");
 
-    assert_eq!(
-        u64::try_from(bytes.len()).expect("a length"),
-        output.written_bytes
+    assert_eq!(output.written_bytes, measured);
+    assert!(
+        u64::try_from(bytes.len()).expect("a length") < measured,
+        "the muxed file must be smaller than the fetched segments"
     );
 
     // The picture is followed by the sound, exactly as the segments carried

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 gunda-core = { path = "../gunda-core" }
 gunda-http = { path = "../gunda-http" }
+gunda-stream = { path = "../gunda-stream" }
 sqlx.workspace = true
 time.workspace = true
 url.workspace = true

@@ -1,5 +1,6 @@
 mod common;
 
+use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -349,7 +350,7 @@ async fn restart_reports_file_failure_without_clearing_resume_state() {
 
     assert_eq!(
         error,
-        RestartResetError::PartialFile(std::io::ErrorKind::InvalidInput)
+        RestartResetError::PartialFile(ErrorKind::InvalidInput)
     );
     assert!(partial.is_dir());
     assert!(store.find(id).await.unwrap().is_some());
