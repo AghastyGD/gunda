@@ -1,3 +1,5 @@
+use std::fmt;
+
 use crate::download::{DownloadId, NewDownload};
 
 /// Intent submitted by an application client.
@@ -34,6 +36,26 @@ pub enum DownloadCommandKind {
     Retry,
     Restart,
     Remove,
+}
+
+impl fmt::Debug for DownloadCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create(_) => f.write_str("Create"),
+            Self::Pause(id) => write!(f, "Pause({id:?})"),
+            Self::Resume(id) => write!(f, "Resume({id:?})"),
+            Self::Cancel(id) => write!(f, "Cancel({id:?})"),
+            Self::Retry(id) => write!(f, "Retry({id:?})"),
+            Self::Restart(id) => write!(f, "Restart({id:?})"),
+            Self::Remove {
+                id,
+                delete_partial_data,
+            } => write!(
+                f,
+                "Remove {{ id: {id:?}, delete_partial_data: {delete_partial_data} }}"
+            ),
+        }
+    }
 }
 
 impl DownloadCommand {
@@ -157,5 +179,21 @@ mod tests {
 
         assert_eq!(command.kind(), DownloadCommandKind::Create);
         assert_eq!(command.target_id(), None)
+    }
+
+    #[test]
+    fn debug_output_hides_download_payload_but_keeps_the_command_identity() {
+        let id = download_id();
+
+        let create = DownloadCommand::create(new_download());
+        let rendered_create = format!("{create:?}");
+        assert!(rendered_create.contains("Create"));
+        assert!(!rendered_create.contains("https://example.com"));
+        assert!(!rendered_create.contains("file.iso"));
+
+        let pause = DownloadCommand::Pause(id);
+        let rendered_pause = format!("{pause:?}");
+        assert!(rendered_pause.contains("Pause"));
+        assert!(rendered_pause.contains("26"));
     }
 }

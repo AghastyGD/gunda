@@ -33,4 +33,3 @@ For security reports, see [SECURITY.md](SECURITY.md).
 ## License
 
 Gunda is licensed under the [GNU General Public License v3.0 only](LICENSE).
-trades
