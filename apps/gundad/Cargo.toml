@@ -1,0 +1,22 @@
+[package]
+name = "gundad"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+directories = "6"
+gunda-capture = { path = "../../crates/gunda-capture" }
+gunda-core = { path = "../../crates/gunda-core" }
+gunda-http = { path = "../../crates/gunda-http" }
+gunda-ipc = { path = "../../crates/gunda-ipc" }
+gunda-storage = { path = "../../crates/gunda-storage" }
+gunda-stream = { path = "../../crates/gunda-stream" }
+tokio = { workspace = true, features = ["io-util", "net", "signal", "sync", "time"] }
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
