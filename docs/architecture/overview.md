@@ -67,6 +67,8 @@ It connects:
 
 A background Tokio worker owns the manager, executors, and runtime lease. Up to three job tasks run concurrently and report updates back to the command loop; the UI sends commands and receives coalesced snapshots through channels. Cancellation and pause use a separate per-job signal.
 
+`gundad` contains the extracted runtime foundation for moving that ownership out of the desktop process. The desktop is still on the in-process path until the IPC client migration lands.
+
 The egui interface owns presentation and local UI state. Download lifecycle decisions remain in the manager.
 
 ## Dependency direction
