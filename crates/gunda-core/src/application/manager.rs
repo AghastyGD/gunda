@@ -713,7 +713,7 @@ where
             .progress();
 
         if let Some(written_bytes) = written_bytes {
-            let progress = validated_execution_progress(&job, written_bytes)?;
+            let progress = stopped_execution_progress(&job, written_bytes)?;
             job.update_progress(progress, OffsetDateTime::now_utc());
         }
 
@@ -850,6 +850,14 @@ fn validated_execution_progress(
 
     DownloadProgress::new(written_bytes, job.progress().total_bytes())
         .map_err(|_| invalid_repository_data("executor returned invalid progress"))
+}
+
+fn stopped_execution_progress(
+    job: &DownloadJob,
+    written_bytes: u64,
+) -> Result<DownloadProgress, RepositoryError> {
+    DownloadProgress::new(written_bytes, job.progress().total_bytes())
+        .map_err(|_| invalid_repository_data("executor returned invalid stopped progress"))
 }
 #[cfg(test)]
 mod tests {

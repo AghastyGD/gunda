@@ -783,6 +783,7 @@ impl StreamPreparedTransfer {
             }
 
             let request = segment_request(resource.url(), &self.manifest_url, &self.headers);
+            let resource_start = written;
 
             // A ranged segment is one interval of a larger resource, so it must
             // be requested as a range; the body is then only that interval.
@@ -806,7 +807,7 @@ impl StreamPreparedTransfer {
 
                 match next {
                     None => {
-                        truncate_track(&mut file, written).await?;
+                        truncate_track(&mut file, resource_start).await?;
                         checkpoint_track(
                             &mut file,
                             self.id,
@@ -814,13 +815,13 @@ impl StreamPreparedTransfer {
                             &mut resume,
                             track,
                             next_resource,
-                            written,
+                            resource_start,
                         )
                         .await?;
-                        return Ok((written, true));
+                        return Ok((resource_start, true));
                     }
                     Some(Err(error)) => {
-                        truncate_track(&mut file, written).await?;
+                        truncate_track(&mut file, resource_start).await?;
                         checkpoint_track(
                             &mut file,
                             self.id,
@@ -828,7 +829,7 @@ impl StreamPreparedTransfer {
                             &mut resume,
                             track,
                             next_resource,
-                            written,
+                            resource_start,
                         )
                         .await?;
                         return Err(error);
@@ -1232,6 +1233,11 @@ pub(crate) fn manifest_failure(error: ManifestError) -> DownloadFailure {
         ManifestError::SelectionUnavailable => DownloadFailure::new(
             FailureKind::InvalidResponse,
             "the selected quality is no longer available",
+            false,
+        ),
+        ManifestError::TooManySegments => DownloadFailure::new(
+            FailureKind::UnsupportedResource,
+            "the media manifest contains too many segments",
             false,
         ),
     }

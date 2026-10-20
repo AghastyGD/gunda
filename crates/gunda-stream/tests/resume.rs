@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -177,6 +177,132 @@ async fn a_paused_segmented_download_resumes_at_the_last_complete_segment() {
     assert_eq!(
         std::fs::read(output.destination.final_path()).unwrap(),
         b"SEG0SEG1SEG2"
+    );
+}
+
+#[tokio::test]
+async fn pausing_inside_a_segment_discards_its_partial_bytes() {
+    let directory = tempdir().unwrap();
+    let (entry, mut partial_rx) = serve_partial_segment().await;
+    let store = MemoryStore::default();
+    let executor = StreamExecutor::with_resume_store(
+        HttpClient::new().expect("client must build"),
+        store.clone(),
+    );
+    let prepared = executor
+        .prepare(input(entry.clone(), directory.path()))
+        .await
+        .expect("preparation must succeed");
+    let cancellation = DownloadCancellation::new();
+    cancellation.set_pause_supported(true);
+    let control = cancellation.clone();
+    let transfer = tokio::spawn(async move {
+        prepared
+            .transfer_controlled(TransferProgress::disabled(), control)
+            .await
+    });
+
+    partial_rx
+        .recv()
+        .await
+        .expect("the segment starts arriving");
+    cancellation.request_pause();
+    let outcome = transfer.await.unwrap().expect("pause must be orderly");
+    assert!(matches!(outcome, TransferOutcome::Stopped { .. }));
+
+    let state = store
+        .find(DownloadId::new(1).unwrap())
+        .await
+        .unwrap()
+        .expect("the pause leaves a checkpoint");
+    assert_eq!(state.tracks()[0].next_resource(), 0);
+    assert_eq!(state.tracks()[0].durable_bytes(), 0);
+
+    let resumed = executor
+        .prepare(input(entry, directory.path()))
+        .await
+        .expect("resume preparation must succeed");
+    let outcome = resumed.transfer().await.expect("resume must finish");
+    let TransferOutcome::Finished(staged) = outcome else {
+        panic!("resume must finish");
+    };
+    let output = staged.finalize().await.expect("publication must succeed");
+
+    assert_eq!(
+        std::fs::read(output.destination.final_path()).unwrap(),
+        b"ABCDEFGH"
+    );
+}
+
+#[tokio::test]
+async fn manager_pause_rewinds_to_the_last_durable_segment_boundary() {
+    let output = tempdir().unwrap();
+    let (entry, mut partial_rx) = serve_partial_segment().await;
+    let manager = Arc::new(
+        DownloadManager::start(MemoryRepository::default())
+            .await
+            .expect("manager must start"),
+    );
+    let id = manager
+        .create(NewDownload::new(
+            RequestContext::new(entry, Vec::new()),
+            DownloadDestination::new(
+                output.path().to_path_buf(),
+                None,
+                FileConflictPolicy::Rename,
+            ),
+            DownloadOrigin::Desktop,
+        ))
+        .await
+        .expect("job must be created")
+        .download_id();
+    let store = MemoryStore::default();
+    let executor = StreamExecutor::with_resume_store(
+        HttpClient::new().expect("client must build"),
+        store.clone(),
+    );
+    let resume_executor =
+        StreamExecutor::with_resume_store(HttpClient::new().expect("client must build"), store);
+    let cancellation = DownloadCancellation::new();
+    let control = cancellation.clone();
+    let running_manager = Arc::clone(&manager);
+    let running_executor = executor;
+    let report = tokio::spawn(async move {
+        running_manager
+            .execute_controlled(id, &running_executor, control, |_| {})
+            .await
+    });
+
+    partial_rx
+        .recv()
+        .await
+        .expect("the segment starts arriving");
+    cancellation.request_pause();
+    let report = report.await.unwrap().expect("pause must be orderly");
+    assert!(matches!(
+        report.event,
+        gunda_core::application::DownloadEvent::StateChanged {
+            current: DownloadState::Paused,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .job(id)
+            .expect("job must exist")
+            .progress()
+            .downloaded_bytes(),
+        0
+    );
+
+    manager.resume(id).await.expect("paused job must resume");
+    manager
+        .execute(id, &resume_executor)
+        .await
+        .expect("resumed job must complete");
+    assert_eq!(
+        manager.job(id).expect("job must exist").state(),
+        DownloadState::Completed
     );
 }
 
@@ -555,6 +681,77 @@ async fn serve(
     });
 
     Url::parse(&format!("http://{address}/")).unwrap()
+}
+
+async fn serve_partial_segment() -> (Url, mpsc::UnboundedReceiver<()>) {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let segment_gets = Arc::new(AtomicUsize::new(0));
+    let (partial_tx, partial_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let segment_gets = Arc::clone(&segment_gets);
+            let partial_tx = partial_tx.clone();
+
+            tokio::spawn(async move {
+                let Ok(head) = read_head(&mut socket).await else {
+                    return;
+                };
+                let mut parts = head.split_whitespace();
+                let method = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or("/");
+
+                match path {
+                    "/media.m3u8" => {
+                        let body = b"#EXTM3U\n#EXTINF:1,\ns0.ts\n#EXT-X-ENDLIST\n";
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/vnd.apple.mpegurl\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.write_all(body).await;
+                    }
+                    "/s0.ts" if method == "HEAD" => {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\ncontent-type: video/mp2t\r\ncontent-length: 8\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                    "/s0.ts" => {
+                        let number = segment_gets.fetch_add(1, Ordering::Relaxed);
+                        let response = b"HTTP/1.1 200 OK\r\ncontent-type: video/mp2t\r\ncontent-length: 8\r\nconnection: close\r\n\r\n";
+                        let _ = socket.write_all(response).await;
+
+                        if number == 0 {
+                            let _ = socket.write_all(b"ABCDEFGH").await;
+                        } else {
+                            let _ = socket.write_all(b"ABCD").await;
+                            let _ = partial_tx.send(());
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            let _ = socket.write_all(b"EFGH").await;
+                        }
+                    }
+                    _ => {
+                        let _ = socket
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                            )
+                            .await;
+                    }
+                }
+            });
+        }
+    });
+
+    (
+        Url::parse(&format!("http://{address}/media.m3u8")).unwrap(),
+        partial_rx,
+    )
 }
 
 fn container_box(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {

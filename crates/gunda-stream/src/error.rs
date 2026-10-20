@@ -19,6 +19,8 @@ pub enum ManifestError {
     InvalidNumber,
     /// The selected track is no longer present in the manifest.
     SelectionUnavailable,
+    /// The manifest exceeds the bounded segment count.
+    TooManySegments,
     /// A recognized feature that this engine refuses to guess about.
     Unsupported(UnsupportedFeature),
 }
@@ -70,6 +72,7 @@ impl fmt::Display for ManifestError {
             Self::SelectionUnavailable => {
                 f.write_str("the selected quality is no longer available")
             }
+            Self::TooManySegments => f.write_str("the manifest contains too many segments"),
             Self::Unsupported(feature) => write!(f, "{feature}"),
         }
     }

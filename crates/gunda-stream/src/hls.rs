@@ -544,6 +544,9 @@ pub fn parse(text: &str) -> Result<Playlist, ManifestError> {
                 }
 
                 saw_media_tag = true;
+                if media.segments.len() >= crate::MAX_SEGMENTS {
+                    return Err(ManifestError::TooManySegments);
+                }
                 media.segments.push(Segment {
                     resource: ResourceRef::new(line, byte_range),
                     duration_millis: pending_duration.take(),

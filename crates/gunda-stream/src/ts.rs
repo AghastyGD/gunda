@@ -150,37 +150,53 @@ pub(crate) fn demux(source: &Path, output: &Path) -> Result<ElementaryTrack, Mux
 /// transport stream around it.
 pub(crate) fn demux_adts(source: &Path, output: &Path) -> Result<ElementaryTrack, MuxError> {
     let mut input = File::open(source).map_err(MuxError::Io)?;
-    let mut bytes = Vec::new();
-    input.read_to_end(&mut bytes).map_err(MuxError::Io)?;
-
     let mut out = File::create(output).map_err(MuxError::Io)?;
     let mut audio = AudioTrack::default();
-    let mut frames = Vec::new();
-
-    audio.push(&bytes, &mut frames)?;
-    audio.flush(&mut frames);
-
     let mut written = 0_u64;
-    let mut samples = Vec::with_capacity(frames.len());
+    let mut samples = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
 
-    for frame in frames {
-        let size = u32::try_from(frame.len()).map_err(|_| MuxError::TooLarge)?;
-        out.write_all(&frame).map_err(MuxError::Io)?;
-        samples.push(ElementarySample {
-            offset: written,
-            size,
-            duration: AAC_FRAME_SAMPLES,
-            composition_offset: 0,
-            sync: true,
-        });
-        written = written.saturating_add(u64::from(size));
+    loop {
+        let read = input.read(&mut buffer).map_err(MuxError::Io)?;
+        if read == 0 {
+            break;
+        }
+
+        let mut frames = Vec::new();
+        audio.push(&buffer[..read], &mut frames)?;
+        write_adts_frames(&mut out, frames, &mut samples, &mut written)?;
     }
 
+    let mut frames = Vec::new();
+    audio.flush(&mut frames);
+    write_adts_frames(&mut out, frames, &mut samples, &mut written)?;
     out.flush().map_err(MuxError::Io)?;
 
     audio.samples = samples;
 
     audio.into_track()
+}
+
+fn write_adts_frames(
+    output: &mut File,
+    frames: Vec<Vec<u8>>,
+    samples: &mut Vec<ElementarySample>,
+    written: &mut u64,
+) -> Result<(), MuxError> {
+    for frame in frames {
+        let size = u32::try_from(frame.len()).map_err(|_| MuxError::TooLarge)?;
+        output.write_all(&frame).map_err(MuxError::Io)?;
+        samples.push(ElementarySample {
+            offset: *written,
+            size,
+            duration: AAC_FRAME_SAMPLES,
+            composition_offset: 0,
+            sync: true,
+        });
+        *written = (*written).saturating_add(u64::from(size));
+    }
+
+    Ok(())
 }
 
 /// The transport stream being read.
@@ -366,7 +382,7 @@ impl<'a> Demuxer<'a> {
         }
 
         if let Some(video) = self.video.as_mut() {
-            video.push(&payload[began..], &mut units);
+            video.push(&payload[began..], &mut units)?;
         }
 
         for unit in units {
@@ -643,7 +659,7 @@ impl VideoTrack {
     }
 
     /// Feeds one PES payload and collects every access unit it completed.
-    fn push(&mut self, payload: &[u8], complete: &mut Vec<CompletedUnit>) {
+    fn push(&mut self, payload: &[u8], complete: &mut Vec<CompletedUnit>) -> Result<(), MuxError> {
         self.pending.extend_from_slice(payload);
 
         while let Some(code) = find_start_code(&self.pending, 0) {
@@ -666,10 +682,12 @@ impl VideoTrack {
         }
 
         if self.pending.len() > MAX_PENDING {
-            // A stream that never starts another NAL unit is not a stream of
-            // access units; growing without bound would be worse than refusing.
-            self.pending.clear();
+            return Err(MuxError::Malformed(
+                "a video NAL unit exceeds the supported size",
+            ));
         }
+
+        Ok(())
     }
 
     /// Emits the access unit still being assembled.
@@ -873,7 +891,9 @@ impl AudioTrack {
         }
 
         if self.pending.len() > MAX_PENDING {
-            self.pending.clear();
+            return Err(MuxError::Malformed(
+                "an AAC frame exceeds the supported size",
+            ));
         }
 
         Ok(())
@@ -1598,6 +1618,17 @@ mod tests {
                 0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22, 0x33, 0x33, 0x33, 0x33
             ]
         );
+    }
+
+    #[test]
+    fn oversized_video_pending_is_refused() {
+        let mut video = VideoTrack::default();
+        let mut complete = Vec::new();
+        let error = video
+            .push(&vec![0; MAX_PENDING + 1], &mut complete)
+            .expect_err("an oversized NAL must not be dropped silently");
+
+        assert!(matches!(error, MuxError::Malformed(_)));
     }
 
     #[test]

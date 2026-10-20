@@ -398,6 +398,10 @@ fn plan_media_playlist(
         return Err(UnsupportedFeature::IncompletePresentation.into());
     }
 
+    if playlist.segments().len().saturating_add(1) > MAX_SEGMENTS {
+        return Err(ManifestError::TooManySegments);
+    }
+
     let mut resources = Vec::new();
     let mut current_init: Option<hls::ResourceRef> = None;
 
@@ -667,8 +671,13 @@ fn plan_set(
             if let Some(timeline) = template.timeline() {
                 let period_end =
                     period_end_millis.map(|millis| millis.saturating_mul(timescale) / 1000);
+                let times = dash::expand_timeline(timeline, period_end)?;
 
-                for time in dash::expand_timeline(timeline, period_end)? {
+                if resources.len().saturating_add(times.len()) > MAX_SEGMENTS {
+                    return Err(ManifestError::TooManySegments);
+                }
+
+                for time in times {
                     let uri =
                         substitute_template(media, representation_id, bandwidth, None, Some(time))?;
                     resources.push(resolve(&resolved, &uri, None)?);
@@ -676,6 +685,10 @@ fn plan_set(
             } else {
                 let duration = template.duration().ok_or(ManifestError::Malformed)?;
                 let count = segment_count(period_end_millis, timescale, duration)?;
+                let available = MAX_SEGMENTS.saturating_sub(resources.len());
+                if count > u64::try_from(available).unwrap_or(u64::MAX) {
+                    return Err(ManifestError::TooManySegments);
+                }
                 let start_number = template.start_number();
 
                 for index in 0..count {
@@ -705,6 +718,9 @@ fn plan_set(
             }
 
             let urls = list.segment_urls().ok_or(ManifestError::Malformed)?;
+            if resources.len().saturating_add(urls.len()) > MAX_SEGMENTS {
+                return Err(ManifestError::TooManySegments);
+            }
 
             for segment in urls {
                 let byte_range = segment.media_range().map(|(first, last)| {
@@ -1237,6 +1253,27 @@ mod tests {
         assert_eq!(plan.kind(), StreamKind::Dash);
         assert_eq!(plan.duration_millis(), Some(10_000));
         assert_eq!(plan.label(), Some("1280x720 (v0)"));
+    }
+
+    #[test]
+    fn dash_template_segment_count_is_checked_before_expansion() {
+        let mpd = dash::parse(
+            r#"<MPD type="static" mediaPresentationDuration="PT1000000S">
+                 <Period>
+                   <AdaptationSet contentType="video" mimeType="video/mp4">
+                     <SegmentTemplate timescale="1" duration="1"
+                                      media="$RepresentationID$/$Number$.m4s"/>
+                     <Representation id="v0" bandwidth="1"/>
+                   </AdaptationSet>
+                 </Period>
+               </MPD>"#,
+        )
+        .expect("manifest must parse");
+
+        assert!(matches!(
+            plan_dash(&url("https://cdn.example/dash/manifest.mpd"), &mpd),
+            Err(ManifestError::TooManySegments)
+        ));
     }
 
     #[test]

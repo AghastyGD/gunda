@@ -1,8 +1,8 @@
 # Media capture and segmented streaming
 
 This document records the problem browser media capture solves, the design
-decisions behind Gunda's capture pipeline, and what the `gunda-stream` engine
-does today. It is the design record for `crates/gunda-stream`.
+decisions behind Gunda's capture pipeline, and the current behavior of the
+`gunda-stream` engine.
 
 ## 1. What browser media capture has to solve
 
@@ -85,8 +85,8 @@ and no subprocess to launch.
 
 Choices made against alternatives:
 
-- **No per-site player adapters.** Site-specific selectors are a maintenance
-  treadmill and break silently whenever a player changes. Gunda relies on
+- **No per-site player adapters.** Site-specific selectors require ongoing
+  maintenance and break whenever a player changes. Gunda relies on
   manifest MIME detection and the reported `<video>`/MSE sources instead.
 - **JSON over WebSocket, not a bespoke binary framing.** There is no legacy
   client to stay compatible with, and a self-describing protocol is easier to
@@ -97,7 +97,7 @@ Choices made against alternatives:
 
 ## 3. The segmented download engine (`crates/gunda-stream`)
 
-Implemented today:
+Current implementation:
 
 - `hls`: playlist parsing (master and media), attribute lists with quoted
   values, `EXT-X-STREAM-INF`, `EXT-X-MEDIA`, `EXT-X-I-FRAME-STREAM-INF`,
@@ -248,10 +248,8 @@ instead of adding a dependency:
 
 - no WebSocket crate is in `Cargo.lock`, so a dependency would have to be
   downloaded, and the workspace keeps its dependency set small on purpose;
-- the subset a single-client, text-only channel needs is bounded and testable;
-- the handshake is verified against the worked example in RFC 6455 section 1.3,
-  and the server is driven end to end by Node's independent WebSocket
-  implementation (see the evidence below).
+- the subset needed by a single-client, text-only channel is bounded;
+- the handshake follows the worked example in RFC 6455 section 1.3.
 
 A frame that cannot be understood ends the connection; nothing is dropped
 silently. Client frames must be masked, control frames must be short and final,
@@ -343,32 +341,6 @@ session cookie is out of scope until there is a deliberate place to keep one.
 | reports held while disconnected | 64 | extension `background.js` |
 | a URL is ignored for | 10 min | extension `background.js` |
 
-### Evidence
-
-The crate's 49 unit tests include the RFC 6455 handshake vector, framing
-refusals, the token, the catalog, and the listener end to end over real loopback
-sockets against a client that masks what a browser masks.
-
-Against a foreign client, `cargo run -p gunda-capture --example listen` driven by
-Node's (undici) `WebSocket`:
-
-```
-upgraded
-answer {"kind":"ready","version":1}
-answer {"kind":"accepted","id":0}          # stream.m3u8
-answer {"kind":"duplicate","id":0}         # the same URL again
-answer {"kind":"accepted","id":1}          # movie.mp4
-answer {"kind":"refused","reason":"segment_stream"}   # seg-3.ts
-closed 1005 ""
-```
-
-and the listener's own record:
-
-```
-id=0 kind=Hls  seen=2 url=https://cdn.example.com/stream.m3u8?token=abc page=https://example.com/watch?v=1 title=Some("Interop check")
-id=1 kind=File seen=1 url=https://cdn.example.com/movie.mp4              page=https://example.com/watch?v=1 title=None
-```
-
 ## 3.3 Two tracks into one file (`crates/gunda-stream::mux`)
 
 The step that turns a split presentation into one file: a presentation whose
@@ -428,58 +400,6 @@ Limits, all typed (`MuxError`) rather than approximated:
 | No Matroska writer yet | `.mkv` remains a later step; MP4 covers what YouTube serves (fMP4 with H.264/HEVC/AV1/VP9 + AAC/Opus). |
 | No separate mux progress | Muxing runs after the last byte arrives and is not reported as its own phase; progress counts fetched bytes, while the published file can be smaller because initialization data and container headers are not media. |
 
-### Evidence that it produces a real file
-
-Observed, on this machine, with a real presentation whose sound is a track of
-its own (`https://storage.googleapis.com/shaka-demo-assets/angel-one-hls/hls.m3u8`,
-H.264 768×576 + AAC, 60 s):
-
-- The engine fetched it and published
-  `target/mux-probe/hls.mp4` — 11,778,326 bytes, while the sum of the fetched
-  resources was 11,791,362 (the difference is the initialization segments, which
-  describe the tracks but carry no media).
-- The Windows shell property handler (Media Foundation), which knows nothing
-  about Gunda, reports: *MP4 Video File*, length `00:01:00`, frame height `576`,
-  frame width `768`, frame rate `25.00`, video compression
-  `{34363248-0000-0010-8000-00AA00389B71}` (the `H264` fourcc).
-- WPF `MediaPlayer` (also Media Foundation) opened it and reports
-  `HasVideo=True`, `HasAudio=True`, `768×576`, duration `00:01:00`; after five
-  seconds of playback its position had advanced to `00:00:04.92`.
-
-Conclusion (inference from those two observations): a foreign media stack parses
-the container and its codec configuration and decodes **both** tracks. It is not
-evidence that every frame is correct, that every codec YouTube serves is
-covered, or that the Matroska path exists — none of those are claimed.
-
-Observed, also on this machine, for transport-stream input: the Apple advanced
-TS example
-(`https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_ts/master.m3u8`,
-which pairs a TS video variant with a separate audio rendition) was fetched for
-three segments per track. The video variant was `v9` (1920×1080, 60 fps, H.264
-in TS) and the audio rendition `a1` (AAC, delivered as packed ADTS segments,
-each beginning with an ID3v2 tag).
-
-- The three video segments measured 6,006,224 + 5,994,756 + 5,987,988 =
-  17,988,968 bytes; the three audio segments 365,689 bytes.
-- `mux_mp4` published `target/mux-probe/ts.mp4` at 17,945,972 bytes — smaller
-  than the input because 188-byte packet headers and ID3 tags are not media.
-- WPF `MediaPlayer` opened it and reports `HasVideo=True`, `HasAudio=True`,
-  1920×1080, duration `00:00:18`; after four seconds of playback its position
-  had advanced to `00:00:03.90`.
-
-Conclusion (inference): the demuxer reads real transport-stream bytes from a
-production encoder, including the ID3 tags packed-audio segments carry, and the
-resulting file is decoded by Windows' own media stack.
-
-Observed, finally, on the failing case itself: the HLS variant manifest that a
-YouTube watch page had produced (the job the desktop app recorded as failed with
-`separate audio and video tracks require muxing`; a 1920×1080 variant with a
-separate audio rendition, 151.5 s) was prepared, fetched and published by the
-same engine: `target/yt-probe/index.mp4`, 59,522,230 bytes, with no external
-tool. WPF `MediaPlayer` reports `HasVideo=True`, `HasAudio=True`, 1920×1080,
-duration `00:02:31`; after five seconds of playback its position had advanced to
-`00:00:04.97`. The same URL had previously ended at the refusal above.
-
 One master can offer the same picture with several audio groups (stereo AAC,
 surround Dolby), and the larger audio track usually gives its variant the higher
 bandwidth. Bandwidth alone would therefore choose sound that cannot be read out
@@ -511,15 +431,14 @@ choice is a default, not a restriction — the picker still lists every variant.
 Done:
 
 1. `crates/gunda-stream`: HLS and DASH parsing, planning, and execution through
-   `DownloadExecutor`, including byte-range segments, with end-to-end HLS, DASH,
-   and ranged downloads against a local server. Container recognition from the
-   media bytes, output naming from the media, measured totals, and `inspect` for
-   quality/track selection.
+   `DownloadExecutor`, including byte-range segments, container recognition
+   from the media bytes, output naming from the media, measured totals, and
+   `inspect` for quality/track selection.
 2. HTTP byte ranges: `HttpClient::open_byte_range`, and the shared validated
    name (`url_filename`) the stream engine names its output with.
 3. `crates/gunda-capture`: the loopback listener, the RFC 6455 subset, the
    versioned JSON protocol, the pairing token, and the candidate catalog with
-   deduplication, verified against a foreign client (Node `undici`).
+   deduplication.
 4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, and
    reports candidates, with an options page for pairing.
 5. Desktop wiring: the capture panel (pairing, captured list, per-candidate
@@ -533,8 +452,7 @@ Done:
    result, and DASH adaptation sets and HLS variant+rendition pairs are planned
    as two tracks. Transport-stream tracks are demuxed first (H.264 video, AAC
    audio), including packed ADTS audio behind ID3v2 tags, so the split HLS that
-   YouTube serves is muxed as well. Verified against real presentations with
-   Windows' own media stack (section 3.3).
+   YouTube serves is muxed as well.
 8. **Track selection inside one manifest:** `inspect` describes each HLS
    variant with its paired audio rendition and each DASH representation with
    its audio set. The choice is persisted as a small, URL-free
