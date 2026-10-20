@@ -420,7 +420,7 @@ Limits, all typed (`MuxError`) rather than approximated:
 
 | Limit | Why |
 | --- | --- |
-| No 64-bit box sizes, no `co64`, output ≤ 4 GiB | The writer emits 32-bit sizes and chunk offsets. A larger file is refused, not truncated. |
+| Metadata boxes remain 32-bit | Sample offsets use `co64` and `mdat` uses its extended size when needed; the movie and track metadata boxes themselves still use 32-bit sizes. |
 | `UndeclaredSample` | A sample whose duration or size the fragments do not declare cannot be tabled. |
 | Second sample entry refused | Only the first `stsd` entry is written, so a fragment that selects another one would be silently wrong. |
 | A transport stream carries one track | The demuxer reads the packet stream's single elementary track. A file that holds both picture and sound is refused, so each track is staged on its own before muxing. |
@@ -549,8 +549,7 @@ Next, in order:
 1. **A Matroska writer** (`.mkv`, EBML with `vp09`/`opus`/`av1`), so a Matroska
    pair can be muxed as well; and HEVC in a transport stream, which is currently
    refused.
-2. **64-bit boxes (`co64`)**, lifting the 4 GiB limit on muxed downloads.
-3. Desktop: surface the per-download refusal reason.
-4. Optional: AES-128 HLS decryption, live capture for
+2. Desktop: surface the per-download refusal reason.
+3. Optional: AES-128 HLS decryption, live capture for
    `IncompletePresentation`, a Firefox manifest variant for the extension
    (`background.scripts` instead of a service worker).

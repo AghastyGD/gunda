@@ -152,7 +152,7 @@ impl Desktop {
         else {
             return;
         };
-        let active = self.snapshot.active == Some(view.id);
+        let active = self.snapshot.active.contains(&view.id);
         let colors = Palette::new(self.dark);
         let color = self.state_color(&view, active);
         let mut open = true;
@@ -250,7 +250,7 @@ impl Desktop {
                     ui.add_space(10.0);
                     notice(ui, error, self.error_color());
                 }
-                if active && !self.snapshot.pause_supported {
+                if active && !view.pause_supported {
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(
@@ -291,7 +291,7 @@ impl Desktop {
                             }
                             if ui
                                 .add_enabled(
-                                    self.snapshot.pause_supported,
+                                    view.pause_supported,
                                     egui::Button::new("Pause")
                                         .min_size(egui::vec2(88.0, 32.0)),
                                 )

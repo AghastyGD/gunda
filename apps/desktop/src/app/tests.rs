@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use super::widgets::display_total;
 use super::*;
 
@@ -231,10 +233,10 @@ fn filename_hover_has_one_tooltip_and_rows_use_the_arrow_cursor() {
 #[test]
 fn filters_separate_running_interrupted_and_completed_rows() {
     let view = crate::view::tests::sample(DownloadState::Interrupted);
-    assert!(Filter::Interrupted.matches(&view, None));
-    assert!(!Filter::Active.matches(&view, None));
-    assert!(!Filter::Completed.matches(&view, None));
-    assert!(Filter::Active.matches(&view, Some(view.id)));
+    assert!(Filter::Interrupted.matches(&view, &BTreeSet::new()));
+    assert!(!Filter::Active.matches(&view, &BTreeSet::new()));
+    assert!(!Filter::Completed.matches(&view, &BTreeSet::new()));
+    assert!(Filter::Active.matches(&view, &BTreeSet::from([view.id])));
 }
 
 #[test]
@@ -269,7 +271,11 @@ fn keyboard_shortcut_opens_add_dialog_and_escape_hides_transfer_details() {
         let mut desktop = desktop(Snapshot {
             ready: true,
             busy: !opens_add,
-            active: (!opens_add).then_some(id),
+            active: if opens_add {
+                BTreeSet::new()
+            } else {
+                BTreeSet::from([id])
+            },
             jobs: vec![view],
             ..Default::default()
         });
@@ -360,7 +366,7 @@ fn unknown_size_transfer_dialog_does_not_show_a_percentage() {
         let mut desktop = desktop(Snapshot {
             ready: true,
             busy: true,
-            active: Some(id),
+            active: BTreeSet::from([id]),
             jobs: vec![view],
             ..Default::default()
         });

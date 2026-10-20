@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use eframe::egui::{self, Color32, RichText};
 use egui_extras::{Column, TableBuilder};
 use gunda_core::download::{DownloadId, DownloadState};
@@ -39,10 +41,10 @@ impl Filter {
             Self::Cancelled => "Cancelled",
         }
     }
-    pub(super) fn matches(self, view: &DownloadView, active: Option<DownloadId>) -> bool {
+    pub(super) fn matches(self, view: &DownloadView, active: &BTreeSet<DownloadId>) -> bool {
         match self {
             Self::All => true,
-            Self::Active => active == Some(view.id),
+            Self::Active => active.contains(&view.id),
             Self::Interrupted => matches!(
                 view.state,
                 DownloadState::Paused | DownloadState::Interrupted
@@ -64,7 +66,7 @@ impl Desktop {
                 .snapshot
                 .jobs
                 .iter()
-                .filter(|view| filter.matches(view, self.snapshot.active))
+                .filter(|view| filter.matches(view, &self.snapshot.active))
                 .count();
             let icon_id = ui.make_persistent_id(("category_icon", filter.label()));
             let response = egui::Button::selectable(
@@ -129,7 +131,7 @@ impl Desktop {
                 self.filter = filter;
                 if self
                     .selected_view()
-                    .is_some_and(|view| !filter.matches(view, self.snapshot.active))
+                    .is_some_and(|view| !filter.matches(view, &self.snapshot.active))
                 {
                     self.selected = None;
                 }
@@ -153,7 +155,7 @@ impl Desktop {
             .jobs
             .iter()
             .filter(|view| {
-                self.filter.matches(view, self.snapshot.active)
+                self.filter.matches(view, &self.snapshot.active)
                     && view.name.to_lowercase().contains(&query)
             })
             .cloned()
@@ -215,7 +217,7 @@ impl Desktop {
                 .body(|body| {
                     body.rows(22.0, visible.len(), |mut row| {
                         let view = &visible[row.index()];
-                        let active = self.snapshot.active == Some(view.id);
+                        let active = self.snapshot.active.contains(&view.id);
                         row.set_selected(self.selected == Some(view.id));
                         row.col(|ui| {
                             ui.horizontal(|ui| {
@@ -303,7 +305,7 @@ impl Desktop {
                         metric(
                             ui,
                             "Status",
-                            view.label(self.snapshot.active == Some(view.id)),
+                            view.label(self.snapshot.active.contains(&view.id)),
                         );
                         metric(ui, "Downloaded", &bytes(view.written));
                         metric(ui, "Total size", &display_total(view));

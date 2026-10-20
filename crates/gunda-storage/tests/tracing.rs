@@ -126,7 +126,7 @@ async fn successful_operations_emit_context_without_request_data() {
         let repository = SqliteDownloadRepository::open(&path)
             .await
             .expect("repository must open");
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -200,7 +200,7 @@ async fn rejected_requests_log_categories_and_accepted_captures_log_no_page_cont
         let repository = SqliteDownloadRepository::open_in_memory()
             .await
             .expect("repository must open");
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -367,7 +367,7 @@ async fn manager_logs_only_the_category_of_repository_errors() {
                 .is_err()
         );
 
-        let mut manager = DownloadManager::start(FailingRepository {
+        let manager = DownloadManager::start(FailingRepository {
             fail_startup: false,
         })
         .await
@@ -399,7 +399,7 @@ async fn lifecycle_operations_emit_safe_context() {
             .await
             .expect("repository must open");
 
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -462,12 +462,12 @@ async fn failed_lifecycle_update_logs_no_success_or_private_error() {
             job: original.clone(),
         };
 
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
         assert!(manager.pause(id).await.is_err());
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original));
     })
     .await;
 

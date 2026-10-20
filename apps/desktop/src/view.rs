@@ -16,6 +16,7 @@ pub struct DownloadView {
     pub error: Option<String>,
     pub retryable: bool,
     pub resume_available: bool,
+    pub pause_supported: bool,
     pub completion_pending: bool,
 }
 
@@ -72,6 +73,7 @@ impl DownloadView {
                     .last_failure()
                     .is_some_and(gunda_core::download::DownloadFailure::is_retryable),
             resume_available: false,
+            pause_supported: false,
             completion_pending: false,
         }
     }
@@ -170,6 +172,7 @@ pub(crate) mod tests {
             error: None,
             retryable: false,
             resume_available: matches!(state, DownloadState::Paused | DownloadState::Interrupted),
+            pause_supported: false,
             completion_pending: false,
         }
     }

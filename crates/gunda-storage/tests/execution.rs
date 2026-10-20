@@ -324,7 +324,7 @@ async fn run_persistent_execution(reject_completed: bool) {
     }
 
     let resume_store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
 
@@ -409,7 +409,7 @@ async fn run_persistent_execution(reject_completed: bool) {
         Some(expected_resume.clone())
     );
 
-    let expected = manager.job(id).expect("job must exist").clone();
+    let expected = manager.job(id).expect("job must exist");
 
     let expected_state = if reject_completed {
         DownloadState::Finalizing
@@ -466,7 +466,7 @@ async fn run_persistent_execution(reject_completed: bool) {
         assert!(restored.snapshot() == recovered);
         assert!(restored.updated_at() >= expected.updated_at());
     } else {
-        assert!(restored == &expected);
+        assert!(restored == expected);
     }
 
     assert_eq!(
@@ -555,7 +555,7 @@ async fn checkpoint_failure_keeps_partial_and_prevents_publication() {
         .await
         .expect("test connection must close");
 
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
     let (url, server) = serve_file().await;
@@ -608,7 +608,7 @@ async fn truncated_response_checkpoints_only_the_written_prefix() {
         .await
         .expect("repository must open");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
     let (url, server) = serve_response(
@@ -662,7 +662,7 @@ async fn full_downloads_without_a_strong_tag_and_known_size_have_no_resume_state
         let directory = tempdir().expect("temporary directory must exist");
         let repository = SqliteDownloadRepository::open_in_memory().await.expect("repository must open");
         let store = repository.http_resume_store();
-        let mut manager = DownloadManager::start(repository).await.expect("manager must start");
+        let manager = DownloadManager::start(repository).await.expect("manager must start");
         let (url, server) = serve_response(response).await;
         let id = manager.create(new_download(url, directory.path())).await.expect("job must be created").download_id();
         let executor = HttpExecutor::with_resume_store(HttpClient::new().expect("client must build"), store.clone());
@@ -682,7 +682,7 @@ async fn existing_resume_state_cannot_be_relabelled_by_a_fresh_transfer() {
         .await
         .expect("repository must open");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
     let url = Url::parse("http://127.0.0.1:9/file.bin").expect("test URL must be valid");
@@ -730,7 +730,7 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
         .await
         .expect("repository must open");
     let resume_store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
     let (url, server) = serve_range_response().await;
@@ -740,7 +740,7 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
         .expect("job must be created")
         .download_id();
 
-    let mut job = manager.job(id).expect("job must exist").clone();
+    let mut job = manager.job(id).expect("job must exist");
     let now = OffsetDateTime::now_utc();
     job.transition_to(DownloadState::Inspecting, now)
         .expect("inspection must start");
@@ -788,7 +788,7 @@ async fn interrupted_download_resumes_from_the_durable_checkpoint() {
         .await
         .expect("repository must reopen");
     let resume_store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     assert_eq!(
@@ -850,7 +850,7 @@ async fn changed_resource_rejects_resume_without_touching_the_partial() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");
@@ -865,11 +865,8 @@ async fn changed_resource_rejects_resume_without_touching_the_partial() {
         .expect("recovery failure must persist");
 
     assert!(matches!(report.event, DownloadEvent::Failed { .. }));
-    let failure = manager
-        .job(id)
-        .expect("job must exist")
-        .last_failure()
-        .expect("failure must exist");
+    let job = manager.job(id).expect("job must exist");
+    let failure = job.last_failure().expect("failure must exist");
     assert_eq!(failure.kind(), FailureKind::Integrity);
     assert!(!failure.is_retryable());
     assert_eq!(
@@ -915,7 +912,7 @@ async fn zero_checkpoint_resumes_with_a_validated_full_response() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");
@@ -992,7 +989,7 @@ async fn cancellation_during_resume_checkpoints_the_new_prefix_without_publicati
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");
@@ -1131,7 +1128,7 @@ async fn download_resumes_after_repeated_process_interruptions() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");
@@ -1167,7 +1164,7 @@ async fn download_resumes_after_repeated_process_interruptions() {
         .await
         .expect("repository must reopen again");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover again");
     assert_eq!(
@@ -1243,7 +1240,7 @@ async fn retryable_failure_resumes_from_the_durable_checkpoint() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
     assert_eq!(
@@ -1291,7 +1288,7 @@ async fn recovery_rejects_a_partial_shorter_than_the_durable_checkpoint() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");
@@ -1356,7 +1353,7 @@ async fn complete_checkpoint_finalizes_without_another_request() {
         .await
         .expect("repository must reopen");
     let store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must recover");
     manager.resume(id).await.expect("resume must queue the job");

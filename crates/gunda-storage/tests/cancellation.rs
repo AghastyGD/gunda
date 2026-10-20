@@ -113,7 +113,7 @@ async fn run_cancellation_case(point: CancellationPoint) {
         .expect("repository must open");
 
     let resume_store = repository.http_resume_store();
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
 
@@ -209,7 +209,7 @@ async fn run_cancellation_case(point: CancellationPoint) {
 
     task.await.expect("server task must succeed");
 
-    let expected = manager.job(id).expect("job must exist").clone();
+    let expected = manager.job(id).expect("job must exist");
 
     assert_eq!(expected.state(), DownloadState::Cancelled);
     assert!(expected.last_failure().is_none());
@@ -284,7 +284,7 @@ async fn run_cancellation_case(point: CancellationPoint) {
         .await
         .expect("manager must restart");
 
-    assert!(manager.job(id) == Some(&expected));
+    assert!(manager.job(id) == Some(expected));
     assert!(!final_path.exists());
 
     match point {

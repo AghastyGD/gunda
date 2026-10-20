@@ -102,6 +102,15 @@ impl Error for MuxError {
 /// elementary track first. The tracks are written one after the other, which
 /// the sample tables describe exactly. Returns the size of the file written.
 pub async fn mux_mp4(video: &Path, audio: &Path, output: &Path) -> Result<u64, MuxError> {
+    mux_mp4_with_layout(video, audio, output, false).await
+}
+
+async fn mux_mp4_with_layout(
+    video: &Path,
+    audio: &Path,
+    output: &Path,
+    force_large_offsets: bool,
+) -> Result<u64, MuxError> {
     let mut temporary = TemporaryTracks::default();
 
     let tracks = vec![
@@ -109,7 +118,7 @@ pub async fn mux_mp4(video: &Path, audio: &Path, output: &Path) -> Result<u64, M
         read_track(audio, &mut temporary).await?,
     ];
 
-    write_mp4(output, &tracks).await
+    write_mp4_layout(output, &tracks, force_large_offsets).await
 }
 
 /// Reads one input as a track, demuxing it when it is not already ISO media.
@@ -1106,7 +1115,11 @@ fn put_duration(
 ///
 /// Each track's samples are written in one run, so a single chunk covers them
 /// and one chunk offset locates them.
-async fn write_mp4(output: &Path, tracks: &[Track]) -> Result<u64, MuxError> {
+async fn write_mp4_layout(
+    output: &Path,
+    tracks: &[Track],
+    force_large_offsets: bool,
+) -> Result<u64, MuxError> {
     const MOVIE_TIMESCALE: u32 = 1000;
 
     let movie_duration = tracks
@@ -1118,21 +1131,29 @@ async fn write_mp4(output: &Path, tracks: &[Track]) -> Result<u64, MuxError> {
     // The tables are built before the layout is known, so each chunk offset is
     // written as a placeholder and filled in once the size of the
     // initialization data decides where the sample data starts.
-    let mut patch = Vec::new();
-    let moov = build_moov(tracks, MOVIE_TIMESCALE, movie_duration, &mut patch)?;
     let ftyp = build_ftyp();
-
-    let header = u64::try_from(ftyp.len() + moov.len() + 8).map_err(|_| MuxError::TooLarge)?;
     let payload: u64 = tracks
         .iter()
         .map(|track| track.demuxed.sample_bytes())
         .sum();
-    let total = header.checked_add(payload).ok_or(MuxError::TooLarge)?;
+    let mut patch = Vec::new();
+    let compact = build_moov(tracks, MOVIE_TIMESCALE, movie_duration, &mut patch, false)?;
+    let compact_header =
+        u64::try_from(ftyp.len() + compact.len() + 8).map_err(|_| MuxError::TooLarge)?;
+    let large_offsets =
+        force_large_offsets || compact_header.saturating_add(payload) > u64::from(u32::MAX);
 
-    // Every offset in the file is 32 bits wide in the tables written here.
-    if total > u64::from(u32::MAX) {
-        return Err(MuxError::TooLarge);
-    }
+    let (moov, patch) = if large_offsets {
+        let mut patch = Vec::new();
+        let moov = build_moov(tracks, MOVIE_TIMESCALE, movie_duration, &mut patch, true)?;
+        (moov, patch)
+    } else {
+        (compact, patch)
+    };
+    let mdat_header = mdat_header_size(payload);
+    let header =
+        u64::try_from(ftyp.len() + moov.len() + mdat_header).map_err(|_| MuxError::TooLarge)?;
+    let total = header.checked_add(payload).ok_or(MuxError::TooLarge)?;
 
     let mut starts = Vec::new();
     let mut start = header;
@@ -1147,23 +1168,40 @@ async fn write_mp4(output: &Path, tracks: &[Track]) -> Result<u64, MuxError> {
     let mut moov = moov;
 
     for (position, start) in patch.iter().zip(&starts) {
-        let start = u32::try_from(*start).map_err(|_| MuxError::TooLarge)?;
-        let field = moov
-            .get_mut(*position..position.saturating_add(4))
-            .ok_or(MuxError::Malformed("a chunk offset was not written"))?;
-
-        field.copy_from_slice(&start.to_be_bytes());
+        if large_offsets {
+            let field = moov
+                .get_mut(*position..position.saturating_add(8))
+                .ok_or(MuxError::Malformed("a chunk offset was not written"))?;
+            field.copy_from_slice(&start.to_be_bytes());
+        } else {
+            let start = u32::try_from(*start).map_err(|_| MuxError::TooLarge)?;
+            let field = moov
+                .get_mut(*position..position.saturating_add(4))
+                .ok_or(MuxError::Malformed("a chunk offset was not written"))?;
+            field.copy_from_slice(&start.to_be_bytes());
+        }
     }
 
     let mut file = BufWriter::new(File::create(output).await.map_err(MuxError::Io)?);
     file.write_all(&ftyp).await.map_err(MuxError::Io)?;
     file.write_all(&moov).await.map_err(MuxError::Io)?;
 
-    let mdat = u32::try_from(payload + 8).map_err(|_| MuxError::TooLarge)?;
-    file.write_all(&mdat.to_be_bytes())
-        .await
-        .map_err(MuxError::Io)?;
-    file.write_all(b"mdat").await.map_err(MuxError::Io)?;
+    if mdat_header == 8 {
+        let mdat = u32::try_from(payload + 8).map_err(|_| MuxError::TooLarge)?;
+        file.write_all(&mdat.to_be_bytes())
+            .await
+            .map_err(MuxError::Io)?;
+        file.write_all(b"mdat").await.map_err(MuxError::Io)?;
+    } else {
+        file.write_all(&1_u32.to_be_bytes())
+            .await
+            .map_err(MuxError::Io)?;
+        file.write_all(b"mdat").await.map_err(MuxError::Io)?;
+        let size = payload.checked_add(16).ok_or(MuxError::TooLarge)?;
+        file.write_all(&size.to_be_bytes())
+            .await
+            .map_err(MuxError::Io)?;
+    }
 
     let mut buffer = vec![0_u8; COPY_BUFFER];
 
@@ -1175,6 +1213,14 @@ async fn write_mp4(output: &Path, tracks: &[Track]) -> Result<u64, MuxError> {
     file.into_inner().sync_all().await.map_err(MuxError::Io)?;
 
     Ok(total)
+}
+
+fn mdat_header_size(payload: u64) -> usize {
+    if payload > u64::from(u32::MAX) - 8 {
+        16
+    } else {
+        8
+    }
 }
 
 /// Copies one track's sample data, in order, into the output.
@@ -1230,6 +1276,7 @@ fn build_moov(
     movie_timescale: u32,
     movie_duration: u64,
     patch: &mut Vec<usize>,
+    large_offsets: bool,
 ) -> Result<Vec<u8>, MuxError> {
     let mut writer = Writer::default();
 
@@ -1237,7 +1284,7 @@ fn build_moov(
         write_mvhd(writer, movie_timescale, movie_duration, tracks.len())?;
 
         for (index, track) in tracks.iter().enumerate() {
-            write_trak(writer, track, index, movie_timescale, patch)?;
+            write_trak(writer, track, index, movie_timescale, patch, large_offsets)?;
         }
 
         Ok(())
@@ -1293,6 +1340,7 @@ fn write_trak(
     index: usize,
     movie_timescale: u32,
     patch: &mut Vec<usize>,
+    large_offsets: bool,
 ) -> Result<(), MuxError> {
     let demuxed = &track.demuxed;
     let identifier = u32::try_from(index.saturating_add(1)).map_err(|_| MuxError::TooLarge)?;
@@ -1346,7 +1394,7 @@ fn write_trak(
                         writer.full(b"stss", stss);
                     }
 
-                    write_stco(writer, patch);
+                    write_stco(writer, patch, large_offsets);
 
                     Ok(())
                 })?;
@@ -1524,13 +1572,16 @@ fn build_stss(samples: &[Sample]) -> Result<Option<Vec<u8>>, MuxError> {
 
 /// Writes the chunk offset table, leaving the offset for the file layout to
 /// fill in: the initialization data has to be measured first to know it.
-fn write_stco(writer: &mut Writer, patch: &mut Vec<usize>) {
-    let position = writer.open(b"stco");
+fn write_stco(writer: &mut Writer, patch: &mut Vec<usize>, large_offsets: bool) {
+    let kind = if large_offsets { b"co64" } else { b"stco" };
+    let position = writer.open(kind);
 
     writer.bytes.extend_from_slice(&[0, 0, 0, 0]); // version and flags
     writer.bytes.extend_from_slice(&1_u32.to_be_bytes()); // one chunk
     patch.push(writer.bytes.len());
-    writer.bytes.extend_from_slice(&0_u32.to_be_bytes()); // filled in later
+    writer
+        .bytes
+        .extend_from_slice(if large_offsets { &[0; 8] } else { &[0; 4] }); // filled in later
 
     writer.close(position);
 }
@@ -1589,7 +1640,7 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-    use super::{Boxes, MuxError, find_box, mux_mp4};
+    use super::{Boxes, MuxError, find_box, mux_mp4_with_layout};
 
     /// The track identifier a fixture's fragments refer to.
     const TRACK_ID: u32 = 1;
@@ -1638,6 +1689,10 @@ mod tests {
 
     /// Muxes two fixture tracks and returns the bytes of the result.
     async fn mux(video: &[u8], audio: &[u8]) -> Vec<u8> {
+        mux_with_layout(video, audio, false).await
+    }
+
+    async fn mux_with_layout(video: &[u8], audio: &[u8], force_large_offsets: bool) -> Vec<u8> {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let video_path = directory.path().join("video.track");
         let audio_path = directory.path().join("audio.track");
@@ -1646,7 +1701,7 @@ mod tests {
         std::fs::write(&video_path, video).expect("the fixture must be written");
         std::fs::write(&audio_path, audio).expect("the fixture must be written");
 
-        let written = mux_mp4(&video_path, &audio_path, &output)
+        let written = mux_mp4_with_layout(&video_path, &audio_path, &output, force_large_offsets)
             .await
             .expect("muxing must succeed");
 
@@ -1671,7 +1726,7 @@ mod tests {
         std::fs::write(&video_path, video).expect("the fixture must be written");
         std::fs::write(&audio_path, audio).expect("the fixture must be written");
 
-        mux_mp4(&video_path, &audio_path, &output)
+        mux_mp4_with_layout(&video_path, &audio_path, &output, false)
             .await
             .expect_err("muxing must be refused")
     }
@@ -2093,6 +2148,27 @@ mod tests {
         // Nothing else is copied: the file ends where the last sample does, and
         // the initialization segments keep no samples of their own.
         assert_eq!(bytes.len(), audio_offset + 16);
+    }
+
+    #[tokio::test]
+    async fn forced_large_layout_writes_64_bit_chunk_offsets() {
+        let bytes = mux_with_layout(&video_track(), &audio_track(), true).await;
+        let found = boxes(&bytes);
+        let offsets = all_tracks(&found, "co64");
+
+        assert_eq!(offsets.len(), 2);
+        assert!(all_tracks(&found, "stco").is_empty());
+
+        for table in offsets {
+            assert_eq!(&table[4..8], &1_u32.to_be_bytes());
+            assert!(u64::from_be_bytes(table[8..16].try_into().unwrap()) >= 8);
+        }
+    }
+
+    #[test]
+    fn extended_mdat_header_is_used_at_the_32_bit_limit() {
+        assert_eq!(super::mdat_header_size(u64::from(u32::MAX) - 8), 8);
+        assert_eq!(super::mdat_header_size(u64::from(u32::MAX) - 7), 16);
     }
 
     #[tokio::test]

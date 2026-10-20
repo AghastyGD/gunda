@@ -410,11 +410,14 @@ async fn a_segmented_download_pauses_and_resumes_from_its_checkpoint() {
 
     let running = wait_for(&mut backend, |snapshot| {
         snapshot.jobs.first().is_some_and(|view| view.written >= 4)
-            && snapshot.pause_supported
-            && snapshot.active.is_some()
+            && snapshot
+                .jobs
+                .first()
+                .is_some_and(|view| view.pause_supported)
+            && !snapshot.active.is_empty()
     })
     .await;
-    let id = running.active.expect("the stream is active");
+    let id = *running.active.iter().next().expect("the stream is active");
 
     assert!(backend.pause(id), "the segmented transfer must be pausable");
 

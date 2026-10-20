@@ -65,7 +65,7 @@ It connects:
 * `gunda-http`
 * the egui/eframe desktop interface
 
-A background Tokio worker owns the manager, executor, and runtime lease. The UI sends commands and receives coalesced snapshots through channels; active cancellation uses a separate signal.
+A background Tokio worker owns the manager, executors, and runtime lease. Up to three job tasks run concurrently and report updates back to the command loop; the UI sends commands and receives coalesced snapshots through channels. Cancellation and pause use a separate per-job signal.
 
 The egui interface owns presentation and local UI state. Download lifecycle decisions remain in the manager.
 

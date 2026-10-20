@@ -448,7 +448,7 @@ async fn a_muxed_download_completes_through_the_manager() {
         HttpClient::new().expect("client must build"),
         store.clone(),
     );
-    let mut manager = DownloadManager::start(MemoryRepository::default())
+    let manager = DownloadManager::start(MemoryRepository::default())
         .await
         .expect("manager must start");
     let id = manager

@@ -33,7 +33,7 @@ async fn manager_restores_complete_jobs_after_restart() {
         .await
         .expect("repository must open");
 
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
 
@@ -92,7 +92,7 @@ async fn manager_restores_complete_jobs_after_restart() {
         .await
         .expect("manager must restart");
 
-    let restored: Vec<_> = manager.jobs().cloned().collect();
+    let restored: Vec<_> = manager.jobs();
 
     assert!(restored == expected);
 
@@ -108,7 +108,7 @@ async fn rejected_creation_preserves_jobs_in_memory_and_on_disk() {
         .await
         .expect("repository must open");
 
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
 
@@ -117,7 +117,7 @@ async fn rejected_creation_preserves_jobs_in_memory_and_on_disk() {
         .await
         .expect("public download must be created");
 
-    let expected: Vec<_> = manager.jobs().cloned().collect();
+    let expected: Vec<_> = manager.jobs();
 
     let result = manager
         .create(new_download(
@@ -136,7 +136,7 @@ async fn rejected_creation_preserves_jobs_in_memory_and_on_disk() {
     };
 
     assert_eq!(error.kind(), RepositoryErrorKind::SensitiveDataUnsupported);
-    assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+    assert!(manager.jobs() == expected);
 
     manager.into_repository().close().await;
 
@@ -148,7 +148,7 @@ async fn rejected_creation_preserves_jobs_in_memory_and_on_disk() {
         .await
         .expect("manager must restart");
 
-    assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+    assert!(manager.jobs() == expected);
 
     manager.into_repository().close().await;
 }
@@ -162,7 +162,7 @@ async fn manager_state_changes_survive_repository_reopen() {
         .await
         .expect("repository must open");
 
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must start");
 
@@ -175,7 +175,7 @@ async fn manager_state_changes_survive_repository_reopen() {
 
     manager.pause(id).await.expect("pause must succeed");
 
-    let paused = manager.job(id).expect("job must exist").clone();
+    let paused = manager.job(id).expect("job must exist");
 
     assert_eq!(paused.state(), DownloadState::Paused);
     assert_eq!(
@@ -192,16 +192,16 @@ async fn manager_state_changes_survive_repository_reopen() {
         .await
         .expect("repository must reopen");
 
-    let mut manager = DownloadManager::start(repository)
+    let manager = DownloadManager::start(repository)
         .await
         .expect("manager must restart");
 
-    assert!(manager.job(id) == Some(&paused));
+    assert!(manager.job(id) == Some(paused));
 
     manager.resume(id).await.expect("resume must succeed");
     manager.cancel(id).await.expect("cancel must succeed");
 
-    let cancelled = manager.job(id).expect("job must exist").clone();
+    let cancelled = manager.job(id).expect("job must exist");
 
     assert_eq!(cancelled.state(), DownloadState::Cancelled);
 
@@ -215,7 +215,7 @@ async fn manager_state_changes_survive_repository_reopen() {
         .await
         .expect("manager must restart");
 
-    assert!(manager.job(id) == Some(&cancelled));
+    assert!(manager.job(id) == Some(cancelled));
 
     manager.into_repository().close().await;
 }

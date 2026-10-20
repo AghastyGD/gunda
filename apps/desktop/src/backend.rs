@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -18,11 +18,12 @@ use gunda_capture::{
 use gunda_core::{
     application::{
         DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError,
-        ExecutionOutput,
+        ExecutionOutput, ExecutionReport,
     },
     download::{
-        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, ExecutionSelection,
-        FileConflictPolicy, NewDownload, RequestContext, ResourceDescriptor, ResourceKind,
+        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
+        ExecutionSelection, FileConflictPolicy, NewDownload, RequestContext, ResourceDescriptor,
+        ResourceKind,
     },
 };
 use gunda_http::{HttpClient, HttpExecutor};
@@ -38,8 +39,7 @@ use crate::view::{DownloadView, bytes};
 pub struct Snapshot {
     pub ready: bool,
     pub busy: bool,
-    pub active: Option<DownloadId>,
-    pub pause_supported: bool,
+    pub active: BTreeSet<DownloadId>,
     pub jobs: Vec<DownloadView>,
     pub captures: Vec<CaptureView>,
     pub capture_tracks: Option<CaptureTracks>,
@@ -113,9 +113,23 @@ pub enum Command {
     SaveStatus(DownloadId),
 }
 
-type Active = Arc<Mutex<Option<(DownloadId, DownloadCancellation)>>>;
+type Active = Arc<Mutex<BTreeMap<DownloadId, DownloadCancellation>>>;
 
 const MAX_AUTOMATIC_ATTEMPTS: u8 = 3;
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+
+enum WorkerEvent {
+    Job {
+        job: Box<DownloadJob>,
+        pause_supported: bool,
+    },
+    Notice(String),
+    ClearNotice,
+    Finished {
+        id: DownloadId,
+        result: Result<ExecutionReport, DownloadManagerError>,
+    },
+}
 
 pub struct Backend {
     commands: Option<mpsc::Sender<Command>>,
@@ -132,7 +146,7 @@ impl Backend {
         Self {
             commands: None,
             snapshots,
-            active: Arc::new(Mutex::new(None)),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
             closing: Arc::new(AtomicBool::new(false)),
             worker: None,
         }
@@ -141,7 +155,7 @@ impl Backend {
     pub fn start(directory: PathBuf, ctx: egui::Context) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel(4);
         let (sender, snapshots) = watch::channel(Snapshot::default());
-        let active = Arc::new(Mutex::new(None));
+        let active = Arc::new(Mutex::new(BTreeMap::new()));
         let closing = Arc::new(AtomicBool::new(false));
         let worker_active = active.clone();
         let worker_closing = closing.clone();
@@ -190,24 +204,26 @@ impl Backend {
     }
 
     pub fn cancel(&self, id: DownloadId) -> bool {
-        if let Ok(active) = self.active.lock()
-            && let Some((active_id, cancellation)) = active.as_ref()
-            && *active_id == id
-        {
-            cancellation.request();
-            return true;
-        }
-        false
+        let Ok(active) = self.active.lock() else {
+            return false;
+        };
+        let Some(cancellation) = active.get(&id).cloned() else {
+            return false;
+        };
+
+        cancellation.request();
+        true
     }
 
     pub fn pause(&self, id: DownloadId) -> bool {
-        if let Ok(active) = self.active.lock()
-            && let Some((active_id, control)) = active.as_ref()
-            && *active_id == id
-        {
-            return control.request_pause();
-        }
-        false
+        let Ok(active) = self.active.lock() else {
+            return false;
+        };
+        let Some(control) = active.get(&id).cloned() else {
+            return false;
+        };
+
+        control.request_pause()
     }
 }
 
@@ -235,7 +251,7 @@ const CAPTURE_PORT: u16 = 48_123;
 /// Everything the command loop needs, once the application can run.
 struct Initialized {
     _lease: RuntimeLease,
-    manager: DownloadManager<SqliteDownloadRepository>,
+    manager: Arc<DownloadManager<SqliteDownloadRepository>>,
     engines: Engines,
     capture: Option<CaptureHandle>,
     capture_problem: Option<&'static str>,
@@ -271,7 +287,7 @@ async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
 
     Ok(Initialized {
         _lease: lease,
-        manager,
+        manager: Arc::new(manager),
         engines: Engines {
             http: HttpExecutor::with_resume_store(client, store),
             stream: StreamExecutor::with_resume_store(stream_client, stream_store),
@@ -335,7 +351,7 @@ async fn run(
 ) {
     let Initialized {
         _lease,
-        mut manager,
+        manager,
         engines,
         capture,
         capture_problem,
@@ -354,9 +370,13 @@ async fn run(
         }
     };
     let mut pending_outputs = BTreeMap::new();
+    let mut active_jobs = BTreeMap::new();
+    let mut pending_engines = BTreeMap::new();
+    let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
+    let engines = Arc::new(engines);
     let mut snapshot = Snapshot {
         ready: true,
-        jobs: idle_views(&manager, &engines, &pending_outputs).await,
+        jobs: idle_views(&manager, &engines, &pending_outputs, &active_jobs).await,
         captures: capture_views(capture.as_ref()),
         capture: capture.as_ref().map(capture_status),
         capture_problem,
@@ -370,13 +390,15 @@ async fn run(
 
     loop {
         enum Wake {
-            Command(Option<Command>),
+            Command(Option<Box<Command>>),
             Catalog { stopped: bool },
+            Worker(Option<Box<WorkerEvent>>),
         }
 
         let wake = tokio::select! {
-            command = commands.recv() => Wake::Command(command),
+            command = commands.recv() => Wake::Command(command.map(Box::new)),
             result = catalog_changed(&mut watcher) => Wake::Catalog { stopped: result.is_err() },
+            event = worker_rx.recv() => Wake::Worker(event.map(Box::new)),
         };
 
         let command = match wake {
@@ -388,7 +410,23 @@ async fn run(
                 publish(&sender, &ctx, snapshot.clone());
                 continue;
             }
-            Wake::Command(command) => command,
+            Wake::Worker(event) => {
+                let mut coordinator = WorkerCoordinator {
+                    manager: &manager,
+                    engines: &engines,
+                    active_jobs: &mut active_jobs,
+                    pending_engines: &mut pending_engines,
+                    active: &active,
+                    pending_outputs: &mut pending_outputs,
+                    updates: &worker_tx,
+                    closing: &closing,
+                    snapshot: &mut snapshot,
+                };
+                coordinator.handle(event.map(|event| *event)).await;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            Wake::Command(command) => command.map(|command| *command),
         };
 
         let Some(command) = command else {
@@ -400,7 +438,7 @@ async fn run(
         snapshot.busy = true;
         snapshot.notice = None;
         publish(&sender, &ctx, snapshot.clone());
-        let (id, engine) = match command {
+        let id = match command {
             Command::SaveStatus(id) => {
                 if let Some(output) = pending_outputs.get(&id) {
                     if manager.confirm_published_output(id, output).await.is_ok() {
@@ -411,7 +449,8 @@ async fn run(
                 } else {
                     snapshot.notice = Some("There is no saved file status to update.".into());
                 }
-                snapshot.jobs = idle_views(&manager, &engines, &pending_outputs).await;
+                snapshot.jobs =
+                    idle_views(&manager, &engines, &pending_outputs, &active_jobs).await;
                 snapshot.busy = false;
                 publish(&sender, &ctx, snapshot.clone());
                 continue;
@@ -436,18 +475,23 @@ async fn run(
                 publish(&sender, &ctx, snapshot.clone());
                 continue;
             }
-            Command::Start { url, directory } => (
+            Command::Start { url, directory } => {
+                let engine = engine_for(&url, None);
+
                 manager
                     .create(NewDownload::new(
-                        RequestContext::new(url.clone(), Vec::new()),
+                        RequestContext::new(url, Vec::new()),
                         DownloadDestination::new(directory, None, FileConflictPolicy::Rename),
                         DownloadOrigin::Desktop,
                     ))
                     .await
-                    .map(|event| event.download_id())
-                    .map_err(|_| "Could not save the new download."),
-                engine_for(&url, None),
-            ),
+                    .map(|event| {
+                        let id = event.download_id();
+                        pending_engines.insert(id, engine);
+                        id
+                    })
+                    .map_err(|_| "Could not save the new download.")
+            }
             Command::Inspect(id) => {
                 snapshot.capture_tracks =
                     Some(inspect_capture(&engines.stream, capture.as_ref(), id).await);
@@ -477,206 +521,266 @@ async fn run(
                         request = request.with_selection(selection);
                     }
 
-                    (
-                        manager
-                            .create(NewDownload::new(
-                                request,
-                                DownloadDestination::new(
-                                    directory,
-                                    filename,
-                                    FileConflictPolicy::Rename,
-                                ),
-                                captured.origin,
-                            ))
-                            .await
-                            .map(|event| event.download_id())
-                            .map_err(|_| "Could not save the new download."),
-                        engine,
-                    )
+                    manager
+                        .create(NewDownload::new(
+                            request,
+                            DownloadDestination::new(
+                                directory,
+                                filename,
+                                FileConflictPolicy::Rename,
+                            ),
+                            captured.origin,
+                        ))
+                        .await
+                        .map(|event| {
+                            let id = event.download_id();
+                            pending_engines.insert(id, engine);
+                            id
+                        })
+                        .map_err(|_| "Could not save the new download.")
                 }
-                Some(Err(message)) => (Err(message), JobEngine::Http),
-                None => (
-                    Err("That capture is no longer in the list."),
-                    JobEngine::Http,
-                ),
+                Some(Err(message)) => Err(message),
+                None => Err("That capture is no longer in the list."),
             },
             Command::Resume(id) => {
                 let engine = engine_of(&manager, id);
                 let available = match manager.job(id) {
                     Some(job) => match engine {
-                        JobEngine::Http => engines.http.can_resume(job).await,
-                        JobEngine::Stream => engines.stream.can_resume(job).await,
+                        JobEngine::Http => engines.http.can_resume(&job).await,
+                        JobEngine::Stream => engines.stream.can_resume(&job).await,
                     },
                     None => Ok(false),
                 };
-                (
-                    match available {
-                        Ok(true) => manager
-                            .resume(id)
-                            .await
-                            .map(|_| id)
-                            .map_err(|_| "This download cannot be resumed."),
-                        Ok(false) => Err(
-                            "Saved progress is unavailable. Use Restart to download again from zero.",
-                        ),
-                        Err(_) => Err(
-                            "Could not check saved progress. Check the application data folder and try again.",
-                        ),
-                    },
-                    engine,
-                )
+                match available {
+                    Ok(true) => manager
+                        .resume(id)
+                        .await
+                        .map(|_| id)
+                        .map_err(|_| "This download cannot be resumed."),
+                    Ok(false) => Err(
+                        "Saved progress is unavailable. Use Restart to download again from zero.",
+                    ),
+                    Err(_) => Err(
+                        "Could not check saved progress. Check the application data folder and try again.",
+                    ),
+                }
             }
-            Command::Retry(id) => (
-                manager
-                    .retry(id)
-                    .await
-                    .map(|_| id)
-                    .map_err(|_| "This download cannot be retried."),
-                engine_of(&manager, id),
-            ),
+            Command::Retry(id) => manager
+                .retry(id)
+                .await
+                .map(|_| id)
+                .map_err(|_| "This download cannot be retried."),
             Command::Restart(id) => {
-                let engine = engine_of(&manager, id);
-                let directory = manager
-                    .job(id)
-                    .filter(|job| job.state().can_restart())
-                    .map(|job| job.destination().directory().to_path_buf());
-                let restarted = if let Some(directory) = directory {
-                    let reset = match engine {
-                        JobEngine::Http => engines
-                            .http
-                            .reset_for_restart(id, &directory)
-                            .await
-                            .is_err(),
-                        JobEngine::Stream => engines
-                            .stream
-                            .reset_for_restart(id, &directory)
-                            .await
-                            .is_err(),
-                    };
-
-                    if reset {
-                        Err("The previous download data could not be cleared safely.")
-                    } else {
-                        manager
-                            .restart(id)
-                            .await
-                            .map(|_| id)
-                            .map_err(|_| "This download could not be restarted.")
-                    }
+                if active_jobs.contains_key(&id) {
+                    Err("This download is still running.")
                 } else {
-                    Err("This download cannot be restarted.")
-                };
-                (restarted, engine)
+                    let engine = engine_of(&manager, id);
+                    let directory = manager
+                        .job(id)
+                        .filter(|job| job.state().can_restart())
+                        .map(|job| job.destination().directory().to_path_buf());
+                    if let Some(directory) = directory {
+                        let reset = match engine {
+                            JobEngine::Http => engines
+                                .http
+                                .reset_for_restart(id, &directory)
+                                .await
+                                .is_err(),
+                            JobEngine::Stream => engines
+                                .stream
+                                .reset_for_restart(id, &directory)
+                                .await
+                                .is_err(),
+                        };
+
+                        if reset {
+                            Err("The previous download data could not be cleared safely.")
+                        } else {
+                            manager
+                                .restart(id)
+                                .await
+                                .map(|_| id)
+                                .map_err(|_| "This download could not be restarted.")
+                        }
+                    } else {
+                        Err("This download cannot be restarted.")
+                    }
+                }
             }
         };
-        if let Ok(id) = id {
-            let cancellation = DownloadCancellation::new();
-            if let Ok(mut slot) = active.lock() {
-                *slot = Some((id, cancellation.clone()));
-            }
-            if closing.load(Ordering::Acquire) {
-                let _ = manager.pause(id).await;
-                break;
-            }
-            snapshot.active = Some(id);
-            snapshot.pause_supported = false;
-            if let Some(job) = manager.job(id) {
-                update_job_view(&mut snapshot, job);
-            }
-            publish(&sender, &ctx, snapshot.clone());
-            let result = {
-                let mut publisher = Publisher {
-                    snapshot: &mut snapshot,
-                    sender: &sender,
-                    ctx: &ctx,
-                };
-
-                match engine {
-                    JobEngine::Http => {
-                        execute_job(
-                            &mut manager,
-                            &engines.http,
-                            id,
-                            cancellation.clone(),
-                            &mut publisher,
-                        )
-                        .await
-                    }
-                    JobEngine::Stream => {
-                        execute_job(
-                            &mut manager,
-                            &engines.stream,
-                            id,
-                            cancellation.clone(),
-                            &mut publisher,
-                        )
-                        .await
-                    }
+        match id {
+            Ok(id) => {
+                if let Some(job) = manager.job(id) {
+                    update_job_view(&mut snapshot, &job);
                 }
-            };
-
-            if let Ok(mut slot) = active.lock() {
-                *slot = None;
             }
-            match result {
-                Err(DownloadManagerError::CompletionNotPersisted {
-                    destination,
-                    written_bytes,
-                    cleanup_pending,
-                    ..
-                }) => {
-                    pending_outputs.insert(
-                        id,
-                        ExecutionOutput {
-                            destination,
-                            written_bytes,
-                            cleanup_pending,
-                        },
-                    );
-                    snapshot.notice = Some("The file was saved. Use Save status to update its download record without downloading again.".into());
-                }
-                Err(_) => {
-                    snapshot.notice =
-                        Some("The download could not be completed. Check its details.".into())
-                }
-                Ok(_) => {}
-            }
-        } else if let Err(message) = id {
-            snapshot.notice = Some(message.into());
+            Err(message) => snapshot.notice = Some(message.into()),
         }
         snapshot.busy = false;
-        snapshot.active = None;
-        snapshot.pause_supported = false;
-        snapshot.jobs = idle_views(&manager, &engines, &pending_outputs).await;
+        snapshot.jobs = idle_views(&manager, &engines, &pending_outputs, &active_jobs).await;
+        if closing.load(Ordering::Acquire) {
+            break;
+        }
+        schedule_jobs(
+            &manager,
+            &engines,
+            &mut active_jobs,
+            &mut pending_engines,
+            &active,
+            &worker_tx,
+            &mut snapshot,
+        );
         publish(&sender, &ctx, snapshot.clone());
     }
 }
 
-/// The parts of the command loop that publishing a snapshot needs.
-struct Publisher<'a> {
-    snapshot: &'a mut Snapshot,
-    sender: &'a watch::Sender<Snapshot>,
-    ctx: &'a egui::Context,
-}
+fn schedule_jobs(
+    manager: &Arc<DownloadManager<SqliteDownloadRepository>>,
+    engines: &Arc<Engines>,
+    active_jobs: &mut BTreeMap<DownloadId, DownloadCancellation>,
+    pending_engines: &mut BTreeMap<DownloadId, JobEngine>,
+    active: &Active,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
+    snapshot: &mut Snapshot,
+) {
+    while active_jobs.len() < MAX_CONCURRENT_DOWNLOADS {
+        let Some(job) = manager.jobs().into_iter().find(|job| {
+            job.state() == DownloadState::Queued && !active_jobs.contains_key(&job.id())
+        }) else {
+            break;
+        };
+        let id = job.id();
+        let engine = pending_engines.remove(&id).unwrap_or_else(|| {
+            engine_for(
+                job.request().url(),
+                job.resource().map(ResourceDescriptor::kind),
+            )
+        });
+        let cancellation = DownloadCancellation::new();
 
-impl Publisher<'_> {
-    /// Publishes the snapshot and wakes the interface.
-    fn publish(&self) {
-        publish(self.sender, self.ctx, self.snapshot.clone());
+        active_jobs.insert(id, cancellation.clone());
+        if let Ok(mut active) = active.lock() {
+            active.insert(id, cancellation.clone());
+        }
+        snapshot.active.insert(id);
+        update_job_view(snapshot, &job);
+
+        let manager = Arc::clone(manager);
+        let engines = Arc::clone(engines);
+        let updates = updates.clone();
+        tokio::spawn(async move {
+            let result = match engine {
+                JobEngine::Http => {
+                    execute_job(&manager, &engines.http, id, cancellation, &updates).await
+                }
+                JobEngine::Stream => {
+                    execute_job(&manager, &engines.stream, id, cancellation, &updates).await
+                }
+            };
+            let _ = updates.send(WorkerEvent::Finished { id, result });
+        });
     }
 }
 
-/// Runs one job to a conclusion, retrying a failure that is worth retrying.
-///
-/// This is generic over the engine on purpose: the retry policy, the progress
-/// publication, and the pause handling are the same whether a job is one HTTP
-/// response or a manifest and a hundred segments.
+struct WorkerCoordinator<'a> {
+    manager: &'a Arc<DownloadManager<SqliteDownloadRepository>>,
+    engines: &'a Arc<Engines>,
+    active_jobs: &'a mut BTreeMap<DownloadId, DownloadCancellation>,
+    pending_engines: &'a mut BTreeMap<DownloadId, JobEngine>,
+    active: &'a Active,
+    pending_outputs: &'a mut BTreeMap<DownloadId, ExecutionOutput>,
+    updates: &'a mpsc::UnboundedSender<WorkerEvent>,
+    closing: &'a AtomicBool,
+    snapshot: &'a mut Snapshot,
+}
+
+impl WorkerCoordinator<'_> {
+    async fn handle(&mut self, event: Option<WorkerEvent>) {
+        let Some(event) = event else {
+            return;
+        };
+
+        match event {
+            WorkerEvent::Job {
+                job,
+                pause_supported,
+            } => {
+                let job = *job;
+                update_job_view(self.snapshot, &job);
+                if let Some(view) = self
+                    .snapshot
+                    .jobs
+                    .iter_mut()
+                    .find(|view| view.id == job.id())
+                {
+                    view.pause_supported = pause_supported;
+                }
+            }
+            WorkerEvent::Notice(message) => self.snapshot.notice = Some(message),
+            WorkerEvent::ClearNotice => self.snapshot.notice = None,
+            WorkerEvent::Finished { id, result } => {
+                self.active_jobs.remove(&id);
+                if let Ok(mut active) = self.active.lock() {
+                    active.remove(&id);
+                }
+                self.snapshot.active.remove(&id);
+
+                if let Some(job) = self.manager.job(id) {
+                    update_job_view(self.snapshot, &job);
+                }
+                match result {
+                    Err(DownloadManagerError::CompletionNotPersisted {
+                        destination,
+                        written_bytes,
+                        cleanup_pending,
+                        ..
+                    }) => {
+                        self.pending_outputs.insert(
+                            id,
+                            ExecutionOutput {
+                                destination,
+                                written_bytes,
+                                cleanup_pending,
+                            },
+                        );
+                        self.snapshot.notice = Some("The file was saved. Use Save status to update its download record without downloading again.".into());
+                    }
+                    Err(_) => {
+                        self.snapshot.notice =
+                            Some("The download could not be completed. Check its details.".into())
+                    }
+                    Ok(_) => {}
+                }
+
+                self.snapshot.jobs = idle_views(
+                    self.manager,
+                    self.engines,
+                    self.pending_outputs,
+                    self.active_jobs,
+                )
+                .await;
+                if !self.closing.load(Ordering::Acquire) {
+                    schedule_jobs(
+                        self.manager,
+                        self.engines,
+                        self.active_jobs,
+                        self.pending_engines,
+                        self.active,
+                        self.updates,
+                        self.snapshot,
+                    );
+                }
+            }
+        }
+    }
+}
+
 async fn execute_job<E: DownloadExecutor>(
-    manager: &mut DownloadManager<SqliteDownloadRepository>,
+    manager: &DownloadManager<SqliteDownloadRepository>,
     executor: &E,
     id: DownloadId,
     cancellation: DownloadCancellation,
-    publisher: &mut Publisher<'_>,
+    updates: &mpsc::UnboundedSender<WorkerEvent>,
 ) -> Result<gunda_core::application::ExecutionReport, DownloadManagerError> {
     let progress_control = cancellation.clone();
     let mut attempts = 0;
@@ -686,9 +790,10 @@ async fn execute_job<E: DownloadExecutor>(
 
         let result = manager
             .execute_controlled_with_updates(id, executor, cancellation.clone(), |_, job| {
-                publisher.snapshot.pause_supported = progress_control.pause_supported();
-                update_job_view(publisher.snapshot, job);
-                publisher.publish();
+                let _ = updates.send(WorkerEvent::Job {
+                    job: Box::new(job.clone()),
+                    pause_supported: progress_control.pause_supported(),
+                });
             })
             .await;
 
@@ -708,13 +813,9 @@ async fn execute_job<E: DownloadExecutor>(
         manager.retry(id).await?;
 
         let delay_seconds = 1_u64 << (attempts - 1);
-        if let Some(job) = manager.job(id) {
-            update_job_view(publisher.snapshot, job);
-        }
-        publisher.snapshot.notice = Some(format!(
+        let _ = updates.send(WorkerEvent::Notice(format!(
             "Connection problem. Trying again in {delay_seconds} seconds…"
-        ));
-        publisher.publish();
+        )));
 
         tokio::select! {
             biased;
@@ -722,7 +823,7 @@ async fn execute_job<E: DownloadExecutor>(
             _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
         }
 
-        publisher.snapshot.notice = None;
+        let _ = updates.send(WorkerEvent::ClearNotice);
     }
 }
 
@@ -947,7 +1048,13 @@ fn kind_label(kind: ResourceKind) -> &'static str {
 }
 
 fn update_job_view(snapshot: &mut Snapshot, job: &DownloadJob) {
-    let updated = DownloadView::from_job(job);
+    let pause_supported = snapshot
+        .jobs
+        .iter()
+        .find(|view| view.id == job.id())
+        .is_some_and(|view| view.pause_supported);
+    let mut updated = DownloadView::from_job(job);
+    updated.pause_supported = pause_supported;
     if let Some(view) = snapshot.jobs.iter_mut().find(|view| view.id == job.id()) {
         *view = updated;
     } else {
@@ -959,14 +1066,23 @@ async fn idle_views(
     manager: &DownloadManager<SqliteDownloadRepository>,
     engines: &Engines,
     pending_outputs: &BTreeMap<DownloadId, ExecutionOutput>,
+    active_jobs: &BTreeMap<DownloadId, DownloadCancellation>,
 ) -> Vec<DownloadView> {
     let mut views = Vec::new();
     for job in manager.jobs() {
-        let mut view = DownloadView::from_job(job);
-        let availability = match engine_of(manager, job.id()) {
-            JobEngine::Http => engines.http.can_resume(job).await,
-            JobEngine::Stream => engines.stream.can_resume(job).await,
+        let mut view = DownloadView::from_job(&job);
+        let is_active = active_jobs.contains_key(&job.id());
+        let availability = if is_active {
+            Ok(false)
+        } else {
+            match engine_of(manager, job.id()) {
+                JobEngine::Http => engines.http.can_resume(&job).await,
+                JobEngine::Stream => engines.stream.can_resume(&job).await,
+            }
         };
+        if let Some(cancellation) = active_jobs.get(&job.id()) {
+            view.pause_supported = cancellation.pause_supported();
+        }
         view.resume_available = matches!(availability, Ok(true));
         if let Some(output) = pending_outputs.get(&job.id()) {
             view.output = Some(output.destination.final_path().to_owned());
@@ -1072,6 +1188,153 @@ mod tests {
         )
     }
 
+    async fn stalled_server() -> (
+        Url,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = waiting.await;
+            socket.write_all(b"hello").await.unwrap();
+        });
+
+        (
+            Url::parse(&format!("http://{address}/file.bin")).unwrap(),
+            release,
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn two_jobs_transfer_at_the_same_time() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (first_url, first_release, first_server) = stalled_server().await;
+        let (second_url, second_release, second_server) = stalled_server().await;
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url: first_url,
+                directory: output.path().into(),
+            })
+            .unwrap();
+        backend
+            .send(Command::Start {
+                url: second_url,
+                directory: output.path().into(),
+            })
+            .unwrap();
+
+        let running = wait_for(&mut backend, |snapshot| {
+            snapshot.active.len() == 2
+                && snapshot
+                    .jobs
+                    .iter()
+                    .filter(|view| view.state == DownloadState::Downloading)
+                    .count()
+                    == 2
+        })
+        .await;
+        assert_eq!(running.jobs.len(), 2);
+
+        first_release.send(()).unwrap();
+        second_release.send(()).unwrap();
+        first_server.await.unwrap();
+        second_server.await.unwrap();
+
+        let completed = wait_for(&mut backend, |snapshot| {
+            snapshot.active.is_empty()
+                && snapshot
+                    .jobs
+                    .iter()
+                    .all(|view| view.state == DownloadState::Completed)
+        })
+        .await;
+        assert_eq!(completed.jobs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_queues_the_extra_job() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let mut servers = Vec::new();
+
+        for _ in 0..=MAX_CONCURRENT_DOWNLOADS {
+            servers.push(stalled_server().await);
+        }
+
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+
+        for (url, _, _) in &servers {
+            backend
+                .send(Command::Start {
+                    url: url.clone(),
+                    directory: output.path().into(),
+                })
+                .unwrap();
+        }
+
+        let running = wait_for(&mut backend, |snapshot| {
+            snapshot.jobs.len() == MAX_CONCURRENT_DOWNLOADS + 1
+                && snapshot.active.len() == MAX_CONCURRENT_DOWNLOADS
+                && snapshot
+                    .jobs
+                    .iter()
+                    .filter(|view| view.state == DownloadState::Queued)
+                    .count()
+                    == 1
+        })
+        .await;
+        assert_eq!(running.jobs.len(), MAX_CONCURRENT_DOWNLOADS + 1);
+
+        let mut handles = Vec::new();
+        for (_, release, handle) in servers.drain(..MAX_CONCURRENT_DOWNLOADS) {
+            release.send(()).unwrap();
+            handles.push(handle);
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let last = wait_for(&mut backend, |snapshot| {
+            snapshot.active.len() == 1
+                && snapshot
+                    .jobs
+                    .iter()
+                    .filter(|view| view.state == DownloadState::Downloading)
+                    .count()
+                    == 1
+        })
+        .await;
+        assert_eq!(last.jobs.len(), MAX_CONCURRENT_DOWNLOADS + 1);
+
+        let (_, release, handle) = servers.pop().unwrap();
+        release.send(()).unwrap();
+        handle.await.unwrap();
+
+        let completed = wait_for(&mut backend, |snapshot| {
+            snapshot.active.is_empty()
+                && snapshot
+                    .jobs
+                    .iter()
+                    .all(|view| view.state == DownloadState::Completed)
+        })
+        .await;
+        assert_eq!(completed.jobs.len(), MAX_CONCURRENT_DOWNLOADS + 1);
+    }
+
     #[test]
     fn validation_rejects_credentials_and_non_http_input() {
         for value in [
@@ -1090,10 +1353,10 @@ mod tests {
         let cancellation = DownloadCancellation::new();
         let backend = Backend::with_snapshot(Snapshot {
             busy: true,
-            active: Some(id),
+            active: BTreeSet::from([id]),
             ..Default::default()
         });
-        *backend.active.lock().unwrap() = Some((id, cancellation.clone()));
+        *backend.active.lock().unwrap() = BTreeMap::from([(id, cancellation.clone())]);
         drop(backend);
         assert!(!cancellation.is_requested());
     }
@@ -1136,7 +1399,7 @@ mod tests {
         })
         .await;
         let view = &running.jobs[0];
-        assert!(running.busy);
+        assert!(running.active.contains(&view.id));
         assert_eq!(view.name, "manual report.pdf");
         assert_eq!(view.written, 0);
         assert_eq!(view.total, Some(5));
@@ -1222,7 +1485,7 @@ mod tests {
             let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
                 .await
                 .unwrap();
-            let mut manager = DownloadManager::start(repository).await.unwrap();
+            let manager = DownloadManager::start(repository).await.unwrap();
             let id = manager
                 .create(NewDownload::new(
                     RequestContext::new(url, Vec::new()),
@@ -1236,7 +1499,7 @@ mod tests {
                 .await
                 .unwrap()
                 .download_id();
-            let mut job = manager.job(id).unwrap().clone();
+            let mut job = manager.job(id).unwrap();
             let repository = manager.into_repository();
             let published = output.path().join("file.bin");
             std::fs::write(&published, b"previous output").unwrap();
@@ -1552,16 +1815,17 @@ mod tests {
             .unwrap()
             .unwrap();
         let snapshot = wait_for(&mut backend, |snapshot| {
-            snapshot.active.is_some()
+            !snapshot.active.is_empty()
                 && snapshot
                     .jobs
                     .first()
                     .is_some_and(|view| view.state == DownloadState::Downloading)
         })
         .await;
-        assert!(!snapshot.pause_supported);
-        assert!(!backend.pause(snapshot.active.unwrap()));
-        assert!(backend.cancel(snapshot.active.unwrap()));
+        let id = *snapshot.active.iter().next().unwrap();
+        assert!(!snapshot.jobs[0].pause_supported);
+        assert!(!backend.pause(id));
+        assert!(backend.cancel(id));
         let snapshot = wait_for(&mut backend, |snapshot| {
             !snapshot.busy
                 && snapshot
@@ -1616,14 +1880,14 @@ mod tests {
             .unwrap();
 
         let downloading = wait_for(&mut backend, |snapshot| {
-            snapshot.busy
-                && snapshot.jobs.first().is_some_and(|view| {
-                    view.state == DownloadState::Downloading && view.written == 5
-                })
+            snapshot
+                .jobs
+                .first()
+                .is_some_and(|view| view.state == DownloadState::Downloading && view.written == 5)
         })
         .await;
         let id = downloading.jobs[0].id;
-        assert!(downloading.pause_supported);
+        assert!(downloading.jobs[0].pause_supported);
         assert!(backend.pause(id));
 
         let paused = wait_for(&mut backend, |snapshot| {
@@ -1669,7 +1933,7 @@ mod tests {
         let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
             .await
             .unwrap();
-        let mut manager = DownloadManager::start(repository).await.unwrap();
+        let manager = DownloadManager::start(repository).await.unwrap();
         let id = manager
             .create(NewDownload::new(
                 RequestContext::new(url, Vec::new()),

@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Instant, MissedTickBehavior};
 
 use time::OffsetDateTime;
@@ -24,8 +26,9 @@ use crate::{
 /// Jobs become visible through the manager only after their repository
 /// operations have completed successfully.
 pub struct DownloadManager<R> {
-    repository: R,
-    jobs: BTreeMap<DownloadId, DownloadJob>,
+    repository: Arc<R>,
+    jobs: Arc<Mutex<BTreeMap<DownloadId, DownloadJob>>>,
+    write_lock: Arc<AsyncMutex<()>>,
 }
 
 impl<R> DownloadManager<R>
@@ -51,10 +54,16 @@ where
                 }
             }
 
-            let mut manager = Self { repository, jobs };
+            let manager = Self {
+                repository: Arc::new(repository),
+                jobs: Arc::new(Mutex::new(jobs)),
+                write_lock: Arc::new(AsyncMutex::new(())),
+            };
 
             let interrupted_jobs: Vec<_> = manager
                 .jobs
+                .lock()
+                .map_err(|_| invalid_repository_data("download manager state lock is poisoned"))?
                 .values()
                 .filter(|job| job.state().requires_recovery_after_restart())
                 .cloned()
@@ -85,7 +94,7 @@ where
             }
 
             tracing::info!(
-                jobs_loaded = manager.jobs.len(),
+                jobs_loaded = manager.jobs().len(),
                 jobs_interrupted = interrupted_count,
                 "download manager started",
             );
@@ -99,25 +108,28 @@ where
 
     /// Persists a new job before exposing it through application state.
     #[tracing::instrument(name = "manager.create", skip_all, fields(download_id = tracing::field::Empty))]
-    pub async fn create(
-        &mut self,
-        download: NewDownload,
-    ) -> Result<DownloadEvent, RepositoryError> {
+    pub async fn create(&self, download: NewDownload) -> Result<DownloadEvent, RepositoryError> {
         let result = async {
+            let _write = self.write_lock.lock().await;
             let created_at = OffsetDateTime::now_utc();
             let job = self.repository.create(download, created_at).await?;
             let id = job.id();
 
             tracing::Span::current().record("download_id", id.value());
 
-            if self.jobs.contains_key(&id) {
+            let mut jobs = self
+                .jobs
+                .lock()
+                .map_err(|_| invalid_repository_data("download manager state lock is poisoned"))?;
+
+            if jobs.contains_key(&id) {
                 return Err(invalid_repository_data(
                     "repository returned an existing download ID",
                 ));
             }
 
             let state = job.state();
-            self.jobs.insert(id, job);
+            jobs.insert(id, job);
 
             tracing::info!(state = ?state, "download registered");
 
@@ -133,7 +145,7 @@ where
     /// Pausing active execution requires worker coordination and is not
     /// supported by this operation yet.
     #[tracing::instrument(name = "manager.pause", skip_all, fields(download_id = id.value()))]
-    pub async fn pause(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+    pub async fn pause(&self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Pause)
             .await
             .inspect_err(|error| {
@@ -145,7 +157,7 @@ where
     ///
     /// This changes scheduling eligibility; it does not start a transfer.
     #[tracing::instrument(name = "manager.resume", skip_all, fields(download_id = id.value()))]
-    pub async fn resume(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+    pub async fn resume(&self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Resume)
             .await
             .inspect_err(|error| {
@@ -155,7 +167,7 @@ where
 
     /// Returns a retryable failed job to the queue.
     #[tracing::instrument(name = "manager.retry", skip_all, fields(download_id = id.value()))]
-    pub async fn retry(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+    pub async fn retry(&self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Retry)
             .await
             .inspect_err(|error| {
@@ -165,7 +177,7 @@ where
 
     /// Queues a fresh attempt for an idle job with execution metadata cleared.
     #[tracing::instrument(name = "manager.restart", skip_all, fields(download_id = id.value()))]
-    pub async fn restart(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+    pub async fn restart(&self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Restart)
             .await
             .inspect_err(|error| {
@@ -178,7 +190,7 @@ where
     /// Cancelling active execution requires worker coordination and is not
     /// supported by this operation yet.
     #[tracing::instrument(name = "manager.cancel", skip_all, fields(download_id = id.value()))]
-    pub async fn cancel(&mut self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
+    pub async fn cancel(&self, id: DownloadId) -> Result<DownloadEvent, DownloadManagerError> {
         self.change_idle_state(id, DownloadCommandKind::Cancel)
             .await
             .inspect_err(|error| {
@@ -188,7 +200,7 @@ where
 
     /// Executes a qued download and persists each phase.
     pub async fn execute<E>(
-        &mut self,
+        &self,
         id: DownloadId,
         executor: &E,
     ) -> Result<ExecutionReport, DownloadManagerError>
@@ -200,7 +212,7 @@ where
 
     /// Calls the observer after persisting changed progress; it must not block.
     pub async fn execute_with_progress<E, F>(
-        &mut self,
+        &self,
         id: DownloadId,
         executor: &E,
         on_progress: F,
@@ -215,7 +227,7 @@ where
 
     /// Executes a job with progress observation and cooperative pause or cancellation.
     pub async fn execute_controlled<E, F>(
-        &mut self,
+        &self,
         id: DownloadId,
         executor: &E,
         cancellation: DownloadCancellation,
@@ -236,7 +248,7 @@ where
     /// Reports saved inspection metadata and progress; the observer must not block.
     #[tracing::instrument(name = "manager.execute", skip_all, fields(download_id = id.value()))]
     pub async fn execute_controlled_with_updates<E, F>(
-        &mut self,
+        &self,
         id: DownloadId,
         executor: &E,
         cancellation: DownloadCancellation,
@@ -251,7 +263,7 @@ where
             .inspect_err(|error| report_management_error("manager.execute", error))
     }
     async fn execute_inner<E, F>(
-        &mut self,
+        &self,
         id: DownloadId,
         executor: &E,
         cancellation: &DownloadCancellation,
@@ -261,11 +273,7 @@ where
         E: DownloadExecutor,
         F: FnMut(DownloadEvent, &DownloadJob) + Send,
     {
-        let mut job = self
-            .jobs
-            .get(&id)
-            .cloned()
-            .ok_or(DownloadManagerError::NotFound { id })?;
+        let mut job = self.job(id).ok_or(DownloadManagerError::NotFound { id })?;
 
         if job.state() != DownloadState::Queued {
             return Err(DownloadManagerError::InvalidExecutionState {
@@ -508,11 +516,11 @@ where
     /// Persists completion using an executor's successful publication result.
     #[tracing::instrument(name = "manager.confirm_completion", skip_all, fields(download_id = id.value()))]
     pub async fn confirm_published_output(
-        &mut self,
+        &self,
         id: DownloadId,
         output: &ExecutionOutput,
     ) -> Result<DownloadEvent, RepositoryError> {
-        let mut job = self.jobs.get(&id).cloned().ok_or_else(|| {
+        let mut job = self.job(id).ok_or_else(|| {
             RepositoryError::new(
                 RepositoryErrorKind::NotFound,
                 "published download does not exist",
@@ -538,15 +546,11 @@ where
     }
 
     async fn record_execution_failure(
-        &mut self,
+        &self,
         id: DownloadId,
         failure: DownloadFailure,
     ) -> Result<ExecutionReport, DownloadManagerError> {
-        let mut job = self
-            .jobs
-            .get(&id)
-            .cloned()
-            .ok_or(DownloadManagerError::NotFound { id })?;
+        let mut job = self.job(id).ok_or(DownloadManagerError::NotFound { id })?;
 
         job.fail(failure.clone(), OffsetDateTime::now_utc())
             .map_err(|_| {
@@ -567,14 +571,12 @@ where
     }
 
     async fn change_idle_state(
-        &mut self,
+        &self,
         id: DownloadId,
         command: DownloadCommandKind,
     ) -> Result<DownloadEvent, DownloadManagerError> {
-        let current = self
-            .jobs
-            .get(&id)
-            .ok_or(DownloadManagerError::NotFound { id })?;
+        let _write = self.write_lock.lock().await;
+        let current = self.job(id).ok_or(DownloadManagerError::NotFound { id })?;
 
         let previous = current.state();
 
@@ -603,7 +605,7 @@ where
             }
         };
 
-        let mut candidate = current.clone();
+        let mut candidate = current;
 
         let updated_at = OffsetDateTime::now_utc();
         if command == DownloadCommandKind::Restart {
@@ -617,7 +619,7 @@ where
             state: previous,
         })?;
 
-        self.commit_job(candidate).await?;
+        self.save_job_locked(candidate).await?;
 
         tracing::info!(
             previous = ?previous,
@@ -632,7 +634,15 @@ where
         })
     }
 
-    async fn commit_job(&mut self, candidate: DownloadJob) -> Result<DownloadJob, RepositoryError> {
+    async fn commit_job(&self, candidate: DownloadJob) -> Result<DownloadJob, RepositoryError> {
+        let _write = self.write_lock.lock().await;
+        self.save_job_locked(candidate).await
+    }
+
+    async fn save_job_locked(
+        &self,
+        candidate: DownloadJob,
+    ) -> Result<DownloadJob, RepositoryError> {
         let id = candidate.id();
         let persisted = self.repository.save(&candidate).await?;
 
@@ -645,13 +655,16 @@ where
             ));
         }
 
-        self.jobs.insert(id, persisted.clone());
+        self.jobs
+            .lock()
+            .map_err(|_| invalid_repository_data("download manager state lock is poisoned"))?
+            .insert(id, persisted.clone());
 
         Ok(persisted)
     }
 
     async fn checkpoint_progress<F>(
-        &mut self,
+        &self,
         job: &mut DownloadJob,
         written_bytes: u64,
         on_progress: &mut F,
@@ -682,7 +695,7 @@ where
     }
 
     async fn record_execution_stop<F>(
-        &mut self,
+        &self,
         mut job: DownloadJob,
         written_bytes: Option<u64>,
         request: DownloadControlRequest,
@@ -695,8 +708,7 @@ where
         let previous = job.state();
 
         let persisted_progress = self
-            .jobs
-            .get(&id)
+            .job(id)
             .ok_or(DownloadManagerError::NotFound { id })?
             .progress();
 
@@ -734,31 +746,39 @@ where
         })
     }
 
-    /// Returns an immutable job snapshot owned by the manager.
+    /// Returns a job snapshot.
     #[must_use]
-    pub fn job(&self, id: DownloadId) -> Option<&DownloadJob> {
-        self.jobs.get(&id)
+    pub fn job(&self, id: DownloadId) -> Option<DownloadJob> {
+        self.jobs
+            .lock()
+            .ok()
+            .and_then(|jobs| jobs.get(&id).cloned())
     }
 
-    /// Iterates over jobs in ascending identifier order.
-    pub fn jobs(&self) -> impl Iterator<Item = &DownloadJob> {
-        self.jobs.values()
+    /// Returns jobs in ascending identifier order.
+    pub fn jobs(&self) -> Vec<DownloadJob> {
+        self.jobs
+            .lock()
+            .map(|jobs| jobs.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.jobs.len()
+        self.jobs.lock().map_or(0, |jobs| jobs.len())
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
+        self.jobs.lock().map_or(true, |jobs| jobs.is_empty())
     }
 
     /// Returns the repository when the composition root shuts the manager down.
     #[must_use]
     pub fn into_repository(self) -> R {
-        self.repository
+        Arc::try_unwrap(self.repository)
+            .ok()
+            .expect("manager still holds a repository reference")
     }
 }
 
@@ -860,9 +880,9 @@ mod tests {
         fail_create: bool,
         fail_save: bool,
         save_calls: Arc<AtomicUsize>,
-        fail_save_at: Option<DownloadState>,
-        fail_progress_save: bool,
-        shared_connection: Option<Arc<CheckpointContention>>,
+        fail_save_at: Mutex<Option<DownloadState>>,
+        fail_progress_save: Mutex<bool>,
+        shared_connection: Mutex<Option<Arc<CheckpointContention>>>,
     }
 
     impl FakeRepository {
@@ -876,9 +896,9 @@ mod tests {
                 fail_create: false,
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
-                fail_save_at: None,
-                fail_progress_save: false,
-                shared_connection: None,
+                fail_save_at: Mutex::new(None),
+                fail_progress_save: Mutex::new(false),
+                shared_connection: Mutex::new(None),
             }
         }
 
@@ -890,9 +910,9 @@ mod tests {
                 fail_create: false,
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
-                fail_save_at: None,
-                fail_progress_save: false,
-                shared_connection: None,
+                fail_save_at: Mutex::new(None),
+                fail_progress_save: Mutex::new(false),
+                shared_connection: Mutex::new(None),
             }
         }
 
@@ -904,9 +924,9 @@ mod tests {
                 fail_create: true,
                 fail_save: false,
                 save_calls: Arc::new(AtomicUsize::new(0)),
-                fail_save_at: None,
-                fail_progress_save: false,
-                shared_connection: None,
+                fail_save_at: Mutex::new(None),
+                fail_progress_save: Mutex::new(false),
+                shared_connection: Mutex::new(None),
             }
         }
     }
@@ -964,19 +984,31 @@ mod tests {
         async fn save(&self, job: &DownloadJob) -> Result<DownloadJob, RepositoryError> {
             self.save_calls.fetch_add(1, Ordering::Relaxed);
 
-            let _connection = if let Some(shared) = &self.shared_connection
+            let shared_connection = self
+                .shared_connection
+                .lock()
+                .expect("shared connection lock is not poisoned")
+                .clone();
+            let _connection = if let Some(shared) = shared_connection
                 && job.state() == DownloadState::Downloading
                 && job.progress().downloaded_bytes() > 0
             {
                 shared.checkpoint_waiting.notify_one();
-                Some(shared.connection.lock().await)
+                Some(shared.connection.clone().lock_owned().await)
             } else {
                 None
             };
 
             if self.fail_save
-                || self.fail_save_at == Some(job.state())
-                || (self.fail_progress_save
+                || *self
+                    .fail_save_at
+                    .lock()
+                    .expect("failure state lock is not poisoned")
+                    == Some(job.state())
+                || (*self
+                    .fail_progress_save
+                    .lock()
+                    .expect("progress failure lock is not poisoned")
                     && job.state() == DownloadState::Downloading
                     && job.progress().downloaded_bytes() > 0)
             {
@@ -1046,7 +1078,11 @@ mod tests {
             .await
             .expect("manager must start");
 
-        let ids: Vec<i64> = manager.jobs().map(|job| job.id().value()).collect();
+        let ids: Vec<i64> = manager
+            .jobs()
+            .into_iter()
+            .map(|job| job.id().value())
+            .collect();
 
         assert_eq!(ids, vec![1, 2, 3]);
     }
@@ -1080,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn created_job_becomes_visible_after_persistence() {
         let repository = FakeRepository::with_jobs(Vec::new());
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1100,7 +1136,7 @@ mod tests {
     #[tokio::test]
     async fn failed_creation_does_not_change_manager_state() {
         let repository = FakeRepository::failing_create();
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1117,7 +1153,7 @@ mod tests {
 
         repository.next_id.store(1, Ordering::Relaxed);
 
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1128,7 +1164,7 @@ mod tests {
 
         assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
         assert_eq!(manager.len(), 1);
-        assert!(manager.job(original.id()) == Some(&original));
+        assert!(manager.job(original.id()) == Some(original));
     }
 
     #[tokio::test]
@@ -1137,7 +1173,7 @@ mod tests {
         let id = original.id();
 
         let repository = FakeRepository::with_jobs(vec![original]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1160,7 +1196,7 @@ mod tests {
             .expect("job must exist");
 
         assert_eq!(persisted.state(), DownloadState::Paused);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
 
         let event = manager.resume(id).await.expect("resume must succeed");
 
@@ -1181,7 +1217,7 @@ mod tests {
             .expect("job must exist");
 
         assert_eq!(persisted.state(), DownloadState::Queued);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
 
         let event = manager.cancel(id).await.expect("cancel must succeed");
 
@@ -1202,7 +1238,7 @@ mod tests {
             .expect("job must exist");
 
         assert_eq!(persisted.state(), DownloadState::Cancelled);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
 
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 3,);
     }
@@ -1216,7 +1252,7 @@ mod tests {
             .expect("inspection transition must succeed");
 
         let repository = FakeRepository::with_jobs(vec![original]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1256,7 +1292,7 @@ mod tests {
             .expect("failure transition must succeed");
 
         let repository = FakeRepository::with_jobs(vec![original]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1278,7 +1314,7 @@ mod tests {
             .expect("job must exist");
         assert_eq!(persisted.state(), DownloadState::Queued);
         assert!(persisted.last_failure().is_some());
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1);
     }
 
@@ -1297,7 +1333,7 @@ mod tests {
             .expect("failure transition must succeed");
 
         let repository = FakeRepository::with_jobs(vec![original.clone()]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1309,7 +1345,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0);
     }
 
@@ -1331,7 +1367,7 @@ mod tests {
             )
             .expect("failure transition must succeed");
 
-        let mut manager = DownloadManager::start(FakeRepository::with_jobs(vec![original]))
+        let manager = DownloadManager::start(FakeRepository::with_jobs(vec![original]))
             .await
             .expect("manager must start");
         manager.restart(id).await.expect("restart must succeed");
@@ -1368,10 +1404,9 @@ mod tests {
                 false,
             ));
             let original = DownloadJob::restore(snapshot);
-            let mut manager =
-                DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
-                    .await
-                    .unwrap();
+            let manager = DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
+                .await
+                .unwrap();
 
             let event = manager.restart(id).await.unwrap();
 
@@ -1393,7 +1428,7 @@ mod tests {
             assert!(restarted.destination() == original.destination());
             assert!(restarted.origin() == original.origin());
             assert_eq!(restarted.created_at(), original.created_at());
-            assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == Some(restarted));
+            assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == Some(&restarted));
             assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1);
         }
     }
@@ -1407,10 +1442,10 @@ mod tests {
         let id = original.id();
         let mut repository = FakeRepository::with_jobs(vec![original.clone()]);
         repository.fail_save = true;
-        let mut manager = DownloadManager::start(repository).await.unwrap();
+        let manager = DownloadManager::start(repository).await.unwrap();
 
         assert!(manager.restart(id).await.is_err());
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original.clone()));
         assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == Some(&original));
     }
 
@@ -1423,14 +1458,17 @@ mod tests {
         ] {
             let original = job(1);
             let id = original.id();
-            let mut manager =
-                DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
-                    .await
-                    .unwrap();
+            let manager = DownloadManager::start(FakeRepository::with_jobs(vec![original.clone()]))
+                .await
+                .unwrap();
             let mut snapshot = original.snapshot();
             snapshot.state = state;
             let active = DownloadJob::restore(snapshot);
-            manager.jobs.insert(id, active.clone());
+            manager
+                .jobs
+                .lock()
+                .expect("manager state lock is not poisoned")
+                .insert(id, active.clone());
 
             assert!(matches!(
                 manager.restart(id).await,
@@ -1439,7 +1477,7 @@ mod tests {
                     ..
                 })
             ));
-            assert!(manager.job(id) == Some(&active));
+            assert!(manager.job(id) == Some(active));
             assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0);
         }
     }
@@ -1452,7 +1490,7 @@ mod tests {
         let mut repository = FakeRepository::with_jobs(vec![original.clone()]);
         repository.fail_save = true;
 
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1464,7 +1502,7 @@ mod tests {
                 if error.kind() == RepositoryErrorKind::Unavailable
         ));
 
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original.clone()));
 
         let persisted = manager
             .repository
@@ -1483,7 +1521,7 @@ mod tests {
         let id = original.id();
 
         let repository = FakeRepository::with_jobs(vec![original.clone()]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1497,14 +1535,14 @@ mod tests {
             })
         ));
 
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
     }
 
     #[tokio::test]
     async fn missing_job_does_not_call_storage() {
         let repository = FakeRepository::with_jobs(Vec::new());
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1534,9 +1572,13 @@ mod tests {
 
         let repository = FakeRepository::with_jobs(vec![active.clone()]);
 
-        let mut manager = DownloadManager {
-            repository,
-            jobs: std::collections::BTreeMap::from([(id, active.clone())]),
+        let manager = DownloadManager {
+            repository: Arc::new(repository),
+            jobs: Arc::new(Mutex::new(std::collections::BTreeMap::from([(
+                id,
+                active.clone(),
+            )]))),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
         assert!(matches!(
@@ -1549,7 +1591,7 @@ mod tests {
             Err(DownloadManagerError::InvalidOperation { .. })
         ));
 
-        assert!(manager.job(id) == Some(&active));
+        assert!(manager.job(id) == Some(active));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
     }
 
@@ -1559,7 +1601,7 @@ mod tests {
         let id = original.id();
 
         let repository = FakeRepository::with_jobs(vec![original]);
-        let mut manager = DownloadManager::start(repository)
+        let manager = DownloadManager::start(repository)
             .await
             .expect("manager must start");
 
@@ -1673,7 +1715,7 @@ mod tests {
         let id = initial.id();
 
         let mut repository = FakeRepository::with_jobs(vec![initial]);
-        repository.fail_save_at = fail_save_at;
+        repository.fail_save_at = Mutex::new(fail_save_at);
 
         let executor = ExecutionProbe {
             saves: Arc::clone(&repository.save_calls),
@@ -1690,7 +1732,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_observer_receives_saved_metadata_before_transfer() {
-        let (mut manager, executor, id) = execution_fixture(None, None).await;
+        let (manager, executor, id) = execution_fixture(None, None).await;
         let mut observed = false;
         manager
             .execute_controlled_with_updates(
@@ -1726,7 +1768,7 @@ mod tests {
 
     #[tokio::test]
     async fn inspection_save_failure_does_not_publish_metadata() {
-        let (mut manager, executor, id) =
+        let (manager, executor, id) =
             execution_fixture(Some(DownloadState::Downloading), None).await;
         let mut observed = false;
         let result = manager
@@ -1741,7 +1783,7 @@ mod tests {
 
     #[tokio::test]
     async fn execution_persists_each_phase_before_advancing() {
-        let (mut manager, executor, id) = execution_fixture(None, None).await;
+        let (manager, executor, id) = execution_fixture(None, None).await;
 
         let report = manager
             .execute(id, &executor)
@@ -1767,7 +1809,7 @@ mod tests {
             .expect("lookup must succeed")
             .expect("job must exist");
 
-        assert!(current == &persisted);
+        assert!(current == persisted);
         assert_eq!(executor.saves.load(Ordering::Relaxed), 4);
 
         assert_eq!(
@@ -1811,7 +1853,7 @@ mod tests {
         ];
 
         for (failed_save, expected_state, expected_calls) in cases {
-            let (mut manager, executor, id) = execution_fixture(Some(failed_save), None).await;
+            let (manager, executor, id) = execution_fixture(Some(failed_save), None).await;
 
             let error = match manager.execute(id, &executor).await {
                 Ok(_) => panic!("persistence must fail"),
@@ -1840,7 +1882,7 @@ mod tests {
                 .expect("lookup must succeed")
                 .expect("job must exist");
 
-            assert!(current == &persisted);
+            assert!(current == persisted);
 
             assert_eq!(
                 *executor
@@ -1854,8 +1896,7 @@ mod tests {
 
     #[tokio::test]
     async fn published_completion_can_be_retried_without_executing_again() {
-        let (mut manager, executor, id) =
-            execution_fixture(Some(DownloadState::Completed), None).await;
+        let (manager, executor, id) = execution_fixture(Some(DownloadState::Completed), None).await;
         let error = match manager.execute(id, &executor).await {
             Err(error) => error,
             Ok(_) => panic!("completion save must fail"),
@@ -1877,7 +1918,11 @@ mod tests {
         let calls = executor.calls.lock().unwrap().clone();
         assert!(manager.confirm_published_output(id, &output).await.is_err());
         assert_eq!(manager.job(id).unwrap().state(), DownloadState::Finalizing);
-        manager.repository.fail_save_at = None;
+        *manager
+            .repository
+            .fail_save_at
+            .lock()
+            .expect("failure state lock is not poisoned") = None;
         let event = manager.confirm_published_output(id, &output).await.unwrap();
         assert!(
             event
@@ -1887,14 +1932,15 @@ mod tests {
                 }
         );
         assert_eq!(manager.job(id).unwrap().state(), DownloadState::Completed);
-        assert!(manager.repository.find_by_id(id).await.unwrap().as_ref() == manager.job(id));
+        assert!(
+            manager.repository.find_by_id(id).await.unwrap().as_ref() == manager.job(id).as_ref()
+        );
         assert_eq!(*executor.calls.lock().unwrap(), calls);
     }
 
     #[tokio::test]
     async fn published_completion_rejects_mismatched_counts_and_nonfinalizing_jobs() {
-        let (mut manager, executor, id) =
-            execution_fixture(Some(DownloadState::Completed), None).await;
+        let (manager, executor, id) = execution_fixture(Some(DownloadState::Completed), None).await;
         let error = match manager.execute(id, &executor).await {
             Err(error) => error,
             Ok(_) => panic!("completion save must fail"),
@@ -1907,8 +1953,12 @@ mod tests {
         else {
             panic!("publication must precede the failed save");
         };
-        manager.repository.fail_save_at = None;
-        let original = manager.job(id).unwrap().clone();
+        *manager
+            .repository
+            .fail_save_at
+            .lock()
+            .expect("failure state lock is not poisoned") = None;
+        let original = manager.job(id).unwrap();
         let saves = manager.repository.save_calls.load(Ordering::Relaxed);
         let mut output = ExecutionOutput {
             destination,
@@ -1916,7 +1966,7 @@ mod tests {
             cleanup_pending: false,
         };
         assert!(manager.confirm_published_output(id, &output).await.is_err());
-        assert!(manager.job(id) == Some(&original));
+        assert!(manager.job(id) == Some(original));
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), saves);
         output.written_bytes = written_bytes;
         manager.confirm_published_output(id, &output).await.unwrap();
@@ -1928,7 +1978,7 @@ mod tests {
     #[tokio::test]
     async fn executor_failures_are_persisted_before_returning_failed() {
         for phase in ["prepare", "transfer", "finalize"] {
-            let (mut manager, executor, id) = execution_fixture(None, Some(phase)).await;
+            let (manager, executor, id) = execution_fixture(None, Some(phase)).await;
 
             let report = manager
                 .execute(id, &executor)
@@ -1955,13 +2005,13 @@ mod tests {
                 .expect("lookup must succeed")
                 .expect("job must exist");
 
-            assert!(current == &persisted);
+            assert!(current == persisted);
         }
     }
 
     #[tokio::test]
     async fn failure_recording_error_does_not_return_a_failed_event() {
-        let (mut manager, executor, id) =
+        let (manager, executor, id) =
             execution_fixture(Some(DownloadState::Failed), Some("transfer")).await;
 
         assert!(matches!(
@@ -1977,7 +2027,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_and_missing_jobs_do_not_start_execution() {
-        let (mut manager, executor, id) = execution_fixture(None, None).await;
+        let (manager, executor, id) = execution_fixture(None, None).await;
 
         manager.pause(id).await.expect("pause must succeed");
 
@@ -2006,7 +2056,7 @@ mod tests {
     }
 
     struct CheckpointContention {
-        connection: tokio::sync::Mutex<()>,
+        connection: Arc<tokio::sync::Mutex<()>>,
         checkpoint_waiting: tokio::sync::Notify,
     }
 
@@ -2097,7 +2147,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn progress_notifications_follow_successful_checkpoints() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let (manager, _, id) = execution_fixture(None, None).await;
 
         let saves = Arc::clone(&manager.repository.save_calls);
         let finalizations = Arc::new(AtomicUsize::new(0));
@@ -2141,17 +2191,21 @@ mod tests {
 
         assert_eq!(persisted.state(), DownloadState::Completed);
         assert_eq!(persisted.progress().downloaded_bytes(), 5);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[tokio::test(start_paused = true)]
     async fn transfer_keeps_running_while_progress_waits_for_a_shared_connection() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let (manager, _, id) = execution_fixture(None, None).await;
         let shared = Arc::new(CheckpointContention {
-            connection: tokio::sync::Mutex::new(()),
+            connection: Arc::new(tokio::sync::Mutex::new(())),
             checkpoint_waiting: tokio::sync::Notify::new(),
         });
-        manager.repository.shared_connection = Some(shared.clone());
+        *manager
+            .repository
+            .shared_connection
+            .lock()
+            .expect("shared connection lock is not poisoned") = Some(shared.clone());
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
             finalizations: finalizations.clone(),
@@ -2178,8 +2232,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn checkpoint_failure_emits_no_progress_and_prevents_publication() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
-        manager.repository.fail_progress_save = true;
+        let (manager, _, id) = execution_fixture(None, None).await;
+        *manager
+            .repository
+            .fail_progress_save
+            .lock()
+            .expect("progress failure lock is not poisoned") = true;
 
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
@@ -2209,7 +2267,7 @@ mod tests {
 
         assert_eq!(persisted.state(), DownloadState::Downloading);
         assert_eq!(persisted.progress().downloaded_bytes(), 0);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[test]
@@ -2234,7 +2292,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_before_execution_does_not_call_executor() {
-        let (mut manager, executor, id) = execution_fixture(None, None).await;
+        let (manager, executor, id) = execution_fixture(None, None).await;
 
         let cancellation = DownloadCancellation::new();
         cancellation.request();
@@ -2269,12 +2327,12 @@ mod tests {
             .expect("job must exist");
 
         assert_eq!(persisted.state(), DownloadState::Cancelled);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[tokio::test(start_paused = true)]
     async fn active_cancellation_preserves_progress_without_publication() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let (manager, _, id) = execution_fixture(None, None).await;
 
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
@@ -2316,12 +2374,12 @@ mod tests {
 
         assert_eq!(persisted.state(), DownloadState::Cancelled);
         assert_eq!(persisted.progress().downloaded_bytes(), 2);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[tokio::test(start_paused = true)]
     async fn active_pause_preserves_progress_without_publication() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let (manager, _, id) = execution_fixture(None, None).await;
 
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
@@ -2361,12 +2419,12 @@ mod tests {
             .expect("job must exist");
         assert_eq!(persisted.state(), DownloadState::Paused);
         assert_eq!(persisted.progress().downloaded_bytes(), 2);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_persistence_failure_does_not_publish_output() {
-        let (mut manager, _, id) = execution_fixture(Some(DownloadState::Cancelled), None).await;
+        let (manager, _, id) = execution_fixture(Some(DownloadState::Cancelled), None).await;
 
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
@@ -2400,12 +2458,12 @@ mod tests {
 
         assert_eq!(persisted.state(), DownloadState::Downloading);
         assert_eq!(persisted.progress().downloaded_bytes(), 2);
-        assert!(manager.job(id) == Some(&persisted));
+        assert!(manager.job(id) == Some(persisted));
     }
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_after_finalization_boundary_does_not_cancel_output() {
-        let (mut manager, _, id) = execution_fixture(None, None).await;
+        let (manager, _, id) = execution_fixture(None, None).await;
 
         let finalizations = Arc::new(AtomicUsize::new(0));
         let executor = ProgressProbe {
@@ -2473,7 +2531,7 @@ mod tests {
                 .expect("lookup must succeed")
                 .expect("persisted job must exist");
 
-            assert!(persisted == *recovered);
+            assert!(persisted == recovered);
             assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1,);
         }
     }
@@ -2499,7 +2557,7 @@ mod tests {
                 .await
                 .expect("manager must start");
 
-            assert!(manager.job(id) == Some(&original));
+            assert!(manager.job(id) == Some(original));
             assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 0,);
         }
     }
@@ -2531,7 +2589,7 @@ mod tests {
             .await
             .expect("first startup must succeed");
 
-        let expected: Vec<_> = manager.jobs().cloned().collect();
+        let expected = manager.jobs();
         let repository = manager.into_repository();
 
         assert_eq!(repository.save_calls.load(Ordering::Relaxed), 1);
@@ -2540,7 +2598,7 @@ mod tests {
             .await
             .expect("second startup must succeed");
 
-        assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+        assert!(manager.jobs() == expected);
         assert_eq!(manager.repository.save_calls.load(Ordering::Relaxed), 1,);
     }
 

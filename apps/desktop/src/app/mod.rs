@@ -73,9 +73,13 @@ impl Desktop {
     fn update(&mut self) {
         if self.backend.snapshots.has_changed().unwrap_or(true) {
             let next = self.backend.snapshots.borrow_and_update().clone();
-            if next.active.is_some() && next.active != self.snapshot.active {
-                self.selected = next.active;
-                self.transfer = next.active;
+            if self.selected.is_none()
+                && let Some(id) = next.active.iter().next().copied()
+            {
+                self.selected = Some(id);
+                if self.transfer.is_none() {
+                    self.transfer = Some(id);
+                }
                 self.filter = Filter::All;
                 self.search.clear();
             }
@@ -98,7 +102,9 @@ impl Desktop {
             }
         }
         if let Some(view) = self.snapshot.jobs.iter().find(|view| {
-            Some(view.id) == self.snapshot.active && view.state == DownloadState::Downloading
+            self.selected == Some(view.id)
+                && self.snapshot.active.contains(&view.id)
+                && view.state == DownloadState::Downloading
         }) {
             match self.measurement {
                 Some((id, initial, started)) if id == view.id && view.written >= initial => {
@@ -204,6 +210,9 @@ impl Desktop {
             let can_resume = selected.as_ref().is_some_and(DownloadView::can_resume);
             let can_retry = selected.as_ref().is_some_and(DownloadView::can_retry);
             let can_restart = selected.as_ref().is_some_and(DownloadView::can_restart);
+            let active_selected = self
+                .selected
+                .is_some_and(|id| self.snapshot.active.contains(&id));
             let save_status = selected
                 .as_ref()
                 .is_some_and(|view| view.completion_pending);
@@ -234,7 +243,7 @@ impl Desktop {
                 ui,
                 Icon::Resume,
                 "Restart",
-                !self.busy() && can_restart,
+                !self.busy() && !active_selected && can_restart,
                 ACCENT,
             )
             .on_hover_text(
@@ -245,15 +254,17 @@ impl Desktop {
             {
                 self.send(Command::Restart(view.id));
             }
-            let active_selected = self.selected.is_some() && self.selected == self.snapshot.active;
+            let pause_supported = self
+                .selected_view()
+                .is_some_and(|view| view.pause_supported);
             let mut pause = action_button(
                 ui,
                 Icon::Pause,
                 "Pause",
-                active_selected && self.snapshot.pause_supported,
+                active_selected && pause_supported,
                 Color32::from_rgb(218, 156, 55),
             );
-            if active_selected && !self.snapshot.pause_supported {
+            if active_selected && !pause_supported {
                 pause = pause
                     .on_disabled_hover_text("This server does not support resuming this download.");
             }
@@ -267,7 +278,8 @@ impl Desktop {
                 ui,
                 Icon::Cancel,
                 "Cancel",
-                self.selected.is_some() && self.selected == self.snapshot.active,
+                self.selected
+                    .is_some_and(|id| self.snapshot.active.contains(&id)),
                 self.error_color(),
             )
             .clicked()
@@ -294,7 +306,7 @@ impl Desktop {
     }
 
     fn remaining(&self, view: &DownloadView) -> String {
-        if self.snapshot.active != Some(view.id) || self.rate == 0 {
+        if !self.snapshot.active.contains(&view.id) || self.rate == 0 {
             return "—".into();
         }
         view.total
@@ -334,7 +346,7 @@ impl Desktop {
                     .jobs
                     .iter()
                     .filter(|view| {
-                        self.filter.matches(view, self.snapshot.active)
+                        self.filter.matches(view, &self.snapshot.active)
                             && view.name.to_lowercase().contains(&query)
                     })
                     .map(|view| view.id)

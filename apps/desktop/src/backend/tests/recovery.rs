@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn updating_one_job_preserves_other_jobs_recovery_actions() {
     let repository = SqliteDownloadRepository::open_in_memory().await.unwrap();
-    let mut manager = DownloadManager::start(repository).await.unwrap();
+    let manager = DownloadManager::start(repository).await.unwrap();
     for _ in 0..2 {
         manager
             .create(NewDownload::new(
@@ -25,8 +25,8 @@ async fn updating_one_job_preserves_other_jobs_recovery_actions() {
         jobs: vec![saved],
         ..Default::default()
     };
-    let second = manager.jobs().nth(1).unwrap();
-    update_job_view(&mut snapshot, second);
+    let second = manager.jobs().into_iter().nth(1).unwrap();
+    update_job_view(&mut snapshot, &second);
     assert!(snapshot.jobs[0].completion_pending);
     assert_eq!(snapshot.jobs[0].name, "file (1).bin");
     assert_eq!(
@@ -35,7 +35,7 @@ async fn updating_one_job_preserves_other_jobs_recovery_actions() {
     );
     assert_eq!(snapshot.jobs[1].id, second.id());
     assert_eq!(snapshot.jobs.len(), 2);
-    update_job_view(&mut snapshot, second);
+    update_job_view(&mut snapshot, &second);
     assert_eq!(snapshot.jobs.len(), 2);
 }
 
@@ -147,7 +147,7 @@ async fn published_file_status_can_be_saved_without_another_download() {
     assert_ne!(published, previous);
     assert_eq!(std::fs::read(&published).unwrap(), b"hello");
     assert!(!view.can_resume() && !view.can_retry() && !view.can_restart());
-    assert!(stopped.active.is_none());
+    assert!(stopped.active.is_empty());
     let request = String::from_utf8(server.await.unwrap()).unwrap();
     assert!(request.starts_with("GET "));
     backend.send(Command::SaveStatus(id)).unwrap();
@@ -196,7 +196,7 @@ async fn missing_resume_data_offers_restart_and_rejects_stale_resume_commands() 
         let repository = SqliteDownloadRepository::open(data.path().join("gunda.sqlite3"))
             .await
             .unwrap();
-        let mut manager = DownloadManager::start(repository).await.unwrap();
+        let manager = DownloadManager::start(repository).await.unwrap();
         let id = manager
             .create(NewDownload::new(
                 RequestContext::new(url, Vec::new()),

@@ -131,7 +131,7 @@ async fn startup_recovery_is_durable_and_preservers_files_and_metadata() {
         assert!(recovered.updated_at() >= original.updated_at());
     }
 
-    let expected: Vec<_> = manager.jobs().cloned().collect();
+    let expected: Vec<_> = manager.jobs();
 
     manager.into_repository().close().await;
 
@@ -145,7 +145,7 @@ async fn startup_recovery_is_durable_and_preservers_files_and_metadata() {
         .await
         .expect("repeated startup must succeed");
 
-    assert!(manager.jobs().cloned().collect::<Vec<_>>() == expected);
+    assert!(manager.jobs() == expected);
 
     for (path, contents) in files {
         assert_eq!(
