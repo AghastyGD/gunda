@@ -231,9 +231,11 @@ impl Drop for Backend {
     fn drop(&mut self) {
         self.closing.store(true, Ordering::Release);
         self.commands.take();
-        // Closing the process interrupts a transfer; it must not become a user cancellation.
-        let busy = self.snapshots.borrow().busy;
-        if !busy && let Some(worker) = self.worker.take() {
+        // The process exit aborts active tasks; joining here would block the UI.
+        let snapshot = self.snapshots.borrow();
+        let idle = !snapshot.busy && snapshot.active.is_empty();
+        drop(snapshot);
+        if idle && let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
     }
@@ -1359,6 +1361,29 @@ mod tests {
         *backend.active.lock().unwrap() = BTreeMap::from([(id, cancellation.clone())]);
         drop(backend);
         assert!(!cancellation.is_requested());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dropping_backend_during_an_active_transfer_does_not_wait_for_the_engine() {
+        let data = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let (url, release, _server) = stalled_server().await;
+        let mut backend = Backend::start(data.path().into(), egui::Context::default()).unwrap();
+
+        wait_for(&mut backend, |snapshot| snapshot.ready).await;
+        backend
+            .send(Command::Start {
+                url,
+                directory: output.path().into(),
+            })
+            .unwrap();
+        wait_for(&mut backend, |snapshot| !snapshot.active.is_empty()).await;
+
+        drop(release);
+        let dropped = std::thread::spawn(move || drop(backend));
+        timeout(Duration::from_secs(2), async { dropped.join().unwrap() })
+            .await
+            .expect("dropping the backend must not block the UI");
     }
 
     #[tokio::test(flavor = "multi_thread")]
