@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use gunda_core::download::{DownloadId, DownloadJob, DownloadState, FailureKind};
+use gunda_core::download::{DownloadId, DownloadState};
+#[cfg(test)]
+use gunda_core::download::{DownloadJob, FailureKind};
 
 #[derive(Clone)]
 pub struct DownloadView {
@@ -21,6 +23,7 @@ pub struct DownloadView {
 }
 
 impl DownloadView {
+    #[cfg(test)]
     pub fn from_job(job: &DownloadJob) -> Self {
         let output = (job.state() == DownloadState::Completed)
             .then(|| {
@@ -124,6 +127,7 @@ impl DownloadView {
     }
 }
 
+#[cfg(test)]
 fn failure_message(kind: FailureKind) -> &'static str {
     match kind {
         FailureKind::Network => "Connection problem. Check your internet connection.",

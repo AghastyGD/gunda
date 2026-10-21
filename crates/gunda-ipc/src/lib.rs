@@ -129,7 +129,7 @@ pub enum ClientMessage {
 }
 
 /// A job as rendered by a client.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobView {
     pub id: i64,
     pub name: String,
@@ -138,8 +138,8 @@ pub struct JobView {
     pub total: Option<u64>,
     pub source: String,
     pub origin: String,
-    pub destination: String,
-    pub output: Option<String>,
+    pub destination: NativePath,
+    pub output: Option<NativePath>,
     pub failure_kind: Option<String>,
     pub failure_message: Option<String>,
     pub retryable: bool,
@@ -314,4 +314,61 @@ pub fn write_endpoint(directory: &Path, endpoint: &str) -> Result<(), IpcError> 
     use std::io::Write as _;
     let mut file = options.open(path).map_err(IpcError::from)?;
     writeln!(file, "{endpoint}").map_err(IpcError::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_round_trips_native_job_paths() {
+        let destination = PathBuf::from("downloads");
+        let output = destination.join("file.bin");
+        let message = ServerMessage::Snapshot {
+            snapshot: Snapshot {
+                jobs: vec![JobView {
+                    id: 1,
+                    name: "file.bin".into(),
+                    state: "completed".into(),
+                    written: 8,
+                    total: Some(8),
+                    source: "https://example.test".into(),
+                    origin: "Desktop".into(),
+                    destination: NativePath::from_path(&destination).unwrap(),
+                    output: Some(NativePath::from_path(&output).unwrap()),
+                    failure_kind: None,
+                    failure_message: None,
+                    retryable: false,
+                    resume_available: false,
+                    pause_supported: false,
+                    completion_pending: false,
+                }],
+                active: Vec::new(),
+                notice: None,
+            },
+        };
+
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let ServerMessage::Snapshot { snapshot } =
+            serde_json::from_slice::<ServerMessage>(&encoded).unwrap()
+        else {
+            panic!("a snapshot must round-trip as a snapshot");
+        };
+        let job = &snapshot.jobs[0];
+
+        assert_eq!(job.destination.to_path().unwrap(), destination);
+        assert_eq!(job.output.as_ref().unwrap().to_path().unwrap(), output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_path_preserves_non_utf8_bytes_on_unix() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let path = PathBuf::from(OsString::from_vec(vec![b'f', 0x80, b'o']));
+        let encoded = NativePath::from_path(&path).unwrap();
+
+        assert_eq!(encoded.to_path().unwrap(), path);
+    }
 }

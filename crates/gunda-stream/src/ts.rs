@@ -9,10 +9,10 @@
 //!
 //! This module turns such a stream back into one elementary track: the sample
 //! bytes written back to back into a new file, plus the timing, codec
-//! configuration and picture size an ISO base media writer needs. Only the two
-//! codecs web players receive in this container are read — H.264 video and
-//! ADTS-framed AAC audio. Anything else is refused rather than guessed at: a
-//! wrong sample table produces a file that opens and plays the wrong thing.
+//! configuration and picture size an ISO base media writer needs. Only H.264
+//! video and ADTS-framed AAC audio are supported. Anything else is refused
+//! rather than guessed at: a wrong sample table produces a file that opens and
+//! plays the wrong thing.
 //!
 //! What this does not do is validate the media. The samples are copied exactly
 //! as the transport stream carried them, and only the framing around them is

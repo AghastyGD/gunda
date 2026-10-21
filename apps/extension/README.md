@@ -35,7 +35,7 @@ manifest variant, which does not exist yet):
 
 1. Start the Gunda desktop application; its capture panel shows an endpoint such
    as `ws://127.0.0.1:49152/capture` and a 64-character token.
-2. Open the extension's options (Details → Extension options) and paste both.
+2. Open the extension's options (Details > Extension options) and paste both.
 3. **Save and connect.** The status line reports `connected` once the greeting is
    accepted.
 

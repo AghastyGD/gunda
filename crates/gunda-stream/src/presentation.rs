@@ -2,9 +2,8 @@
 //!
 //! A capture reports one URL, but a presentation usually carries several
 //! qualities and tracks, and the browser extension cannot know which one the
-//! user wants. Inspection reads the manifest — and, where a playlist has to be
-//! read to describe a track, that playlist — so the choice can be made before a
-//! byte of media is fetched.
+//! user wants. Inspection reads the manifest and any playlist needed to describe
+//! a track. This lets the user choose before any media is fetched.
 
 use std::cmp::Reverse;
 use std::str;

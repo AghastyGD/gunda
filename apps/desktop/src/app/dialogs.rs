@@ -223,7 +223,7 @@ impl Desktop {
                                 &if active && self.rate > 0 {
                                     format!("{}/s", bytes(self.rate))
                                 } else {
-                                    "—".into()
+                                    "-".into()
                                 },
                                 colors,
                             );

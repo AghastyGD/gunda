@@ -410,21 +410,21 @@ impl Daemon {
         }
     }
 
-    async fn snapshot(&self) -> Snapshot {
+    async fn snapshot(&self) -> Result<Snapshot, gunda_ipc::IpcError> {
         let mut jobs = Vec::new();
 
         for job in self.manager.jobs() {
-            jobs.push(self.job_view(&job).await);
+            jobs.push(self.job_view(&job).await?);
         }
 
-        Snapshot {
+        Ok(Snapshot {
             jobs,
             active: self.active_jobs.keys().map(|id| id.value()).collect(),
             notice: self.notice.clone(),
-        }
+        })
     }
 
-    async fn job_view(&self, job: &DownloadJob) -> JobView {
+    async fn job_view(&self, job: &DownloadJob) -> Result<JobView, gunda_ipc::IpcError> {
         let id = job.id();
         let active = self.active_jobs.get(&id);
         let resume_available = if active.is_some() {
@@ -438,7 +438,7 @@ impl Daemon {
         };
         let failure = job.last_failure();
 
-        JobView {
+        Ok(JobView {
             id: id.value(),
             name: job_name(job),
             state: state_name(job.state()).to_owned(),
@@ -451,20 +451,19 @@ impl Daemon {
                 DownloadOrigin::Cli => "CLI",
             }
             .into(),
-            destination: job.destination().directory().to_string_lossy().into_owned(),
-            output: (job.state() == DownloadState::Completed)
-                .then(|| {
-                    job.resolved_destination()
-                        .map(|destination| destination.final_path().to_string_lossy().into_owned())
-                })
-                .flatten(),
+            destination: NativePath::from_path(job.destination().directory())?,
+            output: job
+                .resolved_destination()
+                .filter(|_| job.state() == DownloadState::Completed)
+                .map(|destination| NativePath::from_path(destination.final_path()))
+                .transpose()?,
             failure_kind: failure.map(|failure| failure_kind_name(failure.kind()).to_owned()),
             failure_message: failure.map(|failure| failure.message().to_owned()),
             retryable: failure.is_some_and(DownloadFailure::is_retryable),
             resume_available,
             pause_supported: active.is_some_and(DownloadCancellation::pause_supported),
             completion_pending: self.pending_outputs.contains_key(&id),
-        }
+        })
     }
 }
 
@@ -513,7 +512,7 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
         worker_tx,
         notice: None,
     };
-    publish_snapshot(&daemon, &snapshot_tx).await;
+    publish_snapshot(&daemon, &snapshot_tx).await?;
 
     loop {
         tokio::select! {
@@ -524,11 +523,11 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
                 let result = daemon.handle_command(request.command).await;
                 let _ = request.response.send(result);
                 daemon.schedule_jobs();
-                publish_snapshot(&daemon, &snapshot_tx).await;
+                publish_snapshot(&daemon, &snapshot_tx).await?;
             }
             event = worker_rx.recv() => {
                 daemon.handle_worker_event(event).await;
-                publish_snapshot(&daemon, &snapshot_tx).await;
+                publish_snapshot(&daemon, &snapshot_tx).await?;
             }
             _ = tokio::signal::ctrl_c() => break,
         }
@@ -537,8 +536,12 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
     Ok(())
 }
 
-async fn publish_snapshot(daemon: &Daemon, sender: &watch::Sender<Snapshot>) {
-    sender.send_replace(daemon.snapshot().await);
+async fn publish_snapshot(
+    daemon: &Daemon,
+    sender: &watch::Sender<Snapshot>,
+) -> Result<(), gunda_ipc::IpcError> {
+    sender.send_replace(daemon.snapshot().await?);
+    Ok(())
 }
 
 async fn accept_clients(

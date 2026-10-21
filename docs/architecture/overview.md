@@ -56,20 +56,35 @@ Future protocol engines may reuse the shared HTTP transport without depending on
 
 ### Desktop
 
-The Rust-native desktop application in `apps/desktop` is currently the composition root.
+The Rust-native desktop application in `apps/desktop` is the first daemon client.
 
 It connects:
 
-* `gunda-core`
-* `gunda-storage`
-* `gunda-http`
+* `gunda-ipc`
+* `gunda-capture`
 * the egui/eframe desktop interface
 
-A background Tokio worker owns the manager, executors, and runtime lease. Up to three job tasks run concurrently and report updates back to the command loop; the UI sends commands and receives coalesced snapshots through channels. Cancellation and pause use a separate per-job signal.
+A background client worker maintains the daemon connection, reconnects after a
+transport failure, and converts daemon snapshots into presentation views. The UI
+sends commands and receives snapshots through channels.
 
-`gundad` contains the extracted runtime foundation for moving that ownership out of the desktop process. The desktop is still on the in-process path until the IPC client migration lands.
+Browser capture remains local to the desktop for this stage. Stream inspection
+also stays local so the capture panel can present available qualities before a
+job is created.
 
 The egui interface owns presentation and local UI state. Download lifecycle decisions remain in the manager.
+
+### `gunda-ipc`
+
+Defines the authenticated, versioned protocol between local clients and the
+daemon. Commands carry native filesystem paths, and daemon snapshots describe
+the jobs visible to every connected client.
+
+### `gundad`
+
+Owns the runtime lease, SQLite repository, download manager, protocol engines,
+and bounded scheduler. It executes transfers independently of the desktop
+window and remains reachable to multiple local clients.
 
 ## Dependency direction
 
@@ -78,11 +93,14 @@ The main dependency direction is:
 ```text
 desktop
    |
-   +----> gunda-core
+   +----> gunda-ipc ---------> protocol types
    |
-   +----> gunda-storage ----> gunda-core
+   +----> gunda-capture
    |
-   `----> gunda-http -------> gunda-core
+   `----> gundad ------------> gunda-core
+                              gunda-storage
+                              gunda-http
+                              gunda-stream
 ```
 
 Infrastructure depends on the core contracts, not the other way around.
@@ -152,7 +170,7 @@ The desktop should therefore primarily act as a place to view, inspect, and mana
 
 Browser extensions are expected to discover resources during normal browser navigation and pass useful context to Gunda.
 
-The native application remains responsible for persistence, protocol handling, transfer execution, and filesystem access.
+The daemon remains responsible for persistence, protocol handling, transfer execution, and filesystem access. Clients request operations and render shared state.
 
 ## Protocols
 
@@ -166,17 +184,18 @@ This keeps the core focused on application-level download behavior instead of pr
 
 ## Process model
 
-Downloads currently execute inside the desktop process.
+Downloads execute in `gundad`, independently of the desktop window. The desktop
+connects to an existing daemon or starts one from the same executable in daemon
+mode. Closing a client does not cancel its jobs, and reconnecting restores the
+latest shared snapshot.
 
-A future daemon may take ownership of active jobs so transfers can continue independently of the desktop window.
-
-The current architecture keeps this possible by separating clients from the core application and execution boundaries rather than coupling download behavior directly to the UI.
-
-The daemon protocol itself does not need to be defined before that work begins.
+The current IPC transport is authenticated loopback TCP. Unix domain sockets on
+Linux and named pipes on Windows are planned hardening work; the protocol and
+command semantics are designed to remain unchanged.
 
 ## Security boundaries
 
-Network input, remote filenames, request context, destination paths, browser-provided data, and future local IPC messages should be treated as untrusted.
+Network input, remote filenames, request context, destination paths, browser-provided data, and local IPC messages should be treated as untrusted.
 
 Important constraints include:
 
@@ -186,7 +205,7 @@ Important constraints include:
 * partial output must not unexpectedly replace completed files
 * existing files must follow an explicit conflict policy
 * remote input must never be interpolated into shell commands
-* future browser and local IPC interfaces should expose only what they need
+* browser and local IPC interfaces should expose only what they need
 
 Supporting authenticated requests or encrypted media transport does not imply support for DRM circumvention.
 

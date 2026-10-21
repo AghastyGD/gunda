@@ -1,39 +1,50 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::JoinHandle,
 };
+
+#[cfg(test)]
+use std::{collections::BTreeMap, sync::Mutex};
 
 use eframe::egui;
 use gunda_capture::{
     Candidate, CandidateId, CaptureError, CaptureHandle, CaptureServer, load_or_create_token,
     token_path,
 };
+use gunda_core::download::{
+    DownloadId, DownloadOrigin, DownloadState, ExecutionSelection, RequestContext, ResourceKind,
+};
+#[cfg(test)]
 use gunda_core::{
     application::{
         DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError,
         ExecutionOutput, ExecutionReport,
     },
     download::{
-        DownloadDestination, DownloadId, DownloadJob, DownloadOrigin, DownloadState,
-        ExecutionSelection, FileConflictPolicy, NewDownload, RequestContext, ResourceDescriptor,
-        ResourceKind,
+        DownloadDestination, DownloadJob, FileConflictPolicy, NewDownload, ResourceDescriptor,
     },
 };
+#[cfg(test)]
 use gunda_http::{HttpClient, HttpExecutor};
+#[cfg(test)]
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
 use gunda_stream::{PresentationTrack, StreamExecutor, TrackKind, TrackSize};
 use tokio::sync::{mpsc, watch};
+#[cfg(test)]
 use tokio::time::Duration;
 use url::Url;
 
 use crate::view::{DownloadView, bytes};
+
+#[cfg(not(test))]
+mod daemon_client;
 
 #[derive(Clone, Default)]
 pub struct Snapshot {
@@ -111,13 +122,21 @@ pub enum Command {
     Retry(DownloadId),
     Restart(DownloadId),
     SaveStatus(DownloadId),
+    #[cfg(not(test))]
+    Pause(DownloadId),
+    #[cfg(not(test))]
+    Cancel(DownloadId),
 }
 
+#[cfg(test)]
 type Active = Arc<Mutex<BTreeMap<DownloadId, DownloadCancellation>>>;
 
+#[cfg(test)]
 const MAX_AUTOMATIC_ATTEMPTS: u8 = 3;
+#[cfg(test)]
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 
+#[cfg(test)]
 enum WorkerEvent {
     Job {
         job: Box<DownloadJob>,
@@ -134,6 +153,7 @@ enum WorkerEvent {
 pub struct Backend {
     commands: Option<mpsc::Sender<Command>>,
     pub snapshots: watch::Receiver<Snapshot>,
+    #[cfg(test)]
     active: Active,
     closing: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
@@ -153,6 +173,19 @@ impl Backend {
     }
 
     pub fn start(directory: PathBuf, ctx: egui::Context) -> io::Result<Self> {
+        #[cfg(test)]
+        {
+            Self::start_in_process(directory, ctx)
+        }
+
+        #[cfg(not(test))]
+        {
+            daemon_client::start(directory, ctx)
+        }
+    }
+
+    #[cfg(test)]
+    fn start_in_process(directory: PathBuf, ctx: egui::Context) -> io::Result<Self> {
         let (commands, receiver) = mpsc::channel(4);
         let (sender, snapshots) = watch::channel(Snapshot::default());
         let active = Arc::new(Mutex::new(BTreeMap::new()));
@@ -189,6 +222,7 @@ impl Backend {
         Ok(Self {
             commands: Some(commands),
             snapshots,
+            #[cfg(test)]
             active,
             closing,
             worker: Some(worker),
@@ -204,26 +238,42 @@ impl Backend {
     }
 
     pub fn cancel(&self, id: DownloadId) -> bool {
-        let Ok(active) = self.active.lock() else {
-            return false;
-        };
-        let Some(cancellation) = active.get(&id).cloned() else {
-            return false;
-        };
+        #[cfg(not(test))]
+        {
+            self.send(Command::Cancel(id)).is_ok()
+        }
 
-        cancellation.request();
-        true
+        #[cfg(test)]
+        {
+            let Ok(active) = self.active.lock() else {
+                return false;
+            };
+            let Some(cancellation) = active.get(&id).cloned() else {
+                return false;
+            };
+
+            cancellation.request();
+            true
+        }
     }
 
     pub fn pause(&self, id: DownloadId) -> bool {
-        let Ok(active) = self.active.lock() else {
-            return false;
-        };
-        let Some(control) = active.get(&id).cloned() else {
-            return false;
-        };
+        #[cfg(not(test))]
+        {
+            self.send(Command::Pause(id)).is_ok()
+        }
 
-        control.request_pause()
+        #[cfg(test)]
+        {
+            let Ok(active) = self.active.lock() else {
+                return false;
+            };
+            let Some(control) = active.get(&id).cloned() else {
+                return false;
+            };
+
+            control.request_pause()
+        }
     }
 }
 
@@ -251,6 +301,7 @@ fn publish(sender: &watch::Sender<Snapshot>, ctx: &egui::Context, snapshot: Snap
 const CAPTURE_PORT: u16 = 48_123;
 
 /// Everything the command loop needs, once the application can run.
+#[cfg(test)]
 struct Initialized {
     _lease: RuntimeLease,
     manager: Arc<DownloadManager<SqliteDownloadRepository>>,
@@ -265,11 +316,13 @@ struct Initialized {
 /// representation, and the segmented engine reads a manifest and then its
 /// segments. Which one applies is a property of the resource, not of the user,
 /// so it is decided once, from the URL and from what capture already knew.
+#[cfg(test)]
 struct Engines {
     http: HttpExecutor,
     stream: StreamExecutor,
 }
 
+#[cfg(test)]
 async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
     std::fs::create_dir_all(&directory).map_err(|_| "Could not create Gunda's data folder.")?;
     let lease = RuntimeLease::acquire(directory.join("gunda.runtime.lock"))
@@ -343,6 +396,7 @@ async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<&'sta
     }
 }
 
+#[cfg(test)]
 async fn run(
     directory: PathBuf,
     mut commands: mpsc::Receiver<Command>,
@@ -472,6 +526,29 @@ async fn run(
                     && handle.remove(id).await.is_err()
                 {
                     snapshot.notice = Some("The capture could not be dismissed.".into());
+                }
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            #[cfg(not(test))]
+            Command::Pause(id) => {
+                if let Ok(active) = active.lock()
+                    && let Some(control) = active.get(&id)
+                    && !control.request_pause()
+                {
+                    snapshot.notice = Some("This download cannot be paused safely.".into());
+                }
+                snapshot.busy = false;
+                publish(&sender, &ctx, snapshot.clone());
+                continue;
+            }
+            #[cfg(not(test))]
+            Command::Cancel(id) => {
+                if let Ok(active) = active.lock()
+                    && let Some(control) = active.get(&id)
+                {
+                    control.request();
                 }
                 snapshot.busy = false;
                 publish(&sender, &ctx, snapshot.clone());
@@ -636,6 +713,7 @@ async fn run(
     }
 }
 
+#[cfg(test)]
 fn schedule_jobs(
     manager: &Arc<DownloadManager<SqliteDownloadRepository>>,
     engines: &Arc<Engines>,
@@ -684,6 +762,7 @@ fn schedule_jobs(
     }
 }
 
+#[cfg(test)]
 struct WorkerCoordinator<'a> {
     manager: &'a Arc<DownloadManager<SqliteDownloadRepository>>,
     engines: &'a Arc<Engines>,
@@ -696,6 +775,7 @@ struct WorkerCoordinator<'a> {
     snapshot: &'a mut Snapshot,
 }
 
+#[cfg(test)]
 impl WorkerCoordinator<'_> {
     async fn handle(&mut self, event: Option<WorkerEvent>) {
         let Some(event) = event else {
@@ -777,6 +857,7 @@ impl WorkerCoordinator<'_> {
     }
 }
 
+#[cfg(test)]
 async fn execute_job<E: DownloadExecutor>(
     manager: &DownloadManager<SqliteDownloadRepository>,
     executor: &E,
@@ -891,6 +972,7 @@ fn capture_engine(candidate: &Candidate) -> Result<JobEngine, &'static str> {
 }
 
 /// Picks the engine from the recorded resource, or from the URL when unknown.
+#[cfg(test)]
 fn engine_for(url: &Url, resource: Option<ResourceKind>) -> JobEngine {
     match resource {
         Some(ResourceKind::Hls | ResourceKind::Dash) => JobEngine::Stream,
@@ -901,6 +983,7 @@ fn engine_for(url: &Url, resource: Option<ResourceKind>) -> JobEngine {
 }
 
 /// The engine a job already in the manager is executed with.
+#[cfg(test)]
 fn engine_of(manager: &DownloadManager<SqliteDownloadRepository>, id: DownloadId) -> JobEngine {
     manager
         .job(id)
@@ -1049,6 +1132,7 @@ fn kind_label(kind: ResourceKind) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn update_job_view(snapshot: &mut Snapshot, job: &DownloadJob) {
     let pause_supported = snapshot
         .jobs
@@ -1064,6 +1148,7 @@ fn update_job_view(snapshot: &mut Snapshot, job: &DownloadJob) {
     }
 }
 
+#[cfg(test)]
 async fn idle_views(
     manager: &DownloadManager<SqliteDownloadRepository>,
     engines: &Engines,

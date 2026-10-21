@@ -307,7 +307,7 @@ impl Desktop {
 
     fn remaining(&self, view: &DownloadView) -> String {
         if !self.snapshot.active.contains(&view.id) || self.rate == 0 {
-            return "—".into();
+            return "-".into();
         }
         view.total
             .map(|total| {

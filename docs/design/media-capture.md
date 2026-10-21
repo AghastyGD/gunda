@@ -6,35 +6,33 @@ decisions behind Gunda's capture pipeline, and the current behavior of the
 
 ## 1. What browser media capture has to solve
 
-Three properties of the web shape the design:
+Capture design constraints:
 
-- **The page never exposes a file.** Media arrives as a manifest (HLS `.m3u8`,
-  DASH `.mpd`, Smooth Streaming) followed by segments, or as one progressive
-  response. Reading the page's markup cannot produce a download: media URLs are
-  built at runtime and are frequently signed per session.
-- **Requests are the reliable signal.** The response that carries the media is
-  the thing worth copying, so a capture pipeline observes the requests a page
-  makes and classifies responses by the MIME type the server returns, not by
-  the shape of the URL. Sites can hide media behind opaque query strings and
-  change paths at will, but a player only accepts a manifest with the right
-  content type.
-- **A presentation is not a file.** At most quality levels the picture and the
-  sound travel as two independent tracks with separate URLs. Concatenating those
-  downloads cannot produce a playable result: a container has to be written that
-  describes both at once. That is why "download this video" ends in a muxing
-  step rather than a copy.
+- **Pages do not expose a downloadable file.** Media arrives as a manifest (HLS
+  `.m3u8`, DASH `.mpd`, Smooth Streaming) followed by segments, or as one
+  progressive response. Media URLs are built at runtime and are frequently
+  signed per session, so page markup is not a reliable source.
+- **Requests identify the media resource.** A capture pipeline observes page
+  requests and classifies responses by MIME type rather than URL shape. Sites
+  can hide media behind opaque query strings and change paths, but a player
+  only accepts a manifest with the correct content type.
+- **A presentation can contain multiple resources.** At most quality levels the
+  picture and sound travel as independent tracks with separate URLs.
+  Concatenating those downloads does not produce a playable result because a
+  container must describe both tracks. Split presentations therefore require a
+  muxing step.
 
 ### The shape of a capture pipeline
 
 ```
 [ page world ]        [ isolated world ]      [ service worker ]      [ native ]
-request instrumentation <-> DOM observation <-> response sniffing  -->  local service
+request instrumentation <-> DOM observation <-> response sniffing --> local service
 patch XHR/fetch/MSE        geometry + events    MIME classification
                                         |
-                          ws://127.0.0.1:PORT   or   native messaging
+                          ws://127.0.0.1:PORT or native messaging
 ```
 
-The roles are fixed even though implementations differ:
+The pipeline has these responsibilities:
 
 - **Page-world instrumentation.** A script injected into the page's own
   JavaScript context patches `XMLHttpRequest`, `fetch` and
@@ -58,13 +56,11 @@ The roles are fixed even though implementations differ:
   window's inner size, and mirror mouse, keyboard, scroll, resize and blur
   events.
 
-### Consequences for the engine
+### Engine requirements
 
-Two cases have to be told apart. A presentation that already carries muxed media
-is downloaded as it stands. A presentation that splits audio from video cannot
-yield a single-file container without a muxer: concatenating its parts can never
-do it. Gunda therefore muxes in-process; there is no external tool to install
-and no subprocess to launch.
+Presentations that already contain muxed media are downloaded directly. Split
+audio and video require a container that describes both tracks, so Gunda muxes
+them in-process without an external tool or subprocess.
 
 ## 2. Design decisions
 
@@ -83,7 +79,7 @@ and no subprocess to launch.
    `ResourceKind::Dash` and `DownloadOrigin::Browser { page_url, page_title }`
    already exist in the domain for exactly this.
 
-Choices made against alternatives:
+Design choices:
 
 - **No per-site player adapters.** Site-specific selectors require ongoing
   maintenance and break whenever a player changes. Gunda relies on
@@ -97,7 +93,7 @@ Choices made against alternatives:
 
 ## 3. The segmented download engine (`crates/gunda-stream`)
 
-Current implementation:
+Implemented components:
 
 - `hls`: playlist parsing (master and media), attribute lists with quoted
   values, `EXT-X-STREAM-INF`, `EXT-X-MEDIA`, `EXT-X-I-FRAME-STREAM-INF`,
@@ -111,10 +107,10 @@ Current implementation:
   ranges, and single-file representations. `SegmentTemplate` attributes inherit
   from representation to adaptation set to period.
 - `plan`: resolves a parsed manifest into an ordered list of absolute
-  `http`/`https` resources with optional byte ranges — initialization segments
-  interleaved exactly where they apply — and refuses a plan it cannot execute
-  honestly. A presentation that keeps its sound in a track of its own is planned
-  as two tracks: every resource carries the track it belongs to
+  `http`/`https` resources with optional byte ranges. Initialization segments
+  are interleaved where they apply, and the planner refuses a plan it cannot
+  execute. A presentation that keeps its sound in a track of its own is planned
+  as two tracks. Every resource carries the track it belongs to
   (`StreamResource::track`), and `with_audio` merges the two plans into one.
   MPEG-DASH video and audio adaptation sets are planned together this way, and an
   HLS master playlist's variant is paired with the audio rendition it names
@@ -130,7 +126,7 @@ Current implementation:
   successful publication, and kept when a paused transfer can resume. Progress
   is reported as bytes are appended, a new attempt creates staging exclusively,
   resume opens it and truncates any uncheckpointed suffix, cancellation is
-  observed while a resource body is arriving and between resources, and
+  handled while a resource body is arriving and between resources, and
   publication goes through `finalize_download` so filename validation and
   conflict policy are shared with plain HTTP downloads rather than
   reimplemented.
@@ -138,7 +134,7 @@ Current implementation:
   knowledge and no external tool. See section 3.3.
 - `container`: the media's container is read from the media itself. The first
   planned resource is read up to `SNIFF_BYTES` (2048) and recognised from its
-  leading bytes — ISO base media by brand and by its `hdlr` track handler
+  leading bytes: ISO base media by brand and by its `hdlr` track handler
   (fragmented MP4, or a `M4A `/`M4B `/`M4P `/`F4A ` brand, or an all-`soun`
   handler scan), Matroska/WebM by EBML, MPEG-TS by packet sync bytes, ADTS by
   frame sync, MP3 by frame sync. A byte-range resource is read at the offset the
@@ -161,7 +157,7 @@ Current implementation:
   HLS variant costs one request for its playlist, so the number described is
   capped (`MAX_DESCRIBED_VARIANTS`).
 
-Two decisions the naming and sizing rest on:
+Naming and size rules:
 
 - **The output is named after the media, not the manifest.** A manifest URL
   names a playlist, so publishing its last path segment unchanged saved
@@ -171,23 +167,20 @@ Two decisions the naming and sizing rest on:
   name of the presentation rather than of the variant's own playlist, which is
   frequently also called `index.m3u8`). A filename the caller chose still wins,
   and `plan_destination` remains the only validator.
-- **Sizes are exact or absent, never quietly approximate.** A declared length is
-  used as it stands; otherwise every planned resource is probed with one bounded
-  metadata request (`HEAD`, at most `PROBE_CONCURRENCY` = 8 in flight, at most
-  `MAX_PROBED_RESOURCES` = 512 resources) and the total is the sum, so the
-  progress total is measured rather than inferred. Beyond that bound the total
-  is reported as unknown rather than estimated. The picker is the one place an
-  estimate appears, taken from the declared bitrate and duration, always marked
-  as an estimate (`~`).
+- **Reported sizes are measured or unknown.** A declared length is used
+  directly. Otherwise every planned resource is probed with one bounded metadata
+  request (`HEAD`, at most `PROBE_CONCURRENCY` = 8 in flight, at most
+  `MAX_PROBED_RESOURCES` = 512 resources) and the total is the sum. Beyond that
+  bound the total is reported as unknown. The picker may show an estimate from
+  the declared bitrate and duration, marked with `~`.
 
-Refusals are explicit and named (`UnsupportedFeature`) rather than silently
-approximated:
+Unsupported cases return named errors (`UnsupportedFeature`):
 
 | Feature | Why it is refused |
 | --- | --- |
 | `EncryptedSegments` (`EXT-X-KEY` ≠ `NONE`) | Decryption is not implemented; publishing ciphertext as a finished video would be wrong. |
 | `IncompletePresentation` | Live playlists and `type="dynamic"` MPDs would produce a silently truncated file. Continuous capture is a separate mode. |
-| `SeparateTracks` | Split tracks whose bytes are not a container this can mux — Matroska/WebM input, for instance — cannot be combined, and publishing only the picture would silently lose the sound. ISO base media is carried over; MPEG-TS and ADTS audio are demuxed first. |
+| `SeparateTracks` | Split tracks whose bytes are not a container this can mux, such as Matroska/WebM input, cannot be combined. Publishing only the picture would lose the sound. ISO base media is carried over; MPEG-TS and ADTS audio are demuxed first. |
 | `MultiPeriod` | Stitching periods requires re-encode decisions. |
 | `SegmentIndex` | `SegmentBase`/`sidx` enumeration is not implemented. |
 | `DataUriSegments` | Inline segments are not fetchable resources. |
@@ -195,8 +188,7 @@ approximated:
 Because these refusals are typed, the UI can explain the reason per download
 instead of showing a generic failure.
 
-Known execution-time limits, which are typed failures rather than silent
-approximation:
+Execution limits:
 
 - **Resume is segment-boundary only.** The durable checkpoint records how many
   resources of each track are complete. Pausing inside a segment truncates its
@@ -207,35 +199,31 @@ approximation:
 
 ## 3.1 Seams added to `gunda-http`
 
-A protocol engine needs four things from the HTTP crate that did not exist:
+The streaming engine uses four HTTP operations:
 
-- `PartialDownload::adopt` — adopt the staging file the engine wrote, so
+- `PartialDownload::adopt`: adopts the staging file the engine wrote, so
   publication still runs through `finalize_download` (validated filename,
   conflict policy, partial-file identity).
-- `plan_destination` — now public: destination naming is shared policy, and an
-  engine that planned a different final path than the manager would report the
+- `plan_destination`: shares destination naming policy, so an engine that
+  planned a different final path than the manager would not report the
   wrong result to the user.
-- `HttpInspection::staged` — internal constructor for a staging file with no
+- `HttpInspection::staged`: constructs a staging file with no
   remote validator.
-- `HttpClient::open_byte_range` — fetch exactly `bytes=first-last` with no
+- `HttpClient::open_byte_range`: fetches exactly `bytes=first-last` with no
   validator. The existing `open_range` cannot serve this: it resumes from an
   offset to the end of a representation and requires a strong entity tag. A
   server that ignores `Range` and answers `200 OK` with the whole resource is
   rejected, because appending a whole file where one segment was asked for
   would corrupt the output.
 
-Each is additive; no existing behaviour changed.
-
 ## 3.2 The capture channel (`crates/gunda-capture`, `apps/extension`)
 
-A browser extension cannot open a TCP socket, so something has to be on both
-ends. Two transports can carry this: a loopback WebSocket, or the browser's
-native-messaging bridge. Gunda implements the first one only, because it needs
-no native host registration and no extra executable:
+A browser extension cannot open a TCP socket. Gunda uses a loopback WebSocket
+because it requires no native host registration or extra executable:
 
 ```
-page ── runtime messages ──▶ extension service worker ── WebSocket ──▶ CaptureServer
-        (content.js)            (background.js)          ws://127.0.0.1:PORT/capture
+page -- runtime messages --> extension service worker -- WebSocket --> CaptureServer
+       (content.js)             (background.js)           ws://127.0.0.1:PORT/capture
 ```
 
 ### Transport
@@ -243,8 +231,8 @@ page ── runtime messages ──▶ extension service worker ── WebSocket
 The RFC 6455 subset needed to accept one browser connection is implemented in
 `crates/gunda-capture/src/websocket.rs`: the opening handshake, text messages
 (fragmented or not), ping/pong, and close. Binary messages, reserved opcodes, and
-negotiated extensions are refused rather than ignored. The reasons for writing it
-instead of adding a dependency:
+negotiated extensions are refused rather than ignored. The implementation keeps
+a small dependency set:
 
 - no WebSocket crate is in `Cargo.lock`, so a dependency would have to be
   downloaded, and the workspace keeps its dependency set small on purpose;
@@ -260,12 +248,12 @@ payloads are capped, and the reserved bits must be clear.
 JSON objects tagged with a `kind` (`serde` internally tagged enums), versioned by
 the greeting, limited to `MAX_MESSAGE_BYTES` (256 KiB).
 
-| Extension → desktop | Payload |
+| Extension to desktop | Payload |
 | --- | --- |
-| `hello` | `version`, `token`, `agent` — the first message on every connection |
+| `hello` | `version`, `token`, `agent`; the first message on every connection |
 | `candidate` | `url`, `content_type?`, `page_url`, `page_title?` |
 
-| Desktop → extension | Meaning |
+| Desktop to extension | Meaning |
 | --- | --- |
 | `ready` | the greeting was accepted; `version` is the desktop's protocol version |
 | `accepted` | the report is now a candidate, with its `id` |
@@ -322,7 +310,7 @@ boundary. Two things are:
 A client that presents the wrong token is closed without a reply, so it learns
 nothing from the refusal. Nothing is recorded before the greeting passes.
 
-### Deliberately absent
+### Request credentials
 
 The protocol carries no cookies and no request headers. The extension reports
 *what* the browser asked for; replaying the browser's credentials would move them
@@ -343,20 +331,17 @@ session cookie is out of scope until there is a deliberate place to keep one.
 
 ## 3.3 Two tracks into one file (`crates/gunda-stream::mux`)
 
-The step that turns a split presentation into one file: a presentation whose
-picture and sound are separate tracks becomes one container.
-`mux_mp4(video, audio, output)` takes
-the two staged track files and writes a single plain (non-fragmented) MP4 with
-real sample tables, returning the size of what it wrote.
+`mux_mp4(video, audio, output)` combines two staged track files into one plain,
+non-fragmented MP4 with sample tables. It returns the size of the written file.
 
-What the two files are is decided by their bytes, not by the manifest that named
-them: three input shapes are read.
+The input files are detected from their bytes rather than the manifest. Three
+input shapes are supported.
 
 | Input | Read as |
 | --- | --- |
-| Fragmented MP4 — an initialization segment followed by one fragment per media segment (MPEG-DASH, HLS with `EXT-X-MAP`) | The ISO demuxer walks the boxes with seeks, reads the `trak` of the initialization segment and the `tfhd`/`tfdt`/`trun` of every fragment, and records where each sample's bytes are. |
-| MPEG-TS — 188-byte packets (HLS without `EXT-X-MAP`, which is what YouTube serves when it pairs a TS variant with a TS audio rendition) | PAT/PMT section assembly, PES headers with PTS/DTS, then the elementary stream: H.264 access units found by AUD/VCL boundaries, ADTS frames with their headers stripped. |
-| ADTS AAC — packed audio, with an ID3v2 tag in front of every segment | The same ADTS parser; each tag is stepped over whole, because it carries timing rather than audio. |
+| Fragmented MP4: an initialization segment followed by one fragment per media segment (MPEG-DASH, HLS with `EXT-X-MAP`) | The ISO demuxer walks the boxes with seeks, reads the `trak` of the initialization segment and the `tfhd`/`tfdt`/`trun` of every fragment, and records where each sample's bytes are. |
+| MPEG-TS: 188-byte packets (HLS without `EXT-X-MAP`, which is what YouTube serves when it pairs a TS variant with a TS audio rendition) | PAT/PMT section assembly, PES headers with PTS/DTS, then the elementary stream: H.264 access units found by AUD/VCL boundaries, ADTS frames with their headers stripped. |
+| ADTS AAC: packed audio with an ID3v2 tag in front of every segment | The same ADTS parser; each tag is stepped over whole, because it carries timing rather than audio. |
 
 A transport stream is demuxed into a single elementary track and given a sample
 entry built from what the elementary stream declares: an `avcC` from the SPS/PPS
@@ -369,7 +354,7 @@ transport stream: HEVC, MPEG audio and Dolby audio are refused with a message
 that says which was found, because carrying them over is not possible and
 mislabeling them would be worse.
 
-The writer reuses what it read:
+The writer reuses and generates these boxes:
 
 | Carried over untouched | Written fresh |
 | --- | --- |
@@ -388,7 +373,7 @@ absorbed by lengthening the sample before it (`stts` describes durations, not
 absolute times); two fragments that overlap are refused rather than silently
 dropping media.
 
-Limits, all typed (`MuxError`) rather than approximated:
+Mux limits return typed errors (`MuxError`):
 
 | Limit | Why |
 | --- | --- |
@@ -406,7 +391,7 @@ bandwidth. Bandwidth alone would therefore choose sound that cannot be read out
 of a transport stream. When a master names more than one audio group, the
 planner takes the best variant whose `CODECS` attribute declares AAC; a single
 group, or a master that declares no codecs, leaves bandwidth in charge. The
-choice is a default, not a restriction — the picker still lists every variant.
+choice is a default, not a restriction; the picker still lists every variant.
 
 ## 4. Security rules
 
@@ -428,7 +413,7 @@ choice is a default, not a restriction — the picker still lists every variant.
 
 ## 5. Roadmap
 
-Done:
+Implemented:
 
 1. `crates/gunda-stream`: HLS and DASH parsing, planning, and execution through
    `DownloadExecutor`, including byte-range segments, container recognition
@@ -443,7 +428,7 @@ Done:
    reports candidates, with an options page for pairing.
 5. Desktop wiring: the capture panel (pairing, captured list, per-candidate
    download and dismiss), the browser-origin job path, and the quality picker
-   ("Qualities" → per-track download, named after the presentation).
+   ("Qualities" and per-track download, named after the presentation).
 6. Storage: browser-origin jobs persist, carrying `source_page_url` and
    `source_title`.
 7. **Muxing:** `gunda-stream::mux` combines the two tracks of a split
@@ -462,7 +447,7 @@ Done:
    count. Pause keeps staging, cancels and restarts remove it, and resumed
    downloads truncate any bytes beyond the last checkpoint before continuing.
 
-Next, in order:
+Planned:
 
 1. **A Matroska writer** (`.mkv`, EBML with `vp09`/`opus`/`av1`), so a Matroska
    pair can be muxed as well; and HEVC in a transport stream, which is currently

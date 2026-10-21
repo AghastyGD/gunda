@@ -261,7 +261,7 @@ impl Desktop {
                             ui.label(if active && self.rate > 0 {
                                 format!("{}/s", bytes(self.rate))
                             } else {
-                                "—".into()
+                                "-".into()
                             });
                         });
                         row.col(|ui| {
