@@ -2,7 +2,7 @@
 
 > download manager for the stubborn
 
-[![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/AghastyGD/badge.svg)](https://hub.xerj.org/contributors/AghastyGD)
+[![CI](https://github.com/AghastyGD/gunda/actions/workflows/ci.yml/badge.svg)](https://github.com/AghastyGD/gunda/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/AghastyGD/gunda)](LICENSE) [![XERJ Corpus Hub contributor](https://hub.xerj.org/contributors/AghastyGD/badge.svg)](https://hub.xerj.org/contributors/AghastyGD)
 
 Gunda is a cross-platform download manager written in Rust and developed Linux-first.
 
