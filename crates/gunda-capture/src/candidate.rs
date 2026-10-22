@@ -299,6 +299,10 @@ enum Classification {
 /// octet-stream` is not: plenty of servers label video that way, so a path that
 /// names a media container is still accepted.
 fn classify(url: &Url, content_type: Option<&str>) -> Classification {
+    if range_query(url) {
+        return Classification::Segment;
+    }
+
     if let Some(content_type) = content_type {
         let essence = content_type
             .split(';')
@@ -335,6 +339,15 @@ fn classify(url: &Url, content_type: Option<&str>) -> Classification {
         Some("ts" | "m4s") => Classification::Segment,
         _ => Classification::Unknown,
     }
+}
+
+fn range_query(url: &Url) -> bool {
+    url.query_pairs().any(|(name, _)| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "bytestart" | "byteend" | "range"
+        )
+    })
 }
 
 /// The lowercase extension of a URL's final path segment.
@@ -459,6 +472,16 @@ mod tests {
                 None
             )
             .expect_err("segments are not captured"),
+            Refusal::SegmentStream
+        );
+        assert_eq!(
+            Report::new(
+                "https://cdn.example.com/video.mp4?bytestart=0&byteend=1023",
+                Some("video/mp4"),
+                "https://example.com/watch",
+                None,
+            )
+            .expect_err("a range-marked MP4 is a fragment"),
             Refusal::SegmentStream
         );
     }

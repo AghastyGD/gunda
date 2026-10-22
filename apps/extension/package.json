@@ -1,0 +1,19 @@
+{
+  "name": "gunda-capture-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.3.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "tsc --noEmit",
+    "test": "pnpm run build && node --test test/page.test.js"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.18",
+    "typescript": "^5.9.3"
+  }
+}

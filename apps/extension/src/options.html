@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gunda Capture</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 2rem auto;
+        max-width: 44rem;
+        padding: 0 1rem;
+        line-height: 1.5;
+      }
+
+      h1 {
+        font-size: 1.4rem;
+      }
+
+      label {
+        display: block;
+        font-weight: 600;
+        margin-top: 1.25rem;
+      }
+
+      input {
+        box-sizing: border-box;
+        font-family: ui-monospace, monospace;
+        margin-top: 0.25rem;
+        padding: 0.5rem;
+        width: 100%;
+      }
+
+      .hint {
+        font-size: 0.9rem;
+        opacity: 0.75;
+      }
+
+      .buttons {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 1.5rem;
+      }
+
+      button {
+        padding: 0.5rem 1rem;
+      }
+
+      #status,
+      #stats {
+        background: rgba(127, 127, 127, 0.12);
+        border-radius: 0.5rem;
+        font-family: ui-monospace, monospace;
+        margin-top: 1rem;
+        padding: 0.75rem;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Gunda Capture</h1>
+
+    <p>
+      Paste the endpoint and token from the Gunda capture panel once the desktop
+      application is running.
+    </p>
+
+    <label for="endpoint">Endpoint</label>
+    <input id="endpoint" type="text" spellcheck="false" placeholder="ws://127.0.0.1:48123/capture" />
+
+    <label for="token">Pairing token</label>
+    <input id="token" type="password" spellcheck="false" placeholder="64 hexadecimal characters" />
+    <p class="hint">
+      The token is what stops another page in this browser from injecting downloads into Gunda. It is
+      stored locally by the extension and never sent anywhere except the endpoint above.
+    </p>
+
+    <div class="buttons">
+      <button id="save" type="button">Save and connect</button>
+      <button id="clear" type="button">Forget pairing</button>
+    </div>
+
+    <div id="status">Status: unknown</div>
+    <div id="stats">Nothing reported yet.</div>
+
+    <script src="options.js"></script>
+  </body>
+</html>

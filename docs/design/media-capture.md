@@ -56,6 +56,12 @@ The pipeline has these responsibilities:
   window's inner size, and mirror mouse, keyboard, scroll, resize and blur
   events.
 
+The page-response agent also reads bounded JSON from Instagram and Facebook.
+Instagram `video_versions` and `video_url` fields identify progressive MP4
+files. Facebook `browser_native_*_url` and `progressive_urls` fields provide the
+same fallback. Partial responses and range-addressed URLs are not accepted as
+standalone files.
+
 ### Engine requirements
 
 Presentations that already contain muxed media are downloaded directly. Split
@@ -426,8 +432,9 @@ Implemented:
 3. `crates/gunda-capture`: the loopback listener, the RFC 6455 subset, the
    versioned JSON protocol, the pairing token, and the candidate catalog with
    deduplication.
-4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, and
-   reports candidates, with an options page for pairing.
+4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, reads
+   bounded page JSON for progressive media, and reports candidates, with an
+   options page for pairing.
 5. Daemon and desktop wiring: `gundad` owns capture and quality inspection, and
    the desktop panel shows pairing, candidates, per-candidate download and
    dismiss actions, and the quality picker.

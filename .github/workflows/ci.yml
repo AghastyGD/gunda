@@ -40,6 +40,26 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.3.0
+
+      - name: Install extension dependencies
+        working-directory: apps/extension
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Check extension types
+        working-directory: apps/extension
+        run: pnpm check
+
+      - name: Test extension
+        working-directory: apps/extension
+        run: pnpm test
+
+      - name: Check generated extension
+        run: git diff --exit-code -- apps/extension/dist
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
