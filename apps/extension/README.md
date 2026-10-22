@@ -1,8 +1,8 @@
 # Gunda Capture (browser extension)
 
-Reports the media a page plays to the Gunda desktop application, over a loopback
-WebSocket. This is the browser half of the capture channel documented in
-[`docs/design/media-capture.md`](../../docs/design/media-capture.md); the desktop
+Reports the media a page plays to the Gunda daemon over a loopback WebSocket.
+This is the browser half of the capture channel documented in
+[`docs/design/media-capture.md`](../../docs/design/media-capture.md); the daemon
 half is the `gunda-capture` crate.
 
 ## What it reports
@@ -33,8 +33,8 @@ manifest variant, which does not exist yet):
 
 ## Pairing
 
-1. Start the Gunda desktop application; its capture panel shows an endpoint such
-   as `ws://127.0.0.1:49152/capture` and a 64-character token.
+1. Start the Gunda desktop application; its capture panel shows the daemon's
+   endpoint as `ws://127.0.0.1:48123/capture` and a 64-character token.
 2. Open the extension's options (Details > Extension options) and paste both.
 3. **Save and connect.** The status line reports `connected` once the greeting is
    accepted.

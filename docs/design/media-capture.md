@@ -47,7 +47,7 @@ The pipeline has these responsibilities:
   the manifest and segment types a site may serve (`M3U8`, `MPD`, `F4M`, `M4S`,
   `TS`, `UMP`, `DFXP`/`TTML`, `WEBM`, `MP4`).
 - **A local transport.** An extension cannot open a raw socket, so candidates
-  reach the desktop application either over a loopback WebSocket or through the
+  reach the Gunda daemon either over a loopback WebSocket or through the
   browser's native-messaging bridge, which needs an installed host manifest and
   a helper executable.
 - **A native overlay, if the UI is one.** A window drawn over a video cannot
@@ -64,13 +64,14 @@ them in-process without an external tool or subprocess.
 
 ## 2. Design decisions
 
-1. **The browser side pushes to a local listener.** Gunda listens on loopback
-   and the extension delivers detected media candidates to it. The desktop
-   application decides what a candidate becomes.
+1. **The browser side pushes to a local listener.** `gundad` listens on
+   loopback and the extension delivers detected media candidates to it. The
+   daemon decides what a candidate becomes.
 2. **Detection keys off MIME type, not URL shape.** The manifest types Gunda
    recognises (`application/vnd.apple.mpegurl`, `application/dash+xml`,
-   `application/vnd.yt-ump`, `application/octet-stream-m3u8`, …) are what make
-   detection work across sites without per-site code.
+   `application/vnd.yt-ump`, `application/octet-stream-m3u8`, and similar
+   manifest types) are what make detection work across sites without per-site
+   code.
 3. **Correlation by request tagging.** The extension marks requests it can see
    so a detected element can be tied to the response that carries it.
 4. **Segmented download is part of the engine, not a parallel lifecycle.** It
@@ -218,8 +219,8 @@ The streaming engine uses four HTTP operations:
 
 ## 3.2 The capture channel (`crates/gunda-capture`, `apps/extension`)
 
-A browser extension cannot open a TCP socket. Gunda uses a loopback WebSocket
-because it requires no native host registration or extra executable:
+The Gunda daemon runs a loopback WebSocket listener because it requires no
+native host registration or extra executable:
 
 ```
 page -- runtime messages --> extension service worker -- WebSocket --> CaptureServer
@@ -403,8 +404,8 @@ choice is a default, not a restriction; the picker still lists every variant.
   a URL to try.
 - Nothing from the capture side is trusted to name a file on disk; the existing
   `plan_destination`/`validate_filename` path decides output names.
-- The capture listener binds loopback explicitly; there is no option to bind a
-  routable address.
+- The capture listener in `gundad` binds loopback explicitly; there is no option
+  to bind a routable address.
 - Loopback is not a boundary, because every page in the browser can reach it. The
   pairing token and the extension-origin policy are what protect the channel, and
   a connection that fails either is closed without a reply.
@@ -426,9 +427,9 @@ Implemented:
    deduplication.
 4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, and
    reports candidates, with an options page for pairing.
-5. Desktop wiring: the capture panel (pairing, captured list, per-candidate
-   download and dismiss), the browser-origin job path, and the quality picker
-   ("Qualities" and per-track download, named after the presentation).
+5. Daemon and desktop wiring: `gundad` owns capture and quality inspection, and
+   the desktop panel shows pairing, candidates, per-candidate download and
+   dismiss actions, and the quality picker.
 6. Storage: browser-origin jobs persist, carrying `source_page_url` and
    `source_title`.
 7. **Muxing:** `gunda-stream::mux` combines the two tracks of a split

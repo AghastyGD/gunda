@@ -4,11 +4,15 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gunda_capture::{PairingToken, load_or_create_token};
+use gunda_capture::{
+    Candidate, CandidateId, CaptureHandle, CaptureServer, PairingToken, load_or_create_token,
+    token_path,
+};
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError, ExecutionOutput,
     ExecutionReport,
@@ -20,11 +24,12 @@ use gunda_core::download::{
 };
 use gunda_http::{HttpClient, HttpExecutor};
 use gunda_ipc::{
-    ClientMessage, Command, Connection, JobView, NativePath, PROTOCOL_VERSION, ServerMessage,
-    Snapshot,
+    CaptureStatus as IpcCaptureStatus, CaptureTrackChoice, CaptureTrackView, CaptureTracks,
+    CaptureView, ClientMessage, Command, Connection, JobView, NativePath, PROTOCOL_VERSION,
+    ServerMessage, Snapshot,
 };
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
-use gunda_stream::StreamExecutor;
+use gunda_stream::{PresentationTrack, StreamExecutor, TrackKind, TrackSize};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
@@ -33,6 +38,7 @@ use url::Url;
 const MAX_AUTOMATIC_ATTEMPTS: u8 = 3;
 const MAX_CONCURRENT_DOWNLOADS: usize = 3;
 const GREETING_DEADLINE: Duration = Duration::from_secs(10);
+const CAPTURE_PORT: u16 = 48_123;
 
 /// Failure while starting or running the daemon.
 #[derive(Debug)]
@@ -83,6 +89,11 @@ enum WorkerEvent {
     Changed,
     Notice(String),
     ClearNotice,
+    Inspected {
+        sequence: u64,
+        id: CandidateId,
+        tracks: CaptureTracks,
+    },
     Finished {
         id: DownloadId,
         result: Result<ExecutionReport, DownloadManagerError>,
@@ -111,6 +122,10 @@ struct Daemon {
     pending_engines: BTreeMap<DownloadId, JobEngine>,
     pending_outputs: BTreeMap<DownloadId, ExecutionOutput>,
     worker_tx: mpsc::UnboundedSender<WorkerEvent>,
+    capture: Option<CaptureHandle>,
+    capture_problem: Option<String>,
+    capture_tracks: Option<CaptureTracks>,
+    inspection_sequence: u64,
     notice: Option<String>,
 }
 
@@ -143,6 +158,14 @@ impl Daemon {
             Command::Restart { id } => self.restart(download_id(id)?).await,
             Command::Cancel { id } => self.cancel(download_id(id)?).await,
             Command::SaveStatus { id } => self.save_status(download_id(id)?).await,
+            Command::InspectCapture { id } => self.inspect_capture(id),
+            Command::DownloadCapture {
+                id,
+                directory,
+                track,
+            } => self.download_capture(id, directory, track).await,
+            Command::DismissCapture { id } => self.dismiss_capture(id).await,
+            Command::ClearCaptures => self.clear_captures().await,
         }
     }
 
@@ -325,6 +348,143 @@ impl Daemon {
         Ok(())
     }
 
+    fn inspect_capture(&mut self, id: CandidateId) -> Result<(), String> {
+        let captured = self.captured(id)?;
+        self.inspection_sequence = self.inspection_sequence.saturating_add(1);
+        let sequence = self.inspection_sequence;
+        self.capture_tracks = None;
+        let engines = Arc::clone(&self.engines);
+        let updates = self.worker_tx.clone();
+
+        tokio::spawn(async move {
+            let request = RequestContext::new(captured.url, Vec::new());
+            let tracks = match engines.stream.inspect(&request).await {
+                Ok(presentation) => presentation
+                    .tracks()
+                    .iter()
+                    .map(capture_track_view)
+                    .collect(),
+                Err(_) => {
+                    let _ = updates.send(WorkerEvent::Inspected {
+                        sequence,
+                        id,
+                        tracks: CaptureTracks {
+                            id,
+                            tracks: Vec::new(),
+                            problem: Some(
+                                "The qualities of this presentation could not be read.".into(),
+                            ),
+                        },
+                    });
+                    return;
+                }
+            };
+
+            let _ = updates.send(WorkerEvent::Inspected {
+                sequence,
+                id,
+                tracks: CaptureTracks {
+                    id,
+                    tracks,
+                    problem: None,
+                },
+            });
+        });
+        Ok(())
+    }
+
+    async fn download_capture(
+        &mut self,
+        id: CandidateId,
+        directory: NativePath,
+        track: Option<CaptureTrackChoice>,
+    ) -> Result<(), String> {
+        let captured = self.captured(id)?;
+        let directory = directory
+            .to_path()
+            .map_err(|_| "Invalid destination folder.")?;
+        let (url, filename, selection) = match track {
+            Some(track) => {
+                let url = validate_url(&track.url)?;
+                let selection = track
+                    .selection
+                    .map(ExecutionSelection::new)
+                    .transpose()
+                    .map_err(|_| "Invalid stream selection.")?;
+                (url, track.filename, selection)
+            }
+            None => (captured.url, None, None),
+        };
+        let mut request = RequestContext::new(url, Vec::new());
+        if let Some(selection) = selection {
+            request = request.with_selection(selection);
+        }
+
+        let id = self
+            .manager
+            .create(NewDownload::new(
+                request,
+                DownloadDestination::new(directory, filename, FileConflictPolicy::Rename),
+                captured.origin,
+            ))
+            .await
+            .map_err(|_| "Could not save the new download.")?
+            .download_id();
+
+        self.pending_engines.insert(id, captured.engine);
+        self.capture_tracks = None;
+        self.inspection_sequence = self.inspection_sequence.saturating_add(1);
+        Ok(())
+    }
+
+    async fn dismiss_capture(&mut self, id: CandidateId) -> Result<(), String> {
+        self.capture_handle()?
+            .remove(id)
+            .await
+            .map_err(|_| "The capture could not be dismissed.".to_string())?;
+        if self
+            .capture_tracks
+            .as_ref()
+            .is_some_and(|tracks| tracks.id == id)
+        {
+            self.capture_tracks = None;
+        }
+        self.inspection_sequence = self.inspection_sequence.saturating_add(1);
+        Ok(())
+    }
+
+    async fn clear_captures(&mut self) -> Result<(), String> {
+        self.capture_handle()?
+            .clear()
+            .await
+            .map_err(|_| "The capture list could not be cleared.".to_string())?;
+        self.capture_tracks = None;
+        self.inspection_sequence = self.inspection_sequence.saturating_add(1);
+        Ok(())
+    }
+
+    fn capture_handle(&self) -> Result<&CaptureHandle, String> {
+        self.capture
+            .as_ref()
+            .ok_or_else(|| "Browser capture is not available.".to_string())
+    }
+
+    fn captured(&self, id: CandidateId) -> Result<Captured, String> {
+        let candidate = self
+            .capture_handle()?
+            .view()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "That capture is no longer in the list.".to_string())?;
+        let engine = capture_engine(&candidate)?;
+
+        Ok(Captured {
+            url: candidate.url().clone(),
+            origin: candidate.origin(),
+            engine,
+        })
+    }
+
     fn engine_of(&self, id: DownloadId) -> JobEngine {
         self.manager
             .job(id)
@@ -380,6 +540,19 @@ impl Daemon {
             WorkerEvent::Notice(message) => self.notice = Some(message),
             WorkerEvent::ClearNotice => self.notice = None,
             WorkerEvent::Changed => {}
+            WorkerEvent::Inspected {
+                sequence,
+                id,
+                tracks,
+            } => {
+                let candidate_exists = self
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.view().get(id).is_some());
+                if sequence == self.inspection_sequence && candidate_exists {
+                    self.capture_tracks = Some(tracks);
+                }
+            }
             WorkerEvent::Finished { id, result } => {
                 self.active_jobs.remove(&id);
                 match result {
@@ -420,6 +593,24 @@ impl Daemon {
         Ok(Snapshot {
             jobs,
             active: self.active_jobs.keys().map(|id| id.value()).collect(),
+            captures: self
+                .capture
+                .as_ref()
+                .map(|capture| {
+                    capture
+                        .view()
+                        .candidates()
+                        .iter()
+                        .map(capture_view)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            capture_tracks: self.capture_tracks.clone(),
+            capture: self.capture.as_ref().map(|capture| IpcCaptureStatus {
+                endpoint: capture.endpoint(),
+                token: capture.token().as_str().to_owned(),
+            }),
+            capture_problem: self.capture_problem.clone(),
             notice: self.notice.clone(),
         })
     }
@@ -492,6 +683,7 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
             stream_store,
         ),
     });
+    let (capture, capture_problem) = start_capture(&directory).await;
     let token = load_or_create_token(&directory.join("gundad-token"))
         .map_err(|_| DaemonError::Config("Could not load the daemon token."))?;
     let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
@@ -510,6 +702,10 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
         pending_engines: BTreeMap::new(),
         pending_outputs: BTreeMap::new(),
         worker_tx,
+        capture,
+        capture_problem,
+        capture_tracks: None,
+        inspection_sequence: 0,
         notice: None,
     };
     publish_snapshot(&daemon, &snapshot_tx).await?;
@@ -529,11 +725,71 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
                 daemon.handle_worker_event(event).await;
                 publish_snapshot(&daemon, &snapshot_tx).await?;
             }
+            changed = capture_changed(&mut daemon.capture) => {
+                daemon.handle_capture_change(changed);
+                publish_snapshot(&daemon, &snapshot_tx).await?;
+            }
             _ = tokio::signal::ctrl_c() => break,
         }
     }
 
     Ok(())
+}
+
+async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<String>) {
+    let token = match load_or_create_token(&token_path(directory)) {
+        Ok(token) => token,
+        Err(_) => {
+            return (
+                None,
+                Some(
+                    "The browser capture channel could not be set up. Check the application data folder."
+                        .into(),
+                ),
+            );
+        }
+    };
+
+    let preferred = CaptureServer::bind_to(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, CAPTURE_PORT)),
+        token.clone(),
+    )
+    .await;
+    let bound = match preferred {
+        Ok(bound) => Ok(bound),
+        Err(_) => CaptureServer::bind(token).await,
+    };
+
+    match bound {
+        Ok((server, handle)) => {
+            tokio::spawn(server.run());
+            (Some(handle), None)
+        }
+        Err(_) => (
+            None,
+            Some("The browser capture channel could not be started.".into()),
+        ),
+    }
+}
+
+async fn capture_changed(capture: &mut Option<CaptureHandle>) -> bool {
+    match capture {
+        Some(handle) => handle.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
+}
+
+impl Daemon {
+    fn handle_capture_change(&mut self, running: bool) {
+        if running {
+            return;
+        }
+
+        self.capture = None;
+        self.capture_problem = Some("The browser capture channel stopped.".into());
+        self.capture_tracks = None;
+        self.inspection_sequence = self.inspection_sequence.saturating_add(1);
+    }
 }
 
 async fn publish_snapshot(
@@ -668,6 +924,98 @@ async fn execute_job<E: DownloadExecutor>(
             _ = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
         }
         let _ = updates.send(WorkerEvent::ClearNotice);
+    }
+}
+
+struct Captured {
+    url: Url,
+    origin: DownloadOrigin,
+    engine: JobEngine,
+}
+
+fn capture_engine(candidate: &Candidate) -> Result<JobEngine, String> {
+    match candidate.kind() {
+        ResourceKind::File => Ok(JobEngine::Http),
+        ResourceKind::Hls | ResourceKind::Dash => {
+            if path_names_stream(candidate.url()) {
+                Ok(JobEngine::Stream)
+            } else {
+                Err("This capture is a segmented stream whose URL does not name its format.".into())
+            }
+        }
+        ResourceKind::Unknown => Err("This capture is not something Gunda can download.".into()),
+    }
+}
+
+fn capture_view(candidate: &Candidate) -> CaptureView {
+    CaptureView {
+        id: candidate.id(),
+        url: candidate.url().as_str().to_owned(),
+        kind: capture_kind_name(candidate.kind()).to_owned(),
+        content_type: candidate.content_type().map(str::to_owned),
+        page_title: candidate.page_title().map(str::to_owned),
+        seen: candidate.seen(),
+        segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
+    }
+}
+
+fn capture_track_view(track: &PresentationTrack) -> CaptureTrackView {
+    CaptureTrackView {
+        label: track.label().to_owned(),
+        details: format!(
+            "{} | {}",
+            track_kind_name(track.kind()),
+            size_hint(track.size())
+        ),
+        url: track.url().as_str().to_owned(),
+        filename: track.filename().map(str::to_owned),
+        selection: track
+            .selection()
+            .map(ExecutionSelection::as_str)
+            .map(str::to_owned),
+    }
+}
+
+fn capture_kind_name(kind: ResourceKind) -> &'static str {
+    match kind {
+        ResourceKind::Hls => "HLS",
+        ResourceKind::Dash => "DASH",
+        ResourceKind::File => "File",
+        ResourceKind::Unknown => "Unknown",
+    }
+}
+
+fn track_kind_name(kind: TrackKind) -> &'static str {
+    match kind {
+        TrackKind::Video => "video",
+        TrackKind::Audio => "audio",
+        TrackKind::Text => "text",
+        TrackKind::Unknown => "media",
+    }
+}
+
+fn size_hint(size: TrackSize) -> String {
+    match size {
+        TrackSize::Exact(total) => format_size(total),
+        TrackSize::Estimated(total) => format!("~{}", format_size(total)),
+        TrackSize::Unknown => "size unknown".to_owned(),
+    }
+}
+
+fn format_size(value: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut amount = value as f64;
+    let mut unit = 0;
+    while amount >= 1024.0 && unit < UNITS.len() - 1 {
+        amount /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{value} B")
+    } else {
+        format!("{amount:.1} {}", UNITS[unit])
     }
 }
 

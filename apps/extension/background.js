@@ -1,6 +1,6 @@
 // Gunda Capture -- the half of the capture channel that runs in the browser.
 //
-// This service worker is the only part that talks to the desktop application.
+// This service worker is the only part that talks to the Gunda daemon.
 // It watches responses, because a media response is impossible to miss there,
 // and it also accepts what the content script finds in the page.
 //

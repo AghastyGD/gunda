@@ -7,12 +7,10 @@ use std::sync::{
 use std::time::Duration;
 
 use gunda_capture::load_token;
-use gunda_http::HttpClient;
 use gunda_ipc::{
-    ClientMessage, Command as IpcCommand, NativePath, Reader, ServerMessage,
-    Snapshot as IpcSnapshot, Writer, connect, read_endpoint,
+    CaptureTrackChoice as IpcTrackChoice, ClientMessage, Command as IpcCommand, NativePath, Reader,
+    ServerMessage, Snapshot as IpcSnapshot, Writer, connect, read_endpoint,
 };
-use gunda_stream::StreamExecutor;
 use tokio::sync::{mpsc, watch};
 
 use super::*;
@@ -20,7 +18,6 @@ use super::*;
 pub(super) fn start(directory: PathBuf, ctx: egui::Context) -> io::Result<Backend> {
     let (commands, receiver) = mpsc::channel(4);
     let (sender, snapshots) = watch::channel(Snapshot::default());
-    let inspector = StreamExecutor::new(HttpClient::new().map_err(io::Error::other)?);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -29,14 +26,7 @@ pub(super) fn start(directory: PathBuf, ctx: egui::Context) -> io::Result<Backen
     let worker = std::thread::Builder::new()
         .name("gunda-client".into())
         .spawn(move || {
-            runtime.block_on(run_client(
-                directory,
-                receiver,
-                sender,
-                worker_closing,
-                ctx,
-                inspector,
-            ));
+            runtime.block_on(run_client(directory, receiver, sender, worker_closing, ctx))
         })?;
 
     Ok(Backend {
@@ -53,9 +43,7 @@ async fn run_client(
     sender: watch::Sender<Snapshot>,
     closing: Arc<AtomicBool>,
     ctx: egui::Context,
-    inspector: StreamExecutor,
 ) {
-    let (capture, capture_problem) = start_capture(&directory).await;
     loop {
         let connected = connect_daemon(&directory).await;
         let daemon = match connected {
@@ -65,9 +53,6 @@ async fn run_client(
                     &sender,
                     &ctx,
                     Snapshot {
-                        captures: capture_views(capture.as_ref()),
-                        capture: capture.as_ref().map(capture_status),
-                        capture_problem,
                         notice: Some(message.into()),
                         ..Default::default()
                     },
@@ -86,9 +71,6 @@ async fn run_client(
                 sender: &sender,
                 closing: &closing,
                 ctx: &ctx,
-                capture: &capture,
-                capture_problem,
-                inspector: &inspector,
             },
             daemon,
         )
@@ -102,9 +84,6 @@ async fn run_client(
                 &sender,
                 &ctx,
                 Snapshot {
-                    captures: capture_views(capture.as_ref()),
-                    capture: capture.as_ref().map(capture_status),
-                    capture_problem,
                     notice: Some(message.into()),
                     ..Default::default()
                 },
@@ -119,9 +98,6 @@ struct ClientContext<'a> {
     sender: &'a watch::Sender<Snapshot>,
     closing: &'a AtomicBool,
     ctx: &'a egui::Context,
-    capture: &'a Option<CaptureHandle>,
-    capture_problem: Option<&'static str>,
-    inspector: &'a StreamExecutor,
 }
 
 struct ConnectedDaemon {
@@ -139,56 +115,39 @@ async fn run_connected(
         sender,
         closing,
         ctx,
-        capture,
-        capture_problem,
-        inspector,
     } = client;
     let ConnectedDaemon {
         mut reader,
         mut writer,
         initial,
     } = daemon;
-    let mut snapshot = Snapshot {
-        ready: true,
-        captures: capture_views(capture.as_ref()),
-        capture: capture.as_ref().map(capture_status),
-        capture_problem,
-        ..Default::default()
-    };
+    let mut snapshot = Snapshot::default();
     apply_daemon_snapshot(&mut snapshot, initial);
     publish(sender, ctx, snapshot.clone());
 
-    let mut watcher = capture.clone();
     loop {
         enum Wake {
             Command(Option<Box<Command>>),
-            Catalog { stopped: bool },
-            Daemon(Option<ServerMessage>),
+            Daemon(Option<Box<ServerMessage>>),
         }
 
         let wake = tokio::select! {
             command = commands.recv() => Wake::Command(command.map(Box::new)),
-            result = catalog_changed(&mut watcher) => Wake::Catalog { stopped: result.is_err() },
-            message = reader.receive::<ServerMessage>() => Wake::Daemon(message.ok()),
+            message = reader.receive::<ServerMessage>() => Wake::Daemon(message.ok().map(Box::new)),
         };
 
         match wake {
-            Wake::Catalog { stopped } => {
-                if stopped {
-                    watcher = None;
+            Wake::Daemon(Some(message)) => match *message {
+                ServerMessage::Snapshot { snapshot: daemon } => {
+                    apply_daemon_snapshot(&mut snapshot, daemon);
+                    publish(sender, ctx, snapshot.clone());
                 }
-                snapshot.captures = capture_views(capture.as_ref());
-                publish(sender, ctx, snapshot.clone());
-            }
-            Wake::Daemon(Some(ServerMessage::Snapshot { snapshot: daemon })) => {
-                apply_daemon_snapshot(&mut snapshot, daemon);
-                publish(sender, ctx, snapshot.clone());
-            }
-            Wake::Daemon(Some(ServerMessage::Error { message })) => {
-                snapshot.notice = Some(message);
-                snapshot.busy = false;
-                publish(sender, ctx, snapshot.clone());
-            }
+                ServerMessage::Error { message } => {
+                    snapshot.notice = Some(message);
+                    snapshot.busy = false;
+                    publish(sender, ctx, snapshot.clone());
+                }
+            },
             Wake::Daemon(None) => return Err("Gundad disconnected."),
             Wake::Command(Some(command)) => {
                 if closing.load(Ordering::Acquire) {
@@ -196,8 +155,7 @@ async fn run_connected(
                 }
                 snapshot.busy = true;
                 publish(sender, ctx, snapshot.clone());
-                if let Some(command) =
-                    handle_command(*command, capture, inspector, &mut snapshot).await
+                if let Some(command) = handle_command(*command, &mut snapshot)
                     && writer
                         .send(&ClientMessage::Command { command })
                         .await
@@ -213,12 +171,7 @@ async fn run_connected(
     }
 }
 
-async fn handle_command(
-    command: Command,
-    capture: &Option<CaptureHandle>,
-    inspector: &StreamExecutor,
-    snapshot: &mut Snapshot,
-) -> Option<IpcCommand> {
+fn handle_command(command: Command, snapshot: &mut Snapshot) -> Option<IpcCommand> {
     match command {
         Command::Start { url, directory } => Some(IpcCommand::Create {
             url: url.as_str().to_owned(),
@@ -233,67 +186,23 @@ async fn handle_command(
             id,
             directory,
             track,
-        } => match captured(capture.as_ref(), id) {
-            Some(Ok(captured)) => {
-                let (url, filename, selection) = match track {
-                    Some(track) => (track.url, track.filename, track.selection),
-                    None => (captured.url, None, None),
-                };
-                let (page_url, page_title) = match captured.origin {
-                    DownloadOrigin::Browser {
-                        page_url,
-                        page_title,
-                    } => (Some(page_url.as_str().to_owned()), page_title),
-                    _ => (None, None),
-                };
-                snapshot.capture_tracks = None;
-                Some(IpcCommand::Create {
-                    url: url.as_str().to_owned(),
-                    directory: NativePath::from_path(&directory).ok()?,
-                    preferred_filename: filename,
-                    selection: selection.map(|selection| selection.as_str().to_owned()),
-                    page_url,
-                    page_title,
-                    engine: Some(
-                        match captured.engine {
-                            JobEngine::Stream => "stream",
-                            JobEngine::Http => "http",
-                        }
-                        .into(),
-                    ),
-                })
-            }
-            Some(Err(message)) => {
-                snapshot.notice = Some(message.into());
-                None
-            }
-            None => {
-                snapshot.notice = Some("That capture is no longer in the list.".into());
-                None
-            }
-        },
-        Command::Inspect(id) => {
-            snapshot.capture_tracks = Some(inspect_capture(inspector, capture.as_ref(), id).await);
-            None
+        } => {
+            snapshot.capture_tracks = None;
+            Some(IpcCommand::DownloadCapture {
+                id,
+                directory: NativePath::from_path(&directory).ok()?,
+                track: track.map(|track| IpcTrackChoice {
+                    url: track.url.as_str().to_owned(),
+                    filename: track.filename,
+                    selection: track
+                        .selection
+                        .map(|selection| selection.as_str().to_owned()),
+                }),
+            })
         }
-        Command::DismissCapture(id) => {
-            if let Some(handle) = capture
-                && handle.remove(id).await.is_err()
-            {
-                snapshot.notice = Some("The capture could not be dismissed.".into());
-            }
-            snapshot.captures = capture_views(capture.as_ref());
-            None
-        }
-        Command::ClearCaptures => {
-            if let Some(handle) = capture
-                && handle.clear().await.is_err()
-            {
-                snapshot.notice = Some("The capture list could not be cleared.".into());
-            }
-            snapshot.captures = capture_views(capture.as_ref());
-            None
-        }
+        Command::Inspect(id) => Some(IpcCommand::InspectCapture { id }),
+        Command::DismissCapture(id) => Some(IpcCommand::DismissCapture { id }),
+        Command::ClearCaptures => Some(IpcCommand::ClearCaptures),
         Command::Pause(id) => Some(IpcCommand::Pause { id: id.value() }),
         Command::Resume(id) => Some(IpcCommand::Resume { id: id.value() }),
         Command::Retry(id) => Some(IpcCommand::Retry { id: id.value() }),
@@ -314,8 +223,61 @@ fn apply_daemon_snapshot(snapshot: &mut Snapshot, daemon: IpcSnapshot) {
         .into_iter()
         .filter_map(|id| DownloadId::new(id).ok())
         .collect();
+    snapshot.captures = daemon.captures.into_iter().map(to_capture_view).collect();
+    snapshot.capture_tracks = daemon.capture_tracks.and_then(to_capture_tracks);
+    snapshot.capture = daemon.capture.map(|capture| {
+        Arc::new(CaptureStatus {
+            endpoint: capture.endpoint,
+            token: capture.token,
+        })
+    });
+    snapshot.capture_problem = daemon.capture_problem;
     snapshot.notice = daemon.notice;
     snapshot.ready = true;
+}
+
+fn to_capture_view(capture: gunda_ipc::CaptureView) -> CaptureView {
+    CaptureView {
+        id: capture.id,
+        url: capture.url,
+        kind: match capture.kind.as_str() {
+            "HLS" => "HLS",
+            "DASH" => "DASH",
+            "File" => "File",
+            _ => "Unknown",
+        },
+        content_type: capture.content_type,
+        page_title: capture.page_title,
+        seen: capture.seen,
+        segmented: capture.segmented,
+    }
+}
+
+fn to_capture_tracks(tracks: gunda_ipc::CaptureTracks) -> Option<CaptureTracks> {
+    Some(CaptureTracks {
+        id: tracks.id,
+        tracks: tracks
+            .tracks
+            .into_iter()
+            .filter_map(|track| {
+                let url = Url::parse(&track.url).ok()?;
+                let selection = track
+                    .selection
+                    .map(ExecutionSelection::new)
+                    .transpose()
+                    .ok()?;
+
+                Some(TrackView {
+                    label: track.label,
+                    details: track.details,
+                    url,
+                    filename: track.filename,
+                    selection,
+                })
+            })
+            .collect(),
+        problem: tracks.problem,
+    })
 }
 
 fn to_download_view(job: gunda_ipc::JobView) -> Option<DownloadView> {

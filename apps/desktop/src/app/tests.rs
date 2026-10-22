@@ -548,7 +548,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
             tracks: vec![
                 TrackView {
                     label: "1920x1080 (5.0 Mbps)".into(),
-                    details: "video · 1.2 GiB".into(),
+                    details: "video | 1.2 GiB".into(),
                     url: Url::parse("https://cdn.example.com/1080/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -556,7 +556,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                 },
                 TrackView {
                     label: "English (en)".into(),
-                    details: "audio · 128.0 MiB".into(),
+                    details: "audio | 128.0 MiB".into(),
                     url: Url::parse("https://cdn.example.com/audio/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -577,10 +577,10 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
         has("1920x1080 (5.0 Mbps)"),
         "missing video quality: {labels:?}"
     );
-    assert!(has("video · 1.2 GiB"), "missing video details: {labels:?}");
+    assert!(has("video | 1.2 GiB"), "missing video details: {labels:?}");
     assert!(has("English (en)"), "missing audio track: {labels:?}");
     assert!(
-        has("audio · 128.0 MiB"),
+        has("audio | 128.0 MiB"),
         "missing audio details: {labels:?}"
     );
 }
@@ -590,7 +590,7 @@ fn capture_panel_reports_a_channel_that_did_not_start() {
     let ctx = egui::Context::default();
     let mut desktop = desktop(Snapshot {
         ready: true,
-        capture_problem: Some("The browser capture channel could not be started."),
+        capture_problem: Some("The browser capture channel could not be started.".into()),
         ..Default::default()
     });
     desktop.update();

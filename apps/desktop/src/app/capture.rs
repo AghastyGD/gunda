@@ -32,7 +32,7 @@ impl Desktop {
         );
         ui.separator();
 
-        if let Some(problem) = self.snapshot.capture_problem {
+        if let Some(problem) = self.snapshot.capture_problem.as_deref() {
             notice(ui, problem, self.error_color());
 
             return;
@@ -161,14 +161,14 @@ fn row(
     ui.add(egui::Label::new(RichText::new(&capture.url).size(12.0)).truncate())
         .on_hover_text(&capture.url);
 
-    let mut details = format!("{} · seen {}×", capture.kind, capture.seen);
+    let mut details = format!("{} | seen {}x", capture.kind, capture.seen);
 
     if let Some(content_type) = &capture.content_type {
-        details = format!("{content_type} · {details}");
+        details = format!("{content_type} | {details}");
     }
 
     if let Some(title) = &capture.page_title {
-        details = format!("{title} · {details}");
+        details = format!("{title} | {details}");
     }
 
     ui.label(
@@ -209,7 +209,7 @@ fn tracks_of(
     colors: Palette,
     actions: &mut Actions,
 ) {
-    if let Some(problem) = tracks.problem {
+    if let Some(problem) = tracks.problem.as_deref() {
         notice(ui, problem, colors.muted);
 
         return;

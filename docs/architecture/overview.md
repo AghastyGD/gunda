@@ -68,9 +68,9 @@ A background client worker maintains the daemon connection, reconnects after a
 transport failure, and converts daemon snapshots into presentation views. The UI
 sends commands and receives snapshots through channels.
 
-Browser capture remains local to the desktop for this stage. Stream inspection
-also stays local so the capture panel can present available qualities before a
-job is created.
+Browser capture and quality inspection run in `gundad`. The desktop capture
+panel displays candidates from daemon snapshots and sends inspect, download,
+dismiss, and clear commands.
 
 The egui interface owns presentation and local UI state. Download lifecycle decisions remain in the manager.
 
@@ -82,9 +82,9 @@ the jobs visible to every connected client.
 
 ### `gundad`
 
-Owns the runtime lease, SQLite repository, download manager, protocol engines,
-and bounded scheduler. It executes transfers independently of the desktop
-window and remains reachable to multiple local clients.
+Owns the runtime lease, SQLite repository, download manager, capture listener,
+candidate catalog, protocol engines, and bounded scheduler. It executes transfers
+and records browser discoveries independently of the desktop window.
 
 ## Dependency direction
 

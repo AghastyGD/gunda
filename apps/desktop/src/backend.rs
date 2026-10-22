@@ -1,8 +1,7 @@
 use std::{
     collections::BTreeSet,
     io,
-    net::{Ipv4Addr, SocketAddr},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -12,15 +11,19 @@ use std::{
 
 #[cfg(test)]
 use std::{collections::BTreeMap, sync::Mutex};
+#[cfg(test)]
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    path::Path,
+};
 
 use eframe::egui;
+use gunda_capture::CandidateId;
+#[cfg(test)]
 use gunda_capture::{
-    Candidate, CandidateId, CaptureError, CaptureHandle, CaptureServer, load_or_create_token,
-    token_path,
+    Candidate, CaptureError, CaptureHandle, CaptureServer, load_or_create_token, token_path,
 };
-use gunda_core::download::{
-    DownloadId, DownloadOrigin, DownloadState, ExecutionSelection, RequestContext, ResourceKind,
-};
+use gunda_core::download::{DownloadId, DownloadState, ExecutionSelection};
 #[cfg(test)]
 use gunda_core::{
     application::{
@@ -28,20 +31,24 @@ use gunda_core::{
         ExecutionOutput, ExecutionReport,
     },
     download::{
-        DownloadDestination, DownloadJob, FileConflictPolicy, NewDownload, ResourceDescriptor,
+        DownloadDestination, DownloadJob, DownloadOrigin, FileConflictPolicy, NewDownload,
+        RequestContext, ResourceDescriptor, ResourceKind,
     },
 };
 #[cfg(test)]
 use gunda_http::{HttpClient, HttpExecutor};
 #[cfg(test)]
 use gunda_storage::{RuntimeLease, SqliteDownloadRepository};
+#[cfg(test)]
 use gunda_stream::{PresentationTrack, StreamExecutor, TrackKind, TrackSize};
 use tokio::sync::{mpsc, watch};
 #[cfg(test)]
 use tokio::time::Duration;
 use url::Url;
 
-use crate::view::{DownloadView, bytes};
+use crate::view::DownloadView;
+#[cfg(test)]
+use crate::view::bytes;
 
 #[cfg(not(test))]
 mod daemon_client;
@@ -55,7 +62,7 @@ pub struct Snapshot {
     pub captures: Vec<CaptureView>,
     pub capture_tracks: Option<CaptureTracks>,
     pub capture: Option<Arc<CaptureStatus>>,
-    pub capture_problem: Option<&'static str>,
+    pub capture_problem: Option<String>,
     pub notice: Option<String>,
 }
 
@@ -77,7 +84,7 @@ pub struct CaptureView {
 pub struct CaptureTracks {
     pub id: CandidateId,
     pub tracks: Vec<TrackView>,
-    pub problem: Option<&'static str>,
+    pub problem: Option<String>,
 }
 
 /// One quality or track the user can choose.
@@ -298,6 +305,7 @@ fn publish(sender: &watch::Sender<Snapshot>, ctx: &egui::Context, snapshot: Snap
 }
 
 /// The port the capture listener prefers, so a pairing survives a restart.
+#[cfg(test)]
 const CAPTURE_PORT: u16 = 48_123;
 
 /// Everything the command loop needs, once the application can run.
@@ -307,7 +315,7 @@ struct Initialized {
     manager: Arc<DownloadManager<SqliteDownloadRepository>>,
     engines: Engines,
     capture: Option<CaptureHandle>,
-    capture_problem: Option<&'static str>,
+    capture_problem: Option<String>,
 }
 
 /// The engines a download can be executed with.
@@ -356,14 +364,16 @@ async fn initialize(directory: PathBuf) -> Result<Initialized, &'static str> {
 ///
 /// A failure here is not fatal: downloads and the rest of the application work
 /// without a browser, and the interface says what is missing.
-async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<&'static str>) {
+#[cfg(test)]
+async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<String>) {
     let token = match load_or_create_token(&token_path(directory)) {
         Ok(token) => token,
         Err(_) => {
             return (
                 None,
                 Some(
-                    "The browser capture channel could not be set up. Check the application data folder.",
+                    "The browser capture channel could not be set up. Check the application data folder."
+                        .into(),
                 ),
             );
         }
@@ -391,7 +401,7 @@ async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<&'sta
         }
         Err(_) => (
             None,
-            Some("The browser capture channel could not be started."),
+            Some("The browser capture channel could not be started.".into()),
         ),
     }
 }
@@ -912,6 +922,7 @@ async fn execute_job<E: DownloadExecutor>(
 
 /// The engine that can execute a download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum JobEngine {
     /// One request, one file.
     Http,
@@ -920,6 +931,7 @@ enum JobEngine {
 }
 
 /// What a captured candidate becomes when the user downloads it.
+#[cfg(test)]
 struct CapturedJob {
     url: Url,
     origin: DownloadOrigin,
@@ -930,6 +942,7 @@ struct CapturedJob {
 ///
 /// The copy is taken here because the catalog can evict a candidate while the
 /// command waits in the queue.
+#[cfg(test)]
 fn captured(
     capture: Option<&CaptureHandle>,
     id: CandidateId,
@@ -955,6 +968,7 @@ fn captured(
 /// The segmented engine finds the manifest it needs from the URL. A capture
 /// whose URL does not name its format is refused here rather than handed to the
 /// plain HTTP engine, which would quietly save a playlist as a file.
+#[cfg(test)]
 fn capture_engine(candidate: &Candidate) -> Result<JobEngine, &'static str> {
     match candidate.kind() {
         ResourceKind::File => Ok(JobEngine::Http),
@@ -997,6 +1011,7 @@ fn engine_of(manager: &DownloadManager<SqliteDownloadRepository>, id: DownloadId
 }
 
 /// Whether a URL names a segmented-stream manifest.
+#[cfg(test)]
 fn looks_segmented(url: &Url) -> bool {
     let path = url.path().to_ascii_lowercase();
 
@@ -1007,6 +1022,7 @@ fn looks_segmented(url: &Url) -> bool {
 ///
 /// With no capture channel there is nothing to wait for, so the future never
 /// completes and its branch in the command loop stays quiet.
+#[cfg(test)]
 async fn catalog_changed(capture: &mut Option<CaptureHandle>) -> Result<(), CaptureError> {
     match capture {
         Some(handle) => handle.changed().await,
@@ -1019,15 +1035,16 @@ async fn catalog_changed(capture: &mut Option<CaptureHandle>) -> Result<(), Capt
 /// A capture carries one URL, and a presentation reached that way usually
 /// carries several qualities and tracks. Reading them is a deliberate step
 /// because it costs requests, so it only happens when the user asks.
+#[cfg(test)]
 async fn inspect_capture(
     stream: &StreamExecutor,
     capture: Option<&CaptureHandle>,
     id: CandidateId,
 ) -> CaptureTracks {
-    let unavailable = |problem| CaptureTracks {
+    let unavailable = |problem: &str| CaptureTracks {
         id,
         tracks: Vec::new(),
-        problem: Some(problem),
+        problem: Some(problem.to_owned()),
     };
 
     match captured(capture, id) {
@@ -1053,10 +1070,11 @@ async fn inspect_capture(
 }
 
 impl TrackView {
+    #[cfg(test)]
     fn from_track(track: &PresentationTrack) -> Self {
         Self {
             label: track.label().to_owned(),
-            details: format!("{} · {}", kind_name(track.kind()), size_hint(track.size())),
+            details: format!("{} | {}", kind_name(track.kind()), size_hint(track.size())),
             url: track.url().clone(),
             filename: track.filename().map(str::to_owned),
             selection: track.selection().cloned(),
@@ -1065,6 +1083,7 @@ impl TrackView {
 }
 
 /// A short name for what a track carries.
+#[cfg(test)]
 fn kind_name(kind: TrackKind) -> &'static str {
     match kind {
         TrackKind::Video => "video",
@@ -1078,6 +1097,7 @@ fn kind_name(kind: TrackKind) -> &'static str {
 ///
 /// An estimate is marked as one: the total a download shows is measured, and
 /// the two must not be mistaken for each other.
+#[cfg(test)]
 fn size_hint(size: TrackSize) -> String {
     match size {
         TrackSize::Exact(total) => bytes(total),
@@ -1087,6 +1107,7 @@ fn size_hint(size: TrackSize) -> String {
 }
 
 /// Copies the catalog into the shape the interface renders.
+#[cfg(test)]
 fn capture_views(capture: Option<&CaptureHandle>) -> Vec<CaptureView> {
     let Some(handle) = capture else {
         return Vec::new();
@@ -1101,6 +1122,7 @@ fn capture_views(capture: Option<&CaptureHandle>) -> Vec<CaptureView> {
 }
 
 impl CaptureView {
+    #[cfg(test)]
     fn from_candidate(candidate: &Candidate) -> Self {
         Self {
             id: candidate.id(),
@@ -1115,6 +1137,7 @@ impl CaptureView {
 }
 
 /// How to pair the browser with this application.
+#[cfg(test)]
 fn capture_status(handle: &CaptureHandle) -> Arc<CaptureStatus> {
     Arc::new(CaptureStatus {
         endpoint: handle.endpoint(),
@@ -1123,6 +1146,7 @@ fn capture_status(handle: &CaptureHandle) -> Arc<CaptureStatus> {
 }
 
 /// A short label for a captured resource.
+#[cfg(test)]
 fn kind_label(kind: ResourceKind) -> &'static str {
     match kind {
         ResourceKind::Hls => "HLS",

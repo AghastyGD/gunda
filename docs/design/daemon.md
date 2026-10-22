@@ -5,16 +5,18 @@ Status: implemented; the desktop is a daemon client
 ## Ownership
 
 `gundad` owns the runtime lease, SQLite repository, `DownloadManager`, HTTP and
-stream executors, and the bounded job scheduler. It is the only production
-transfer owner, and jobs continue when desktop clients disconnect.
+stream executors, browser capture listener, candidate catalog, and bounded job
+scheduler. It is the only production transfer owner, and downloads and capture
+continue when desktop clients disconnect.
 
 The desktop connects through `gunda-ipc`. It starts `gunda-desktop --daemon`
 with the same data directory when no daemon is available, then reads snapshots
 and sends lifecycle commands. The executable therefore acts as either the
 desktop client or its background daemon.
 
-Browser capture and stream inspection remain desktop-owned. Moving the capture
-listener into `gundad` is a separate change.
+The daemon inspects captured presentations and creates jobs from captured
+candidates. The desktop capture panel renders daemon snapshots and sends
+inspection and download commands.
 
 ## Transport
 
@@ -34,12 +36,14 @@ named pipes on Windows, keeping the same protocol and command semantics.
 - create
 - pause, resume, retry, restart, and cancel
 - save a published status
+- inspect, download, dismiss, and clear captured resources
 
 The daemon replies with complete snapshots after state changes. Each snapshot
 contains job state, progress, failure classification, native destination and
-output paths, active IDs, pause capability, and pending publication status. Every
-connected client receives the same state, and a reconnecting client receives the
-current snapshot immediately.
+output paths, active IDs, pause capability, pending publication status, capture
+pairing values, candidates, and inspected tracks. Every connected client receives
+the same state, and a reconnecting client receives the current snapshot
+immediately.
 
 ## Scheduling
 
@@ -58,5 +62,4 @@ bytes. The endpoint file contains no secret; the token is not printed by
 `gundad`.
 
 The first transport does not yet provide permission isolation equivalent to a
-Unix socket or named pipe. Windows verification and daemon-owned capture remain
-to be completed.
+Unix socket or named pipe. Windows verification remains to be completed.

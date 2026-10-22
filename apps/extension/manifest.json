@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Gunda Capture",
   "version": "0.1.0",
-  "description": "Reports the media a page plays to the Gunda desktop application.",
+  "description": "Reports the media a page plays to the Gunda daemon.",
   "minimum_chrome_version": "116",
 
   "permissions": ["webRequest", "storage", "tabs", "alarms"],

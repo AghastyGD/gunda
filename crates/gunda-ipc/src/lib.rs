@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 /// Version of the daemon protocol.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest single protocol message accepted.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -118,6 +118,18 @@ pub enum Command {
     SaveStatus {
         id: i64,
     },
+    InspectCapture {
+        id: u64,
+    },
+    DownloadCapture {
+        id: u64,
+        directory: NativePath,
+        track: Option<CaptureTrackChoice>,
+    },
+    DismissCapture {
+        id: u64,
+    },
+    ClearCaptures,
 }
 
 /// A client message. `Hello` must be the first message on every connection.
@@ -126,6 +138,61 @@ pub enum Command {
 pub enum ClientMessage {
     Hello { version: u32, token: String },
     Command { command: Command },
+}
+
+/// Pairing values shown in a daemon client.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CaptureStatus {
+    pub endpoint: String,
+    pub token: String,
+}
+
+impl fmt::Debug for CaptureStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureStatus")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// A media resource reported by the browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureView {
+    pub id: u64,
+    pub url: String,
+    pub kind: String,
+    pub content_type: Option<String>,
+    pub page_title: Option<String>,
+    pub seen: u32,
+    pub segmented: bool,
+}
+
+/// One quality or track offered by a captured presentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureTrackView {
+    pub label: String,
+    pub details: String,
+    pub url: String,
+    pub filename: Option<String>,
+    pub selection: Option<String>,
+}
+
+/// A quality selected for a captured presentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureTrackChoice {
+    pub url: String,
+    pub filename: Option<String>,
+    pub selection: Option<String>,
+}
+
+/// The inspected tracks for one captured presentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptureTracks {
+    pub id: u64,
+    pub tracks: Vec<CaptureTrackView>,
+    pub problem: Option<String>,
 }
 
 /// A job as rendered by a client.
@@ -153,6 +220,10 @@ pub struct JobView {
 pub struct Snapshot {
     pub jobs: Vec<JobView>,
     pub active: Vec<i64>,
+    pub captures: Vec<CaptureView>,
+    pub capture_tracks: Option<CaptureTracks>,
+    pub capture: Option<CaptureStatus>,
+    pub capture_problem: Option<String>,
     pub notice: Option<String>,
 }
 
@@ -345,6 +416,7 @@ mod tests {
                 }],
                 active: Vec::new(),
                 notice: None,
+                ..Snapshot::default()
             },
         };
 
@@ -370,5 +442,65 @@ mod tests {
         let encoded = NativePath::from_path(&path).unwrap();
 
         assert_eq!(encoded.to_path().unwrap(), path);
+    }
+
+    #[test]
+    fn snapshot_round_trips_capture_state() {
+        let message = ServerMessage::Snapshot {
+            snapshot: Snapshot {
+                captures: vec![CaptureView {
+                    id: 7,
+                    url: "https://cdn.example.test/master.m3u8".into(),
+                    kind: "HLS".into(),
+                    content_type: Some("application/vnd.apple.mpegurl".into()),
+                    page_title: Some("A presentation".into()),
+                    seen: 2,
+                    segmented: true,
+                }],
+                capture_tracks: Some(CaptureTracks {
+                    id: 7,
+                    tracks: vec![CaptureTrackView {
+                        label: "640x360".into(),
+                        details: "video | 1.0 MiB".into(),
+                        url: "https://cdn.example.test/master.m3u8".into(),
+                        filename: Some("presentation.mp4".into()),
+                        selection: Some("hls:v1".into()),
+                    }],
+                    problem: None,
+                }),
+                capture: Some(CaptureStatus {
+                    endpoint: "ws://127.0.0.1:48123/capture".into(),
+                    token: "a".repeat(64),
+                }),
+                ..Snapshot::default()
+            },
+        };
+
+        let encoded = serde_json::to_vec(&message).unwrap();
+        let ServerMessage::Snapshot { snapshot } =
+            serde_json::from_slice::<ServerMessage>(&encoded).unwrap()
+        else {
+            panic!("a snapshot must round-trip as a snapshot");
+        };
+
+        assert_eq!(snapshot.captures[0].kind, "HLS");
+        assert_eq!(
+            snapshot.capture_tracks.unwrap().tracks[0].details,
+            "video | 1.0 MiB"
+        );
+        assert_eq!(
+            snapshot.capture.unwrap().endpoint,
+            "ws://127.0.0.1:48123/capture"
+        );
+    }
+
+    #[test]
+    fn capture_status_debug_redacts_the_token() {
+        let status = CaptureStatus {
+            endpoint: "ws://127.0.0.1:48123/capture".into(),
+            token: "a".repeat(64),
+        };
+
+        assert!(!format!("{status:?}").contains(&status.token));
     }
 }

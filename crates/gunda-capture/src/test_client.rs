@@ -1,15 +1,14 @@
-//! A minimal WebSocket client, used only by this crate's tests.
+//! A minimal WebSocket client for capture integration tests.
 //!
-//! The crate ships the server half of the protocol; the tests need the other
-//! half. Writing it here keeps the assertions honest: the test client masks what
-//! a browser masks, and a refusal is seen exactly as a browser would see it, as
-//! a closed connection.
+//! The test client masks frames as a browser does, so integrations exercise the
+//! same wire behavior as the extension.
 
 use std::net::SocketAddr;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+#[cfg(test)]
 use crate::websocket::accept_key;
 
 /// The key from the handshake example in RFC 6455 section 1.3.
@@ -156,6 +155,7 @@ async fn read_head(stream: &mut TcpStream) -> String {
 }
 
 /// A test that the handshake response is built the way the RFC describes it.
+#[cfg(test)]
 #[test]
 fn accept_key_is_the_one_the_server_will_send() {
     assert_eq!(accept_key(CLIENT_KEY), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");

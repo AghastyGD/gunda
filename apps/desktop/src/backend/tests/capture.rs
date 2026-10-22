@@ -255,7 +255,7 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
 
     assert_eq!(track.label, "640x360 (1.0 Mbps)");
     assert!(
-        track.details.starts_with("video · ~"),
+        track.details.starts_with("video | ~"),
         "an estimated size must be marked as one: {}",
         track.details
     );

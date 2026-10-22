@@ -417,7 +417,9 @@ impl Desktop {
                                 ));
                         } else if self.snapshot.capture_problem.is_some() {
                             ui.label(RichText::new("Browser capture: unavailable").small().weak())
-                                .on_hover_text(self.snapshot.capture_problem.unwrap_or_default());
+                                .on_hover_text(
+                                    self.snapshot.capture_problem.as_deref().unwrap_or_default(),
+                                );
                         }
                     });
                 });

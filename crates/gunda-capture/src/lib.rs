@@ -1,11 +1,11 @@
 //! Browser media capture for Gunda.
 //!
 //! A browser extension cannot open a raw socket, so it reports the media it
-//! detects to a small loopback service the desktop application runs. The
+//! detects to a small loopback service the Gunda daemon runs. The
 //! channel has two properties that matter for safety:
 //!
 //! - it authenticates with a shared secret, so any page in the browser cannot
-//!   inject downloads into the application;
+//!   inject downloads into Gunda;
 //! - the wire protocol is documented JSON with explicit limits rather than a
 //!   bespoke binary framing.
 //!
@@ -43,8 +43,8 @@ mod error;
 mod pairing;
 mod protocol;
 mod server;
-#[cfg(test)]
-mod test_client;
+#[cfg(any(test, feature = "test-client"))]
+pub mod test_client;
 mod websocket;
 
 pub use candidate::{Candidate, CandidateId, Catalog, DEFAULT_CAPACITY, Recorded, Report};
