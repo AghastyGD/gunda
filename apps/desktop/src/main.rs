@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .with_min_inner_size([900.0, 600.0])
             .with_app_id("io.github.aghastygd.gunda"),
         persistence_path: Some(directory.join("ui-egui")),
+        run_and_return: false,
         ..Default::default()
     };
     eframe::run_native(

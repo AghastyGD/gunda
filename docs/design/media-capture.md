@@ -160,20 +160,21 @@ Implemented components:
 
 Naming and size rules:
 
-- **The output is named after the media, not the manifest.** A manifest URL
-  names a playlist, so publishing its last path segment unchanged saved
-  `index.m3u8` for a file that is really an MP4 or a transport stream. The
-  validated stem is kept and its extension replaced with the container the bytes
-  are (`output_filename`, shared with the desktop so a chosen quality keeps the
-  name of the presentation rather than of the variant's own playlist, which is
-  frequently also called `index.m3u8`). A filename the caller chose still wins,
-  and `plan_destination` remains the only validator.
+- **The output is named after the presentation, not the manifest.** Captured
+  downloads use the page title when it contains usable text. A shared sanitizer
+  replaces unsafe filename characters, removes common browser annotations, and
+  applies the media extension. Manifest and variant URLs frequently end in
+  `index.m3u8`, so `output_filename` remains only a fallback. A filename the
+  caller chose still wins, and `plan_destination` remains the only validator.
 - **Reported sizes are measured or unknown.** A declared length is used
   directly. Otherwise every planned resource is probed with one bounded metadata
-  request (`HEAD`, at most `PROBE_CONCURRENCY` = 8 in flight, at most
-  `MAX_PROBED_RESOURCES` = 512 resources) and the total is the sum. Beyond that
-  bound the total is reported as unknown. The picker may show an estimate from
-  the declared bitrate and duration, marked with `~`.
+  request. The probe tries `HEAD`, then `Range: bytes=0-0` to read the total
+  from `Content-Range`, then response metadata from a normal `GET`. At most
+  `PROBE_CONCURRENCY` = 8 probes run in flight and at most
+  `MAX_PROBED_RESOURCES` = 512 resources are accepted. Beyond that bound, or
+  when the origin exposes no length through any method, the total is unknown.
+  The picker may show an estimate from the declared bitrate and duration,
+  marked with `~`.
 
 Unsupported cases return named errors (`UnsupportedFeature`):
 

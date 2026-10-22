@@ -291,6 +291,11 @@ async fn described_variant(
         track.size = combine_sizes(track.size, audio.size);
         track.duration_millis = track.duration_millis.max(audio.duration_millis);
         track.label = format!("{} with audio", track.label);
+        if track.container.is_some_and(Container::can_be_muxed)
+            && audio.container.is_some_and(Container::can_be_muxed)
+        {
+            track.container = Some(Container::Mp4);
+        }
     }
 
     track.filename = output_filename(manifest, track.container);

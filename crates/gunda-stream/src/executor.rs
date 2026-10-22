@@ -496,16 +496,15 @@ impl StreamExecutor {
         let mut total = 0_u64;
 
         for resource in plan.resources() {
+            if let Some(length) = resource.known_length() {
+                total = total.checked_add(length)?;
+                continue;
+            }
+
             let segment = segment_request(resource.url(), request.url(), request.headers());
             let client = Arc::clone(&self.client);
 
-            probes.spawn(async move {
-                client
-                    .inspect(&segment)
-                    .await
-                    .map(|metadata| metadata.content_length())
-                    .unwrap_or_default()
-            });
+            probes.spawn(async move { resource_length(&client, &segment).await });
 
             if probes.len() >= PROBE_CONCURRENCY {
                 total = total.checked_add(finished_probe(&mut probes).await?)?;
@@ -526,6 +525,24 @@ impl StreamExecutor {
 /// unknowable, which `None` carries to the caller.
 async fn finished_probe(probes: &mut tokio::task::JoinSet<Option<u64>>) -> Option<u64> {
     probes.join_next().await?.ok()?
+}
+
+async fn resource_length(client: &HttpClient, request: &RequestContext) -> Option<u64> {
+    if let Ok(metadata) = client.inspect(request).await
+        && let Some(length) = metadata.content_length()
+    {
+        return Some(length);
+    }
+
+    if let Ok(body) = client.open_byte_range(request, 0, 0).await {
+        return Some(body.range().total());
+    }
+
+    client
+        .open(request)
+        .await
+        .ok()
+        .and_then(|body| body.metadata().content_length())
 }
 
 /// Names the output after the media it will contain.

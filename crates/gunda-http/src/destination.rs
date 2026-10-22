@@ -51,6 +51,98 @@ pub fn url_filename(url: &Url) -> Option<String> {
     Some(filename.into_owned())
 }
 
+/// Builds a validated filename from a page title.
+///
+/// Browser pages often expose an opaque manifest name while the page title
+/// describes the presentation. Unsafe filesystem characters are replaced and
+/// the title is bounded before the normal filename validation rules are applied.
+#[must_use]
+pub fn title_filename(title: &str, extension: Option<&str>) -> Option<String> {
+    let title = strip_page_title_annotations(title.trim());
+    let mut stem = String::with_capacity(title.len().min(160));
+    let mut previous_space = false;
+
+    for character in title.chars() {
+        let character = if character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '~'
+            ) {
+            ' '
+        } else {
+            character
+        };
+
+        if character.is_whitespace() {
+            if !previous_space {
+                stem.push(' ');
+            }
+            previous_space = true;
+        } else {
+            stem.push(character);
+            previous_space = false;
+        }
+    }
+
+    let stem = stem.trim_matches([' ', '.']);
+    if stem.is_empty() {
+        return None;
+    }
+
+    let mut end = stem.len().min(160);
+    while end > 0 && !stem.is_char_boundary(end) {
+        end -= 1;
+    }
+    let stem = stem[..end].trim_matches([' ', '.']);
+    if stem.is_empty() {
+        return None;
+    }
+
+    let extension = extension.filter(|extension| {
+        !extension.is_empty()
+            && extension.len() <= 10
+            && extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    });
+    let filename = match extension {
+        Some(extension) => format!("{stem}.{extension}"),
+        None => stem.to_owned(),
+    };
+
+    if validate_filename(&filename).is_ok() {
+        return Some(filename);
+    }
+
+    let filename = match extension {
+        Some(extension) => format!("download {stem}.{extension}"),
+        None => format!("download {stem}"),
+    };
+    validate_filename(&filename).ok().map(|()| filename)
+}
+
+fn strip_page_title_annotations(mut title: &str) -> &str {
+    if let Some(rest) = title.strip_prefix('(')
+        && let Some(end) = rest.find(')')
+        && end <= 3
+        && rest[..end].bytes().all(|byte| byte.is_ascii_digit())
+    {
+        title = rest[end + 1..].trim_start();
+    }
+
+    let lowercase = title.to_ascii_lowercase();
+    for suffix in [
+        " - youtube music",
+        " | youtube music",
+        " - youtube",
+        " | youtube",
+    ] {
+        if lowercase.ends_with(suffix) {
+            return title[..title.len() - suffix.len()].trim_end();
+        }
+    }
+
+    title
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -58,7 +150,7 @@ mod tests {
     use gunda_core::download::{DownloadDestination, DownloadId, FileConflictPolicy};
     use url::Url;
 
-    use super::plan_destination;
+    use super::{plan_destination, title_filename};
     use crate::FinalizeError;
 
     #[test]
@@ -151,5 +243,30 @@ mod tests {
                 "unexpected destination for {raw_url}",
             );
         }
+    }
+
+    #[test]
+    fn page_titles_become_valid_media_filenames() {
+        assert_eq!(
+            title_filename("Video: part 1/2?", Some("mp4")).as_deref(),
+            Some("Video part 1 2.mp4")
+        );
+        assert_eq!(
+            title_filename("CON", Some("mp4")).as_deref(),
+            Some("download CON.mp4")
+        );
+        assert_eq!(
+            title_filename("(12) Arcane - Remember Me | YouTube", Some("mp4")).as_deref(),
+            Some("Arcane - Remember Me.mp4")
+        );
+        assert_eq!(
+            title_filename("  ...  ", Some("mp4")),
+            None,
+            "a title with no usable text must fall back to the source name"
+        );
+
+        let long = title_filename(&"á".repeat(200), Some("mp4")).expect("a title is usable");
+        assert!(long.len() <= 200);
+        assert!(long.ends_with(".mp4"));
     }
 }

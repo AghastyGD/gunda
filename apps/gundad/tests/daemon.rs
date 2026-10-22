@@ -76,8 +76,13 @@ async fn capture_continues_while_no_client_is_connected() {
         .iter()
         .find(|job| job.state == "completed")
         .unwrap();
+    let output = job.output.as_ref().unwrap().to_path().unwrap();
 
     assert_eq!(job.origin, "Browser");
+    assert_eq!(
+        output.file_name().and_then(|name| name.to_str()),
+        Some("A movie.mp4")
+    );
     server.await.unwrap();
     daemon.abort();
 }

@@ -119,6 +119,10 @@ const MULTI_DASH: &str = r#"<MPD type="static" mediaPresentationDuration="PT4S">
 /// Serves fixed bodies by request path, honouring `Range`, and closes each
 /// connection after one response.
 async fn serve(routes: &[(&str, &str, &[u8])], entry: &str) -> Url {
+    serve_with_head(routes, entry, true).await
+}
+
+async fn serve_with_head(routes: &[(&str, &str, &[u8])], entry: &str, allow_head: bool) -> Url {
     let routes: Vec<(String, String, Vec<u8>)> = routes
         .iter()
         .map(|(path, content_type, body)| {
@@ -151,40 +155,46 @@ async fn serve(routes: &[(&str, &str, &[u8])], entry: &str) -> Url {
                     let head = String::from_utf8_lossy(&buffer[..read]).to_string();
                     let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
 
-                    let response = match routes.iter().find(|(route, _, _)| route == &path) {
-                        Some((_, content_type, body)) => match requested_range(&head) {
-                            Some((first, last)) if last < body.len() as u64 => {
-                                let slice = &body[first as usize..=last as usize];
+                    let response = if !allow_head && head.starts_with("HEAD ") {
+                        b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\n\
+                          connection: close\r\n\r\n"
+                            .to_vec()
+                    } else {
+                        match routes.iter().find(|(route, _, _)| route == &path) {
+                            Some((_, content_type, body)) => match requested_range(&head) {
+                                Some((first, last)) if last < body.len() as u64 => {
+                                    let slice = &body[first as usize..=last as usize];
 
-                                let mut response = format!(
-                                    "HTTP/1.1 206 Partial Content\r\n\
+                                    let mut response = format!(
+                                        "HTTP/1.1 206 Partial Content\r\n\
                                      content-type: {content_type}\r\n\
                                      content-range: bytes {first}-{last}/{}\r\n\
                                      content-length: {}\r\n\
                                      connection: close\r\n\r\n",
-                                    body.len(),
-                                    slice.len()
-                                )
-                                .into_bytes();
+                                        body.len(),
+                                        slice.len()
+                                    )
+                                    .into_bytes();
 
-                                response.extend_from_slice(slice);
-                                response
-                            }
-                            _ => {
-                                let mut response = format!(
-                                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
+                                    response.extend_from_slice(slice);
+                                    response
+                                }
+                                _ => {
+                                    let mut response = format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\n\
                                      content-length: {}\r\nconnection: close\r\n\r\n",
-                                    body.len()
-                                )
-                                .into_bytes();
+                                        body.len()
+                                    )
+                                    .into_bytes();
 
-                                response.extend_from_slice(body);
-                                response
-                            }
-                        },
-                        None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
-                                  connection: close\r\n\r\n"
-                            .to_vec(),
+                                    response.extend_from_slice(body);
+                                    response
+                                }
+                            },
+                            None => b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
+                                      connection: close\r\n\r\n"
+                                .to_vec(),
+                        }
                     };
 
                     let _ = socket.write_all(&response).await;
@@ -333,6 +343,40 @@ async fn downloads_an_hls_presentation_into_one_file() {
         leftovers.is_empty(),
         "unexpected staging files: {leftovers:?}"
     );
+}
+
+#[tokio::test]
+async fn a_server_that_rejects_head_still_reports_the_measured_size() {
+    let master = serve_with_head(
+        &[
+            (
+                "/master.m3u8",
+                "application/vnd.apple.mpegurl",
+                MASTER.as_bytes(),
+            ),
+            (
+                "/media.m3u8",
+                "application/vnd.apple.mpegurl",
+                MEDIA.as_bytes(),
+            ),
+            ("/init.mp4", "video/mp4", b"INIT"),
+            ("/s0.m4s", "video/mp4", b"SEG0"),
+            ("/s1.m4s", "video/mp4", b"SEG1"),
+            ("/s2.m4s", "video/mp4", b"SEG2"),
+        ],
+        "/master.m3u8",
+        false,
+    )
+    .await;
+
+    let directory = tempfile::tempdir().expect("temp directory must exist");
+    let executor = StreamExecutor::new(HttpClient::new().expect("client must build"));
+    let prepared = executor
+        .prepare(input(master, directory.path()))
+        .await
+        .expect("prepare must succeed");
+
+    assert_eq!(prepared.total_bytes(), Some(16));
 }
 
 #[tokio::test]
@@ -875,6 +919,15 @@ async fn a_presentation_that_keeps_its_sound_apart_is_fetched_and_muxed() {
 
     let directory = tempfile::tempdir().expect("temp directory must exist");
     let executor = StreamExecutor::new(HttpClient::new().expect("client must build"));
+
+    let presentation = executor
+        .inspect(&RequestContext::new(entry.clone(), Vec::new()))
+        .await
+        .expect("inspection must succeed");
+    let track = &presentation.tracks()[0];
+
+    assert_eq!(track.container(), Some(Container::Mp4));
+    assert_eq!(track.filename(), Some("master.mp4"));
 
     let prepared = executor
         .prepare(input_unnamed(entry, directory.path()))

@@ -22,7 +22,7 @@ use gunda_core::download::{
     ExecutionSelection, FailureKind, FileConflictPolicy, NewDownload, RequestContext,
     ResourceDescriptor, ResourceKind,
 };
-use gunda_http::{HttpClient, HttpExecutor};
+use gunda_http::{HttpClient, HttpExecutor, title_filename, url_filename};
 use gunda_ipc::{
     CaptureStatus as IpcCaptureStatus, CaptureTrackChoice, CaptureTrackView, CaptureTracks,
     CaptureView, ClientMessage, Command, Connection, JobView, NativePath, PROTOCOL_VERSION,
@@ -403,7 +403,7 @@ impl Daemon {
         let directory = directory
             .to_path()
             .map_err(|_| "Invalid destination folder.")?;
-        let (url, filename, selection) = match track {
+        let (url, track_filename, selection) = match track {
             Some(track) => {
                 let url = validate_url(&track.url)?;
                 let selection = track
@@ -413,8 +413,19 @@ impl Daemon {
                     .map_err(|_| "Invalid stream selection.")?;
                 (url, track.filename, selection)
             }
-            None => (captured.url, None, None),
+            None => (captured.url.clone(), None, None),
         };
+        let extension = capture_extension(&captured, track_filename.as_deref());
+        let fallback_filename = track_filename.or_else(|| {
+            extension
+                .as_deref()
+                .map(|extension| format!("download.{extension}"))
+        });
+        let filename = captured
+            .page_title
+            .as_deref()
+            .and_then(|title| title_filename(title, extension.as_deref()))
+            .or(fallback_filename);
         let mut request = RequestContext::new(url, Vec::new());
         if let Some(selection) = selection {
             request = request.with_selection(selection);
@@ -482,6 +493,9 @@ impl Daemon {
             url: candidate.url().clone(),
             origin: candidate.origin(),
             engine,
+            kind: candidate.kind(),
+            content_type: candidate.content_type().map(str::to_owned),
+            page_title: candidate.page_title().map(str::to_owned),
         })
     }
 
@@ -931,6 +945,57 @@ struct Captured {
     url: Url,
     origin: DownloadOrigin,
     engine: JobEngine,
+    kind: ResourceKind,
+    content_type: Option<String>,
+    page_title: Option<String>,
+}
+
+fn capture_extension(captured: &Captured, track_filename: Option<&str>) -> Option<String> {
+    track_filename
+        .and_then(|filename| Path::new(filename).extension())
+        .and_then(|extension| extension.to_str())
+        .map(str::to_owned)
+        .or_else(|| {
+            captured
+                .content_type
+                .as_deref()
+                .and_then(content_type_extension)
+                .map(str::to_owned)
+        })
+        .or_else(|| match captured.kind {
+            ResourceKind::Hls | ResourceKind::Dash => Some("mp4".into()),
+            ResourceKind::File | ResourceKind::Unknown => {
+                url_filename(&captured.url).and_then(|filename| {
+                    Path::new(&filename)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .map(str::to_owned)
+                })
+            }
+        })
+}
+
+fn content_type_extension(content_type: &str) -> Option<&'static str> {
+    match content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "video/quicktime" => Some("mov"),
+        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/aac" => Some("aac"),
+        "audio/ogg" => Some("ogg"),
+        "audio/opus" => Some("opus"),
+        "audio/flac" => Some("flac"),
+        "audio/wav" | "audio/x-wav" => Some("wav"),
+        _ => None,
+    }
 }
 
 fn capture_engine(candidate: &Candidate) -> Result<JobEngine, String> {
