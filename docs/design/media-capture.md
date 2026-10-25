@@ -50,6 +50,13 @@ The pipeline has these responsibilities:
   reach the Gunda daemon either over a loopback WebSocket or through the
   browser's native-messaging bridge, which needs an installed host manifest and
   a helper executable.
+
+The packaged extension prefers a native-messaging host named
+`com.gunda.capture`. The desktop registers the host for detected Chromium
+browsers on Linux, and the host returns the current daemon endpoint and capture
+token.
+Manual endpoint and token entry remains available when native messaging cannot
+be registered.
 - **A native overlay, if the UI is one.** A window drawn over a video cannot
   receive DOM input, so the content script has to report the element's
   rectangle, device-pixel ratio, visibility and clipped ancestor box, the

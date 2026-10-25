@@ -2,3 +2,4 @@
 node_modules/
 /apps/desktop/.svelte-kit/
 /apps/desktop/build/
+/apps/extension/dist

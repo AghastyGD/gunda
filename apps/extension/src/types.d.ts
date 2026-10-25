@@ -33,6 +33,11 @@ type ChannelStatus = {
 
 type ChannelStats = Record<string, number>;
 
+type PairingSettings = {
+  endpoint: string;
+  token: string;
+};
+
 interface Window {
   __gundaPageAgent?: boolean;
 }

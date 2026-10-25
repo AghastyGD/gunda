@@ -2,7 +2,7 @@
 
 use std::error::Error;
 use std::fmt;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -15,6 +15,36 @@ pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest single protocol message accepted.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Browser native-messaging host name.
+pub const NATIVE_HOST_NAME: &str = "com.gunda.capture";
+
+/// Version of the browser native-messaging protocol.
+pub const NATIVE_HOST_PROTOCOL_VERSION: u32 = 1;
+
+/// Largest browser native-messaging request or response.
+pub const MAX_NATIVE_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// A request from the browser extension to its native host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeHostRequest {
+    Pairing { version: u32, agent: String },
+}
+
+/// A response from the native host to the browser extension.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeHostResponse {
+    Pairing {
+        version: u32,
+        endpoint: String,
+        token: String,
+    },
+    Error {
+        message: String,
+    },
+}
 
 /// A path encoded without assuming it is UTF-8.
 ///
@@ -265,6 +295,66 @@ impl From<io::Error> for IpcError {
     }
 }
 
+/// Reads one browser native-messaging request.
+pub fn read_native_host_request(reader: &mut impl Read) -> Result<NativeHostRequest, IpcError> {
+    let mut size = [0_u8; 4];
+    reader.read_exact(&mut size)?;
+    let size = usize::try_from(u32::from_le_bytes(size)).map_err(|_| IpcError::InvalidMessage)?;
+    if size == 0 || size > MAX_NATIVE_HOST_MESSAGE_BYTES {
+        return Err(IpcError::InvalidMessage);
+    }
+
+    let mut body = vec![0_u8; size];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|_| IpcError::Json)
+}
+
+/// Writes one browser native-messaging response.
+pub fn write_native_host_response(
+    writer: &mut impl Write,
+    response: &NativeHostResponse,
+) -> Result<(), IpcError> {
+    let body = serde_json::to_vec(response).map_err(|_| IpcError::Json)?;
+    let size = u32::try_from(body.len()).map_err(|_| IpcError::InvalidMessage)?;
+    if body.is_empty() || body.len() > MAX_NATIVE_HOST_MESSAGE_BYTES {
+        return Err(IpcError::InvalidMessage);
+    }
+
+    writer.write_all(&size.to_le_bytes())?;
+    writer.write_all(&body)?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Writes a Chrome-compatible native-messaging host manifest.
+pub fn write_chrome_native_host_manifest(
+    path: &Path,
+    executable: &Path,
+    extension_id: &str,
+) -> Result<(), IpcError> {
+    #[derive(Serialize)]
+    struct Manifest<'a> {
+        name: &'a str,
+        description: &'a str,
+        path: &'a str,
+        #[serde(rename = "type")]
+        kind: &'a str,
+        allowed_origins: Vec<String>,
+    }
+
+    let executable = executable.to_str().ok_or(IpcError::InvalidPath)?;
+    let manifest = Manifest {
+        name: NATIVE_HOST_NAME,
+        description: "Gunda browser capture bridge",
+        path: executable,
+        kind: "stdio",
+        allowed_origins: vec![format!("chrome-extension://{extension_id}/")],
+    };
+    let body = serde_json::to_vec_pretty(&manifest).map_err(|_| IpcError::Json)?;
+    std::fs::write(path, body)?;
+    Ok(())
+}
+
 /// One side of a newline-delimited JSON connection.
 pub struct Connection {
     reader: BufReader<ReadHalf<TcpStream>>,
@@ -502,5 +592,63 @@ mod tests {
         };
 
         assert!(!format!("{status:?}").contains(&status.token));
+    }
+
+    #[test]
+    fn native_host_request_uses_length_prefixed_json() {
+        let body = br#"{"kind":"pairing","version":1,"agent":"test"}"#;
+        let mut frame = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        let mut cursor = std::io::Cursor::new(frame);
+
+        assert_eq!(
+            read_native_host_request(&mut cursor).unwrap(),
+            NativeHostRequest::Pairing {
+                version: 1,
+                agent: "test".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn native_host_response_uses_length_prefixed_json() {
+        let mut frame = Vec::new();
+        write_native_host_response(
+            &mut frame,
+            &NativeHostResponse::Pairing {
+                version: 1,
+                endpoint: "127.0.0.1:1234".into(),
+                token: "a".repeat(64),
+            },
+        )
+        .unwrap();
+
+        let size = usize::try_from(u32::from_le_bytes(frame[..4].try_into().unwrap())).unwrap();
+        assert_eq!(frame.len(), size + 4);
+        let value: serde_json::Value = serde_json::from_slice(&frame[4..]).unwrap();
+        assert_eq!(value["kind"], "pairing");
+        assert_eq!(value["endpoint"], "127.0.0.1:1234");
+    }
+
+    #[test]
+    fn chrome_native_host_manifest_names_one_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("host.json");
+
+        write_chrome_native_host_manifest(
+            &path,
+            Path::new("/opt/gunda/gunda-native-host"),
+            "abcdefghijklmnopabcdefghijklmnop",
+        )
+        .unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["name"], NATIVE_HOST_NAME);
+        assert_eq!(value["type"], "stdio");
+        assert_eq!(
+            value["allowed_origins"][0],
+            "chrome-extension://abcdefghijklmnopabcdefghijklmnop/"
+        );
     }
 }

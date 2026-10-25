@@ -1,5 +1,7 @@
 const PROTOCOL_VERSION = 1;
 const AGENT = 'gunda-capture/0.1.0';
+const NATIVE_HOST_NAME = 'com.gunda.capture';
+const NATIVE_HOST_PROTOCOL_VERSION = 1;
 const MAX_PENDING = 64;
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const DEDUP_LIMIT = 2048;
@@ -15,11 +17,76 @@ let connection: WebSocket | null = null;
 let greeted = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let attempt = 0;
+let automaticPairing: PairingSettings | null = null;
 
 const pending: string[] = [];
 const seen = new Map<string, number>();
 
-async function settings(): Promise<{ endpoint: string; token: string }> {
+async function nativePairing(): Promise<PairingSettings | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let port: chrome.runtime.Port;
+    const finish = (pairing: PairingSettings | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      try {
+        port.disconnect();
+      } catch {
+        return;
+      }
+      resolve(pairing);
+    };
+    const timer = setTimeout(() => finish(null), 5000);
+
+    try {
+      port = chrome.runtime.connectNative(NATIVE_HOST_NAME);
+    } catch {
+      clearTimeout(timer);
+      resolve(null);
+      return;
+    }
+
+    port.onMessage.addListener((message: unknown) => {
+      if (!message || typeof message !== 'object' || !('kind' in message)) {
+        return;
+      }
+      const response = message as {
+        kind: string;
+        version?: number;
+        endpoint?: string;
+        token?: string;
+      };
+      if (
+        response.kind === 'pairing' &&
+        response.version === NATIVE_HOST_PROTOCOL_VERSION &&
+        typeof response.endpoint === 'string' &&
+        typeof response.token === 'string'
+      ) {
+        finish({ endpoint: response.endpoint, token: response.token });
+      }
+    });
+    port.onDisconnect.addListener(() => finish(null));
+    try {
+      port.postMessage({
+        kind: 'pairing',
+        version: NATIVE_HOST_PROTOCOL_VERSION,
+        agent: AGENT,
+      });
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+async function settings(): Promise<PairingSettings> {
+  automaticPairing ??= await nativePairing();
+  if (automaticPairing) {
+    return automaticPairing;
+  }
+
   const stored = await chrome.storage.local.get(['endpoint', 'token']);
 
   return {
@@ -87,6 +154,7 @@ function connect(): void {
       if (connection === socket) {
         connection = null;
       }
+      automaticPairing = null;
       greeted = false;
       void setStatus({ state: 'closed' });
       scheduleReconnect();
@@ -117,6 +185,7 @@ function disconnect(): void {
 
   const socket = connection;
   connection = null;
+  automaticPairing = null;
   greeted = false;
 
   if (socket) {

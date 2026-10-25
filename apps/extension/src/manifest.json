@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "description": "Reports the media a page plays to the Gunda daemon.",
   "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzeloXmcSl8MKOMQVZmtr0bXt4CmQtew4mbVhuEeSxc/oP+sqy+JgqrLuagMhsfBdUnSr/sgDkiuUFC+/B7E8ceYUKyrR1cZV/K9hVeiInFi7sQiB9gDgKAONlV4zAoHR4lhufh36e+MJO2xp14ZIaqc0x9HvuMt6oPCOEwOhmt0wCXuscjHFmwJb2GfbLrdUluas+8gdAti444ZHN+fVuirjPGj40RrwoNbExyya4pWOg08FzboHEZpTRkL0JtwU9/Ba+Z2wvRtXH24VwXLSu6CDfOCGAHcNCjj3qmcJDtw3xl14bn281CSvkGoN/dxka9jcouq7KueEejNp8+Vl3QIDAQAB",
 
-  "permissions": ["webRequest", "storage", "tabs", "alarms", "scripting"],
+  "permissions": ["webRequest", "storage", "tabs", "alarms", "scripting", "nativeMessaging"],
 
   "host_permissions": ["<all_urls>"],
 
