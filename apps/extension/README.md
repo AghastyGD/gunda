@@ -10,17 +10,19 @@ generated under `dist`.
 
 ## What it reports
 
-Two sources, because neither is enough on its own:
+Three sources, because none is enough on its own:
 
 | Source | File | Sees |
 | --- | --- | --- |
 | Response sniffing | `background.js` | every response the browser fetches, including the manifests and media files that Media Source Extensions hide from the page |
 | DOM scanning | `content.js` | `<video>`, `<audio>`, and `<source>` elements the page declares, including ones a page builds from data it already had |
-| Page response extraction | `page.js` | bounded JSON responses that identify complete progressive media, starting with Instagram and Facebook |
+| Page source capture | `page.js` | bounded Instagram, Facebook, and YouTube JSON responses forwarded to the daemon extractor |
 
-A report is `{ url, content_type, page_url, page_title }`. It contains no
-cookies, no request headers, and no page content, so a captured download carries
-none of the browser's session with it.
+A direct media report is `{ url, content_type, page_url, page_title }`. A source
+report adds a bounded JSON document and its response URL. The daemon interprets
+the document, keeps normalized media URLs, and drops the original source. Gunda
+does not send cookies or request headers with a download, so a captured
+download carries none of the browser's session with it.
 
 Stream segments (`video/mp2t`, `.ts`, `.m4s`, partial responses, and URLs with
 range parameters) are deliberately **not** reported as complete files.
@@ -66,9 +68,9 @@ Gunda normally pairs automatically:
 1. Start the desktop application once so it can register the native-messaging
    host with detected Chromium browsers.
 2. Open the extension. It asks `com.gunda.capture` for the current endpoint and
-   token.
+   capture token.
 3. The native host starts `gundad` when necessary and returns the current
-   pairing.
+   WebSocket endpoint and capture token.
 
 If native messaging is unavailable, the options page remains a manual fallback.
 Paste the endpoint and token from the capture panel and choose **Save and connect**.
@@ -88,7 +90,6 @@ removing the token would still not make a web page able to report.
 | Permission | Why |
 | --- | --- |
 | `webRequest` | to observe responses, status, ranges, and content type |
-| `scripting` | to run the bounded page-response agent in the page's JavaScript context |
 | `nativeMessaging` | to request endpoint and token pairing from the local Gunda bridge |
 | `host_permissions: <all_urls>` | a capture can be on any site; response headers are not readable without it |
 | `tabs` | to name the page a capture came from. Only the URL and title of the tab that made the request are read, and only to attribute the capture |
@@ -102,8 +103,8 @@ removing the token would still not make a web page able to report.
   the report is lost; the page can be played again.
 - Only `http` and `https` pages are attributed. A capture from a page with no
   such URL is dropped rather than attributed to the wrong place.
-- The desktop decides what is downloadable. A refusal comes back as a stable
+- The daemon decides what is downloadable. A refusal comes back as a stable
   reason (`unsupported_url`, `unsupported_media`, `segment_stream`,
-  `unsupported_version`) and is counted in the options page.
-- Paired to two browsers at once, both connect; the desktop deduplicates by media
+  `unsupported_source`, `unsupported_version`) and is counted in the options page.
+- Paired to two browsers at once, both connect; the daemon deduplicates by media
   URL.

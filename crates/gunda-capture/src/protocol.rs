@@ -14,11 +14,12 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::error::CaptureError;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Largest message accepted, in bytes.
 pub use crate::websocket::MAX_MESSAGE_BYTES;
@@ -36,6 +37,8 @@ pub enum Refusal {
     UnsupportedMedia,
     /// The report is one segment of a segmented stream, not the stream itself.
     SegmentStream,
+    /// No extractor is available for the page that supplied the source.
+    UnsupportedSource,
     /// The extension speaks a protocol this build does not.
     UnsupportedVersion,
 }
@@ -46,6 +49,7 @@ impl fmt::Display for Refusal {
             Self::UnsupportedUrl => "the media URL is not an absolute HTTP URL",
             Self::UnsupportedMedia => "the resource is not downloadable media",
             Self::SegmentStream => "the report is a stream segment, not a stream",
+            Self::UnsupportedSource => "the page source is not supported",
             Self::UnsupportedVersion => "the extension speaks a newer protocol",
         };
 
@@ -80,6 +84,19 @@ pub enum ClientMessage {
         #[serde(default)]
         page_title: Option<String>,
     },
+
+    /// A bounded page response for daemon-side extraction.
+    Source {
+        /// The response URL, used to attribute extraction failures.
+        source_url: String,
+        /// The page the response belongs to.
+        page_url: String,
+        /// The page title, when the extension has one.
+        #[serde(default)]
+        page_title: Option<String>,
+        /// Parsed JSON, already bounded by the message limit.
+        document: Value,
+    },
 }
 
 /// A message to the extension.
@@ -100,6 +117,11 @@ pub enum ServerMessage {
     Duplicate {
         /// The candidate's identifier.
         id: u64,
+    },
+    /// Extracted presentations stored from one source document.
+    Recorded {
+        accepted: Vec<u64>,
+        duplicates: Vec<u64>,
     },
     /// The report was refused, with a stable reason.
     Refused {
@@ -147,14 +169,14 @@ mod tests {
     #[test]
     fn parses_a_greeting() {
         let message = parse_client_message(
-            r#"{"kind":"hello","version":1,"token":"aabb","agent":"gunda-extension"}"#,
+            r#"{"kind":"hello","version":2,"token":"aabb","agent":"gunda-extension"}"#,
         )
         .expect("the greeting is valid");
 
         assert_eq!(
             message,
             ClientMessage::Hello {
-                version: 1,
+                version: 2,
                 token: "aabb".to_owned(),
                 agent: "gunda-extension".to_owned(),
             }
@@ -194,6 +216,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_bounded_source_document() {
+        let message = parse_client_message(
+            r#"{"kind":"source","source_url":"https://example.com/api","page_url":"https://example.com/watch","document":{"media":{"video_url":"https://cdn.example/movie.mp4"}}}"#,
+        )
+        .expect("the source is valid");
+
+        let ClientMessage::Source {
+            source_url,
+            document,
+            ..
+        } = message
+        else {
+            panic!("the message is a source");
+        };
+
+        assert_eq!(source_url, "https://example.com/api");
+        assert_eq!(
+            document["media"]["video_url"],
+            "https://cdn.example/movie.mp4"
+        );
+    }
+
+    #[test]
     fn refuses_an_unknown_kind() {
         let error = parse_client_message(r#"{"kind":"teleport"}"#).expect_err("unknown kinds fail");
 
@@ -219,8 +264,8 @@ mod tests {
     #[test]
     fn encodes_server_messages_as_stable_json() {
         assert_eq!(
-            encode_server_message(&ServerMessage::Ready { version: 1 }),
-            r#"{"kind":"ready","version":1}"#
+            encode_server_message(&ServerMessage::Ready { version: 2 }),
+            r#"{"kind":"ready","version":2}"#
         );
         assert_eq!(
             encode_server_message(&ServerMessage::Accepted { id: 3 }),
@@ -235,6 +280,13 @@ mod tests {
                 reason: Refusal::SegmentStream
             }),
             r#"{"kind":"refused","reason":"segment_stream"}"#
+        );
+        assert_eq!(
+            encode_server_message(&ServerMessage::Recorded {
+                accepted: vec![4],
+                duplicates: vec![2],
+            }),
+            r#"{"kind":"recorded","accepted":[4],"duplicates":[2]}"#
         );
     }
 }

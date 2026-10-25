@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 /// Version of the daemon protocol.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest single protocol message accepted.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -197,6 +197,7 @@ pub struct CaptureView {
     pub page_title: Option<String>,
     pub seen: u32,
     pub segmented: bool,
+    pub selectable: bool,
 }
 
 /// One quality or track offered by a captured presentation.
@@ -546,6 +547,7 @@ mod tests {
                     page_title: Some("A presentation".into()),
                     seen: 2,
                     segmented: true,
+                    selectable: true,
                 }],
                 capture_tracks: Some(CaptureTracks {
                     id: 7,

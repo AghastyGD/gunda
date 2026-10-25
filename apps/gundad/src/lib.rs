@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gunda_capture::{
-    Candidate, CandidateId, CaptureHandle, CaptureServer, PairingToken, load_or_create_token,
-    token_path,
+    Candidate, CandidateId, CaptureHandle, CaptureServer, MediaVariant, PairingToken,
+    endpoint_path, load_or_create_token, save_endpoint, token_path,
 };
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError, ExecutionOutput,
@@ -353,6 +353,16 @@ impl Daemon {
         self.inspection_sequence = self.inspection_sequence.saturating_add(1);
         let sequence = self.inspection_sequence;
         self.capture_tracks = None;
+
+        if !captured.variants.is_empty() {
+            self.capture_tracks = Some(CaptureTracks {
+                id,
+                tracks: captured.variants.iter().map(capture_variant_view).collect(),
+                problem: None,
+            });
+            return Ok(());
+        }
+
         let engines = Arc::clone(&self.engines);
         let updates = self.worker_tx.clone();
 
@@ -496,6 +506,7 @@ impl Daemon {
             kind: candidate.kind(),
             content_type: candidate.content_type().map(str::to_owned),
             page_title: candidate.page_title().map(str::to_owned),
+            variants: candidate.variants().to_vec(),
         })
     }
 
@@ -776,6 +787,12 @@ async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<Strin
 
     match bound {
         Ok((server, handle)) => {
+            if save_endpoint(&endpoint_path(directory), &handle.endpoint()).is_err() {
+                return (
+                    None,
+                    Some("The browser capture endpoint could not be published.".into()),
+                );
+            }
             tokio::spawn(server.run());
             (Some(handle), None)
         }
@@ -948,6 +965,7 @@ struct Captured {
     kind: ResourceKind,
     content_type: Option<String>,
     page_title: Option<String>,
+    variants: Vec<MediaVariant>,
 }
 
 fn capture_extension(captured: &Captured, track_filename: Option<&str>) -> Option<String> {
@@ -1021,6 +1039,31 @@ fn capture_view(candidate: &Candidate) -> CaptureView {
         page_title: candidate.page_title().map(str::to_owned),
         seen: candidate.seen(),
         segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
+        selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)
+            || candidate.variants().len() > 1,
+    }
+}
+
+fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
+    let mut details = vec![String::from("video")];
+    if let Some(bitrate) = variant.bitrate() {
+        details.push(format!("{} kbps", bitrate / 1000));
+    }
+    if let Some(codecs) = variant.codecs() {
+        details.push(codecs.to_owned());
+    }
+    if details.len() == 1
+        && let Some(content_type) = variant.content_type()
+    {
+        details.push(content_type.to_owned());
+    }
+
+    CaptureTrackView {
+        label: variant.label(),
+        details: details.join(" | "),
+        url: variant.url().as_str().to_owned(),
+        filename: None,
+        selection: None,
     }
 }
 

@@ -250,6 +250,7 @@ fn to_capture_view(capture: gunda_ipc::CaptureView) -> CaptureView {
         page_title: capture.page_title,
         seen: capture.seen,
         segmented: capture.segmented,
+        selectable: capture.selectable,
     }
 }
 

@@ -23,9 +23,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::debug;
+use url::Url;
 
 use crate::candidate::{Candidate, CandidateId, Catalog, DEFAULT_CAPACITY, Recorded, Report};
 use crate::error::CaptureError;
+use crate::extractor;
 use crate::pairing::PairingToken;
 use crate::protocol::{
     ClientMessage, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
@@ -350,7 +352,7 @@ async fn converse(
 
             debug!("a capture client connected");
         }
-        ClientMessage::Candidate { .. } => {
+        ClientMessage::Candidate { .. } | ClientMessage::Source { .. } => {
             respond(
                 &mut socket,
                 ServerMessage::Malformed {
@@ -399,6 +401,32 @@ async fn converse(
                 },
                 Err(reason) => ServerMessage::Refused { reason },
             },
+            Ok(ClientMessage::Source {
+                source_url,
+                page_url,
+                page_title,
+                document,
+            }) => match source_reports(&source_url, &page_url, page_title.as_deref(), &document) {
+                Ok(reports) => {
+                    let mut accepted = Vec::with_capacity(reports.len());
+                    let mut duplicates = Vec::with_capacity(reports.len());
+
+                    for report in reports {
+                        let recorded = submit(submissions, report).await?;
+                        if recorded.duplicate {
+                            duplicates.push(recorded.id);
+                        } else {
+                            accepted.push(recorded.id);
+                        }
+                    }
+
+                    ServerMessage::Recorded {
+                        accepted,
+                        duplicates,
+                    }
+                }
+                Err(reason) => ServerMessage::Refused { reason },
+            },
             Ok(ClientMessage::Hello { .. }) => ServerMessage::Malformed {
                 reason: String::from("the greeting was already sent"),
             },
@@ -412,6 +440,25 @@ async fn converse(
 
         respond(&mut socket, response).await?;
     }
+}
+
+fn source_reports(
+    source_url: &str,
+    page_url: &str,
+    page_title: Option<&str>,
+    document: &serde_json::Value,
+) -> Result<Vec<Report>, Refusal> {
+    let source_url = Url::parse(source_url).map_err(|_| Refusal::UnsupportedUrl)?;
+    let page_url = Url::parse(page_url).map_err(|_| Refusal::UnsupportedUrl)?;
+
+    if page_url.cannot_be_a_base() {
+        return Err(Refusal::UnsupportedUrl);
+    }
+
+    extractor::extract(&page_url, &source_url, document)?
+        .into_iter()
+        .map(|presentation| Report::from_extracted(presentation, &page_url, page_title))
+        .collect()
 }
 
 /// Hands a report to the listener and waits for the identifier.
@@ -525,7 +572,7 @@ mod tests {
 
         assert_eq!(
             within(client.receive()).await.as_deref(),
-            Some(r#"{"kind":"ready","version":1}"#)
+            Some(r#"{"kind":"ready","version":2}"#)
         );
 
         client
@@ -617,6 +664,43 @@ mod tests {
             within(client.receive()).await.as_deref(),
             Some(r#"{"kind":"accepted","id":0}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn records_presentations_extracted_from_a_source() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        let source = serde_json::json!({
+            "kind": "source",
+            "source_url": "https://www.instagram.com/api/graphql",
+            "page_url": "https://www.instagram.com/reels/example/",
+            "page_title": "Instagram",
+            "document": {
+                "media": {
+                    "pk": "7",
+                    "video_versions": [
+                        {"url": "https://cdn.example/low.mp4", "width": 640, "height": 360},
+                        {"url": "https://cdn.example/high.mp4", "width": 1080, "height": 1920}
+                    ]
+                }
+            }
+        });
+
+        within(client.send(&source.to_string())).await;
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"recorded","accepted":[0],"duplicates":[]}"#)
+        );
+
+        settle(&mut handle, |view| view.len() == 1).await;
+        let view = handle.view();
+        let candidate = &view.candidates()[0];
+
+        assert_eq!(candidate.url().as_str(), "https://cdn.example/high.mp4");
+        assert_eq!(candidate.variants().len(), 2);
     }
 
     #[tokio::test]

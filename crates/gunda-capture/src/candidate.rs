@@ -11,6 +11,7 @@ use std::time::Instant;
 use gunda_core::download::{DownloadOrigin, ResourceKind};
 use url::Url;
 
+use crate::extractor::{ExtractedPresentation, MediaVariant};
 use crate::protocol::Refusal;
 
 /// How many candidates are kept before the oldest is evicted.
@@ -33,6 +34,7 @@ pub struct Report {
     content_type: Option<String>,
     page_url: Url,
     page_title: Option<String>,
+    variants: Vec<MediaVariant>,
 }
 
 impl Report {
@@ -76,7 +78,28 @@ impl Report {
             content_type,
             page_url,
             page_title,
+            variants: Vec::new(),
         })
+    }
+
+    pub(crate) fn from_extracted(
+        presentation: ExtractedPresentation,
+        page_url: &Url,
+        page_title: Option<&str>,
+    ) -> Result<Self, Refusal> {
+        let title = presentation.title.as_deref().or(page_title);
+        let mut report = Self::new(
+            presentation.url.as_str(),
+            presentation.content_type.as_deref(),
+            page_url.as_str(),
+            title,
+        )?;
+
+        if report.kind == ResourceKind::File {
+            report.variants = presentation.variants;
+        }
+
+        Ok(report)
     }
 }
 
@@ -89,6 +112,7 @@ pub struct Candidate {
     content_type: Option<String>,
     page_url: Url,
     page_title: Option<String>,
+    variants: Vec<MediaVariant>,
     first_seen: Instant,
     last_seen: Instant,
     seen: u32,
@@ -124,6 +148,12 @@ impl Candidate {
     #[must_use]
     pub fn page_title(&self) -> Option<&str> {
         self.page_title.as_deref()
+    }
+
+    /// Directly downloadable qualities discovered with this presentation.
+    #[must_use]
+    pub fn variants(&self) -> &[MediaVariant] {
+        &self.variants
     }
 
     /// The final path segment of the media URL, still percent-encoded.
@@ -212,6 +242,9 @@ impl Catalog {
             if report.content_type.is_some() {
                 existing.content_type = report.content_type;
             }
+            if !report.variants.is_empty() {
+                existing.variants = report.variants;
+            }
 
             return Recorded {
                 id: existing.id,
@@ -231,6 +264,7 @@ impl Catalog {
                 content_type: report.content_type,
                 page_url: report.page_url,
                 page_title: report.page_title,
+                variants: report.variants,
                 first_seen: now,
                 last_seen: now,
                 seen: 1,

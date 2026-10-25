@@ -1,4 +1,4 @@
-//! Browser media capture for Gunda.
+//! Browser media capture and source extraction for Gunda.
 //!
 //! A browser extension cannot open a raw socket, so it reports the media it
 //! detects to a small loopback service the Gunda daemon runs. The
@@ -9,10 +9,10 @@
 //! - the wire protocol is documented JSON with explicit limits rather than a
 //!   bespoke binary framing.
 //!
-//! This crate is the listener: the RFC 6455 subset needed to accept a browser
-//! connection, the message protocol, the candidate model with deduplication, and
-//! pairing-token storage. It does not talk to `gunda-http` or the job manager;
-//! the caller decides what a candidate becomes.
+//! This crate owns the listener, the RFC 6455 subset needed to accept a browser
+//! connection, bounded source extractors, the message protocol, the candidate
+//! model with deduplication, and pairing-token storage. It does not talk to
+//! `gunda-http` or the job manager; the caller decides what a candidate becomes.
 //!
 //! ```no_run
 //! use gunda_capture::{CaptureServer, load_or_create_token, token_path};
@@ -40,6 +40,7 @@
 
 mod candidate;
 mod error;
+mod extractor;
 mod pairing;
 mod protocol;
 mod server;
@@ -49,7 +50,11 @@ mod websocket;
 
 pub use candidate::{Candidate, CandidateId, Catalog, DEFAULT_CAPACITY, Recorded, Report};
 pub use error::CaptureError;
-pub use pairing::{PairingToken, load_or_create_token, load_token, save_token, token_path};
+pub use extractor::{ExtractedPresentation, MediaVariant, extract};
+pub use pairing::{
+    PairingToken, endpoint_path, load_endpoint, load_or_create_token, load_token, save_endpoint,
+    save_token, token_path,
+};
 pub use protocol::{
     ClientMessage, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
     parse_client_message,

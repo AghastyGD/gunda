@@ -1,14 +1,23 @@
 const MEDIA_SELECTOR = 'video, audio, source';
 
-function pageCandidate(value: unknown): PageCandidate | null {
+function pageMessage(value: unknown): PageMessage | null {
   if (!value || typeof value !== 'object') {
     return null;
   }
-  const candidate = value as Partial<PageCandidate>;
-  return candidate.source === 'gunda-page' &&
-    candidate.kind === 'candidate' &&
-    typeof candidate.url === 'string'
-    ? (candidate as PageCandidate)
+  const message = value as Partial<PageMessage>;
+  if (message.source !== 'gunda-page') {
+    return null;
+  }
+  if (
+    message.kind === 'source' &&
+    typeof message.source_url === 'string' &&
+    message.document !== null &&
+    typeof message.document === 'object'
+  ) {
+    return message as PageSource;
+  }
+  return message.kind === 'candidate' && typeof message.url === 'string'
+    ? (message as PageMedia)
     : null;
 }
 
@@ -17,19 +26,25 @@ window.addEventListener('message', (event: MessageEvent<unknown>) => {
     return;
   }
 
-  const candidate = pageCandidate(event.data);
-  if (candidate) {
+  const message = pageMessage(event.data);
+  if (message?.kind === 'source') {
+    void chrome.runtime
+      .sendMessage({
+        kind: 'source',
+        source_url: message.source_url,
+        document: message.document,
+      })
+      .catch(() => {});
+  } else if (message?.kind === 'candidate') {
     void chrome.runtime
       .sendMessage({
         kind: 'candidate',
-        url: candidate.url,
+        url: message.url,
         content_type: null,
       })
       .catch(() => {});
   }
 });
-
-void chrome.runtime.sendMessage({ kind: 'start-page-agent' }).catch(() => {});
 
 function reportElement(element: HTMLMediaElement | HTMLSourceElement): void {
   const url =

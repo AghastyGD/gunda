@@ -179,10 +179,10 @@ fn row(
     .on_hover_text(details);
 
     ui.horizontal(|ui| {
+        if capture.selectable && ui.button("Qualities").clicked() {
+            actions.inspect = Some(capture.id);
+        }
         if capture.segmented {
-            if ui.button("Qualities").clicked() {
-                actions.inspect = Some(capture.id);
-            }
             if ui.button("Best quality").clicked() {
                 actions.download = Some(capture.id);
             }

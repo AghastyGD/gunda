@@ -5,17 +5,24 @@ use std::process::{Command, Stdio};
 use tempfile::tempdir;
 
 #[test]
-fn native_host_returns_the_existing_daemon_pairing() {
+fn native_host_returns_the_existing_capture_pairing() {
     let directory = tempdir().unwrap();
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let endpoint = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let daemon = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let daemon_endpoint = daemon.local_addr().unwrap();
+    let capture = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let capture_endpoint = format!("ws://{}/capture", capture.local_addr().unwrap());
     let token = "a".repeat(64);
     std::fs::write(
         directory.path().join("gundad.endpoint"),
-        format!("{endpoint}\n"),
+        format!("{daemon_endpoint}\n"),
     )
     .unwrap();
-    std::fs::write(directory.path().join("gundad-token"), format!("{token}\n")).unwrap();
+    std::fs::write(
+        directory.path().join("capture.endpoint"),
+        format!("{capture_endpoint}\n"),
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("capture-token"), format!("{token}\n")).unwrap();
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_gunda-desktop"))
         .arg("--native-host")
@@ -44,7 +51,8 @@ fn native_host_returns_the_existing_daemon_pairing() {
 
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["kind"], "pairing");
-    assert_eq!(value["endpoint"], endpoint);
+    assert_eq!(value["endpoint"], capture_endpoint);
     assert_eq!(value["token"], token);
-    drop(listener);
+    drop(capture);
+    drop(daemon);
 }

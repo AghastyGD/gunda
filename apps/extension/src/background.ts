@@ -1,8 +1,9 @@
-const PROTOCOL_VERSION = 1;
+const PROTOCOL_VERSION = 2;
 const AGENT = 'gunda-capture/0.1.0';
 const NATIVE_HOST_NAME = 'com.gunda.capture';
 const NATIVE_HOST_PROTOCOL_VERSION = 1;
 const MAX_PENDING = 64;
+const MAX_SOURCE_MESSAGE_BYTES = 480 * 1024;
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const DEDUP_LIMIT = 2048;
 
@@ -99,12 +100,12 @@ async function setStatus(status: Omit<ChannelStatus, 'at'>): Promise<void> {
   await chrome.storage.session.set({ status: { ...status, at: Date.now() } });
 }
 
-async function count(kind: string): Promise<void> {
+async function count(kind: string, amount = 1): Promise<void> {
   const stored = await chrome.storage.session.get('stats');
   const stats: ChannelStats =
     stored.stats && typeof stored.stats === 'object' ? { ...stored.stats } : {};
 
-  stats[kind] = (stats[kind] ?? 0) + 1;
+  stats[kind] = (stats[kind] ?? 0) + amount;
   await chrome.storage.session.set({ stats });
 }
 
@@ -211,6 +212,10 @@ function handle(message: unknown): void {
     case 'duplicate':
       void count('duplicate');
       break;
+    case 'recorded':
+      void count('accepted', server.accepted.length);
+      void count('duplicate', server.duplicates.length);
+      break;
     case 'refused':
       void count('refused');
       void setStatus({ state: 'connected', refused: server.reason });
@@ -252,6 +257,27 @@ function reportCandidate(candidate: CandidateReport): void {
   }
 
   const message = JSON.stringify({ kind: 'candidate', ...candidate });
+  if (greeted && connection?.readyState === WebSocket.OPEN) {
+    connection.send(message);
+    return;
+  }
+
+  if (pending.length >= MAX_PENDING) {
+    pending.shift();
+  }
+  pending.push(message);
+  connect();
+}
+
+function reportSource(
+  source: { source_url: string; document: unknown },
+): void {
+  const message = JSON.stringify({ kind: 'source', ...source });
+  if (new TextEncoder().encode(message).byteLength > MAX_SOURCE_MESSAGE_BYTES) {
+    void count('source_too_large');
+    return;
+  }
+
   if (greeted && connection?.readyState === WebSocket.OPEN) {
     connection.send(message);
     return;
@@ -312,7 +338,15 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
   if (message.kind === 'candidate' && typeof message.url === 'string') {
     return message;
   }
-  return message.kind === 'reconnect' || message.kind === 'start-page-agent' ? message : null;
+  if (
+    message.kind === 'source' &&
+    typeof message.source_url === 'string' &&
+    message.document !== null &&
+    typeof message.document === 'object'
+  ) {
+    return message;
+  }
+  return message.kind === 'reconnect' ? message : null;
 }
 
 chrome.webRequest.onResponseStarted.addListener(
@@ -361,32 +395,26 @@ chrome.runtime.onMessage.addListener((value: unknown, sender) => {
     return;
   }
 
-  if (message.kind === 'start-page-agent' && sender.tab?.id != null) {
-    const target: chrome.scripting.InjectionTarget =
-      sender.frameId != null
-        ? { tabId: sender.tab.id, frameIds: [sender.frameId] }
-        : { tabId: sender.tab.id };
-    void chrome.scripting
-      .executeScript({
-        target,
-        files: ['page.js'],
-        world: 'MAIN',
-        injectImmediately: true,
-      })
-      .catch(() => {});
+  if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
     return;
   }
 
-  if (message.kind !== 'candidate' || !sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
+  if (message.kind === 'source') {
+    reportSource({
+      source_url: message.source_url,
+      document: message.document,
+    });
     return;
   }
 
-  reportCandidate({
-    url: message.url,
-    content_type: message.content_type ?? null,
-    page_url: sender.tab.url,
-    page_title: sender.tab.title ?? null,
-  });
+  if (message.kind === 'candidate') {
+    reportCandidate({
+      url: message.url,
+      content_type: message.content_type ?? null,
+      page_url: sender.tab.url,
+      page_title: sender.tab.title ?? null,
+    });
+  }
 });
 
 chrome.runtime.onInstalled.addListener(() => connect());

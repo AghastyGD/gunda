@@ -2,21 +2,19 @@
 //!
 //! A capture reports one URL, but a presentation usually carries several
 //! qualities and tracks, and the browser extension cannot know which one the
-//! user wants. Inspection reads the manifest and any playlist needed to describe
-//! a track. This lets the user choose before any media is fetched.
+//! user wants. Inspection reads the entry manifest so the user can choose
+//! before media playlists are fetched.
 
 use std::cmp::Reverse;
 use std::str;
 
-use gunda_core::download::{DownloadFailure, ExecutionSelection, RequestContext, RequestHeader};
+use gunda_core::download::{DownloadFailure, ExecutionSelection, RequestContext};
 use gunda_http::HttpClient;
 use url::Url;
 
 use crate::container::Container;
 use crate::dash::{self, TrackKind};
-use crate::executor::{
-    manifest_failure, not_textual, open_manifest, output_filename, segment_request,
-};
+use crate::executor::{manifest_failure, not_textual, open_manifest, output_filename};
 use crate::hls::{self, Playlist};
 use crate::plan::{
     HlsOutcome, TrackPlan, audio_set_index, bandwidth_hint, best_representation_index,
@@ -24,10 +22,7 @@ use crate::plan::{
 };
 use crate::selection::{dash_selection, hls_selection};
 
-/// Most variants described by one inspection.
-///
-/// Describing a variant means reading its playlist, and the number of variants
-/// is remote input, so the work is bounded the same way the plan itself is.
+/// Most variants returned by one inspection.
 const MAX_DESCRIBED_VARIANTS: usize = 24;
 
 #[derive(Debug, Clone)]
@@ -185,9 +180,7 @@ pub async fn inspect(
                 .take(MAX_DESCRIBED_VARIANTS)
                 .enumerate()
             {
-                if let Some(track) =
-                    described_variant(client, request, &base, master, index, variant).await
-                {
+                if let Some(track) = described_variant(&base, master, index, variant) {
                     tracks.push(track);
                 }
             }
@@ -208,11 +201,11 @@ pub async fn inspect(
                     continue;
                 };
 
-                let mut track = PresentationTrack {
+                let track = PresentationTrack {
                     label: rendition_label(rendition),
                     kind: TrackKind::Audio,
                     url: url.clone(),
-                    filename: output_filename(&base, None),
+                    filename: None,
                     resolution: None,
                     bandwidth: None,
                     codecs: None,
@@ -221,8 +214,6 @@ pub async fn inspect(
                     container: None,
                     selection: None,
                 };
-
-                enrich(client, &base, &url, request.headers(), &mut track).await;
 
                 tracks.push(track);
             }
@@ -234,25 +225,27 @@ pub async fn inspect(
     }
 }
 
-async fn described_variant(
-    client: &HttpClient,
-    request: &RequestContext,
+fn described_variant(
     manifest: &Url,
     master: &hls::MasterPlaylist,
     index: usize,
     variant: &hls::Variant,
 ) -> Option<PresentationTrack> {
-    let playlist_url = manifest.join(variant.uri()).ok()?;
-    let audio_url = master
+    let selection = hls_selection(index, variant).ok()?;
+    let with_audio = master
         .default_audio_rendition(variant)
         .and_then(hls::Rendition::uri)
-        .and_then(|uri| manifest.join(uri).ok());
-    let selection = hls_selection(index, variant).ok()?;
-    let mut track = PresentationTrack {
-        label: label_for_variant(variant).unwrap_or_else(|| format!("Variant {}", index + 1)),
+        .is_some();
+    let mut label = label_for_variant(variant).unwrap_or_else(|| format!("Variant {}", index + 1));
+    if with_audio {
+        label.push_str(" with audio");
+    }
+
+    Some(PresentationTrack {
+        label,
         kind: TrackKind::Video,
         url: manifest.clone(),
-        filename: output_filename(manifest, None),
+        filename: None,
         resolution: variant.resolution(),
         bandwidth: variant.bandwidth(),
         codecs: variant.codecs().map(str::to_owned),
@@ -260,47 +253,7 @@ async fn described_variant(
         size: TrackSize::Unknown,
         container: None,
         selection: Some(selection),
-    };
-
-    enrich(
-        client,
-        manifest,
-        &playlist_url,
-        request.headers(),
-        &mut track,
-    )
-    .await;
-
-    if let Some(audio_url) = audio_url {
-        let mut audio = PresentationTrack {
-            label: String::new(),
-            kind: TrackKind::Audio,
-            url: audio_url.clone(),
-            filename: output_filename(manifest, None),
-            resolution: None,
-            bandwidth: None,
-            codecs: None,
-            duration_millis: None,
-            size: TrackSize::Unknown,
-            container: None,
-            selection: None,
-        };
-
-        enrich(client, manifest, &audio_url, request.headers(), &mut audio).await;
-
-        track.size = combine_sizes(track.size, audio.size);
-        track.duration_millis = track.duration_millis.max(audio.duration_millis);
-        track.label = format!("{} with audio", track.label);
-        if track.container.is_some_and(Container::can_be_muxed)
-            && audio.container.is_some_and(Container::can_be_muxed)
-        {
-            track.container = Some(Container::Mp4);
-        }
-    }
-
-    track.filename = output_filename(manifest, track.container);
-
-    Some(track)
+    })
 }
 
 async fn described_dash_presentation(
@@ -502,25 +455,6 @@ fn dash_audio_label(set: &dash::AdaptationSet, representation: &dash::Representa
     }
 }
 
-/// A sum is only exact when both halves are; anything less would report a
-/// precision the parts do not have.
-fn combine_sizes(video: TrackSize, audio: TrackSize) -> TrackSize {
-    let exact = video.is_exact() && audio.is_exact();
-
-    match (video.bytes(), audio.bytes()) {
-        (Some(video), Some(audio)) => {
-            let total = video.saturating_add(audio);
-
-            if exact {
-                TrackSize::Exact(total)
-            } else {
-                TrackSize::Estimated(total)
-            }
-        }
-        _ => TrackSize::Unknown,
-    }
-}
-
 /// The playlist has already been parsed by the caller, so it is planned from
 /// that rather than read a second time.
 fn described_playlist(base: &Url, playlist: &Playlist) -> PresentationTrack {
@@ -564,38 +498,6 @@ fn track_from_plan(manifest: &Url, url: &Url, plan: &TrackPlan) -> PresentationT
         container,
         selection: None,
     }
-}
-
-/// A playlist that cannot be read or planned leaves the track described by its
-/// variant declaration alone. That is deliberate: the download reports the
-/// reason a track cannot be fetched, and hiding an option the user might still
-/// want would be worse than listing one that may fail.
-async fn enrich(
-    client: &HttpClient,
-    manifest: &Url,
-    playlist_url: &Url,
-    headers: &[RequestHeader],
-    track: &mut PresentationTrack,
-) {
-    let request = segment_request(playlist_url, manifest, headers);
-
-    let Ok((bytes, _)) = open_manifest(client, &request).await else {
-        return;
-    };
-    let Ok(text) = str::from_utf8(&bytes) else {
-        return;
-    };
-    let Ok(playlist) = hls::parse(text) else {
-        return;
-    };
-    let Ok(HlsOutcome::Ready(plan)) = plan_hls(playlist_url, &playlist) else {
-        return;
-    };
-
-    track.duration_millis = plan.duration_millis();
-    track.container = plan.container_hint();
-    track.filename = output_filename(manifest, track.container);
-    track.size = size_of(&plan, track.bandwidth, track.duration_millis);
 }
 
 fn size_of(plan: &TrackPlan, bandwidth: Option<u64>, duration_millis: Option<u64>) -> TrackSize {

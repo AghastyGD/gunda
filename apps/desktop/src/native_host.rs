@@ -8,7 +8,10 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gunda_capture::load_token;
+use gunda_capture::{
+    endpoint_path as capture_endpoint_path, load_endpoint as load_capture_endpoint,
+    load_token as load_capture_token, token_path as capture_token_path,
+};
 use gunda_ipc::{
     NATIVE_HOST_NAME, NATIVE_HOST_PROTOCOL_VERSION, NativeHostRequest, NativeHostResponse,
     read_endpoint, read_native_host_request, write_chrome_native_host_manifest,
@@ -154,11 +157,20 @@ fn ensure_pairing(directory: &Path) -> Result<(String, String), String> {
 }
 
 fn current_pairing(directory: &Path) -> Option<(String, String)> {
-    let endpoint = read_endpoint(directory).ok()?;
-    let token = load_token(&directory.join("gundad-token")).ok()??;
-    if !reachable(&endpoint) {
+    let daemon_endpoint = read_endpoint(directory).ok()?;
+    if !reachable(&daemon_endpoint) {
         return None;
     }
+
+    let endpoint = load_capture_endpoint(&capture_endpoint_path(directory))
+        .ok()??
+        .trim()
+        .to_owned();
+    let token = load_capture_token(&capture_token_path(directory)).ok()??;
+    if !capture_reachable(&endpoint) {
+        return None;
+    }
+
     Some((endpoint, token.as_str().to_owned()))
 }
 
@@ -167,6 +179,18 @@ fn reachable(endpoint: &str) -> bool {
         return false;
     };
     addresses.any(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok())
+}
+
+fn capture_reachable(endpoint: &str) -> bool {
+    let Some(authority) = endpoint
+        .strip_prefix("ws://")
+        .or_else(|| endpoint.strip_prefix("wss://"))
+        .and_then(|endpoint| endpoint.split('/').next())
+    else {
+        return false;
+    };
+
+    reachable(authority)
 }
 
 fn spawn_daemon(directory: &Path) -> Result<(), String> {

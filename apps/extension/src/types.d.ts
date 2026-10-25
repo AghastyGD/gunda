@@ -5,21 +5,35 @@ type CandidateReport = {
   page_title: string | null;
 };
 
-type PageCandidate = {
+type PageSource = {
+  source: 'gunda-page';
+  kind: 'source';
+  source_url: string;
+  document: unknown;
+};
+
+type PageMedia = {
   source: 'gunda-page';
   kind: 'candidate';
   url: string;
 };
 
+type PageMessage = PageSource | PageMedia;
+
 type RuntimeMessage =
   | { kind: 'candidate'; url: string; content_type: string | null }
-  | { kind: 'reconnect' }
-  | { kind: 'start-page-agent' };
+  | {
+      kind: 'source';
+      source_url: string;
+      document: unknown;
+    }
+  | { kind: 'reconnect' };
 
 type ServerMessage =
   | { kind: 'ready'; version: number }
   | { kind: 'accepted'; id: number }
   | { kind: 'duplicate'; id: number }
+  | { kind: 'recorded'; accepted: number[]; duplicates: number[] }
   | { kind: 'refused'; reason: string }
   | { kind: 'malformed'; reason: string };
 

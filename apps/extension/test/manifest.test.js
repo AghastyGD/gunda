@@ -9,7 +9,17 @@ const manifest = JSON.parse(
 
 test('manifest declares automatic native pairing', () => {
   assert.ok(manifest.permissions.includes('nativeMessaging'));
+  assert.ok(!manifest.permissions.includes('scripting'));
   assert.equal(typeof manifest.key, 'string');
+});
+
+test('page agent runs in the page world before site scripts', () => {
+  const agent = manifest.content_scripts.find((script) => script.js.includes('page.js'));
+
+  assert.ok(agent);
+  assert.equal(agent.world, 'MAIN');
+  assert.equal(agent.run_at, 'document_start');
+  assert.ok(agent.matches.some((match) => match.includes('instagram.com')));
 });
 
 test('manifest key resolves to the registered extension id', () => {

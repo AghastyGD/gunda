@@ -254,12 +254,8 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
     let track = &tracks.tracks[0];
 
     assert_eq!(track.label, "640x360 (1.0 Mbps)");
-    assert!(
-        track.details.starts_with("video | ~"),
-        "an estimated size must be marked as one: {}",
-        track.details
-    );
-    assert_eq!(track.filename.as_deref(), Some("master.mp4"));
+    assert_eq!(track.details, "video | size unknown");
+    assert_eq!(track.filename, None);
     assert_eq!(track.url, master);
     assert!(track.selection.is_some());
 
@@ -616,11 +612,11 @@ impl Extension {
     /// Greets the channel and checks it came up.
     async fn greet(&mut self, token: &str) {
         self.send(&format!(
-            r#"{{"kind":"hello","version":1,"token":"{token}","agent":"gunda-test"}}"#
+            r#"{{"kind":"hello","version":2,"token":"{token}","agent":"gunda-test"}}"#
         ))
         .await;
 
-        assert_eq!(self.receive().await, r#"{"kind":"ready","version":1}"#);
+        assert_eq!(self.receive().await, r#"{"kind":"ready","version":2}"#);
     }
 
     /// Reports one media resource and checks the identifier it was given.

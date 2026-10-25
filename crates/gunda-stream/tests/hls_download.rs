@@ -10,7 +10,7 @@ use gunda_core::download::{
     ResourceKind,
 };
 use gunda_http::HttpClient;
-use gunda_stream::{Container, StreamExecutor, TrackKind, TrackSize};
+use gunda_stream::{StreamExecutor, TrackKind, TrackSize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -452,9 +452,9 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     assert_eq!(tracks[0].kind(), TrackKind::Video);
     assert_eq!(tracks[0].url(), &entry);
     assert_eq!(tracks[0].resolution(), Some((1920, 1080)));
-    assert_eq!(tracks[0].duration_millis(), Some(8000));
-    assert_eq!(tracks[0].container(), Some(Container::Mp4));
-    assert_eq!(tracks[0].filename(), Some("master.mp4"));
+    assert_eq!(tracks[0].duration_millis(), None);
+    assert_eq!(tracks[0].container(), None);
+    assert_eq!(tracks[0].filename(), None);
     assert!(tracks[0].selection().is_some());
 
     // Neither size is declared in full, so the whole is not reported as exact.
@@ -464,9 +464,9 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     assert_eq!(tracks[1].kind(), TrackKind::Video);
     assert_eq!(tracks[1].url(), &entry);
     assert_eq!(tracks[1].resolution(), Some((640, 360)));
-    assert_eq!(tracks[1].duration_millis(), Some(8000));
-    assert_eq!(tracks[1].container(), Some(Container::Mp4));
-    assert_eq!(tracks[1].filename(), Some("master.mp4"));
+    assert_eq!(tracks[1].duration_millis(), None);
+    assert_eq!(tracks[1].container(), None);
+    assert_eq!(tracks[1].filename(), None);
     assert!(tracks[1].selection().is_some());
     assert_eq!(tracks[1].size(), TrackSize::Unknown);
 
@@ -476,8 +476,8 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     assert_eq!(tracks[2].label(), "English (en)");
     assert_eq!(tracks[2].kind(), TrackKind::Audio);
     assert_eq!(tracks[2].size(), TrackSize::Unknown);
-    assert_eq!(tracks[2].duration_millis(), Some(4000));
-    assert_eq!(tracks[2].filename(), Some("master.ts"));
+    assert_eq!(tracks[2].duration_millis(), None);
+    assert_eq!(tracks[2].filename(), None);
 }
 
 #[tokio::test]
@@ -524,18 +524,17 @@ async fn inspection_describes_every_quality_of_a_presentation_that_carries_its_s
 
     assert_eq!(tracks[0].label(), "1920x1080 (5.0 Mbps)");
     assert_eq!(tracks[0].kind(), TrackKind::Video);
-    assert_eq!(tracks[0].size(), TrackSize::Estimated(5_000_000));
-    assert!(!tracks[0].size().is_exact());
-    assert_eq!(tracks[0].container(), Some(Container::Mp4));
-    assert_eq!(tracks[0].duration_millis(), Some(8000));
-    assert_eq!(tracks[0].filename(), Some("master.mp4"));
+    assert_eq!(tracks[0].size(), TrackSize::Unknown);
+    assert_eq!(tracks[0].container(), None);
+    assert_eq!(tracks[0].duration_millis(), None);
+    assert_eq!(tracks[0].filename(), None);
 
     // The variant that declares every part's length is exactly known.
     assert_eq!(tracks[1].label(), "640x360 (1.0 Mbps)");
-    assert_eq!(tracks[1].size(), TrackSize::Exact(12));
-    assert_eq!(tracks[1].container(), Some(Container::Mp4));
-    assert_eq!(tracks[1].duration_millis(), Some(8000));
-    assert_eq!(tracks[1].filename(), Some("master.mp4"));
+    assert_eq!(tracks[1].size(), TrackSize::Unknown);
+    assert_eq!(tracks[1].container(), None);
+    assert_eq!(tracks[1].duration_millis(), None);
+    assert_eq!(tracks[1].filename(), None);
 }
 
 #[tokio::test]
@@ -926,8 +925,8 @@ async fn a_presentation_that_keeps_its_sound_apart_is_fetched_and_muxed() {
         .expect("inspection must succeed");
     let track = &presentation.tracks()[0];
 
-    assert_eq!(track.container(), Some(Container::Mp4));
-    assert_eq!(track.filename(), Some("master.mp4"));
+    assert_eq!(track.container(), None);
+    assert_eq!(track.filename(), None);
 
     let prepared = executor
         .prepare(input_unnamed(entry, directory.path()))

@@ -90,6 +90,37 @@ pub fn token_path(directory: &Path) -> PathBuf {
     directory.join("capture-token")
 }
 
+/// The path of the active capture endpoint inside a configuration directory.
+#[must_use]
+pub fn endpoint_path(directory: &Path) -> PathBuf {
+    directory.join("capture.endpoint")
+}
+
+/// Reads the active capture endpoint, if one was published.
+///
+/// # Errors
+///
+/// Returns an I/O error if the file exists but cannot be read.
+pub fn load_endpoint(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(endpoint) => Ok(Some(endpoint.trim().to_owned())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Publishes the endpoint of a running capture listener.
+///
+/// # Errors
+///
+/// Returns an I/O error if the endpoint cannot be written.
+pub fn save_endpoint(path: &Path, endpoint: &str) -> io::Result<()> {
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    fs::write(path, format!("{endpoint}\n"))
+}
+
 /// Reads a stored pairing token, if there is one.
 ///
 /// # Errors
@@ -183,7 +214,10 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{PairingToken, load_or_create_token, load_token, save_token, token_path};
+    use super::{
+        PairingToken, endpoint_path, load_endpoint, load_or_create_token, load_token,
+        save_endpoint, save_token, token_path,
+    };
     use crate::error::CaptureError;
 
     #[test]
@@ -307,5 +341,25 @@ mod tests {
     #[test]
     fn token_path_lives_in_the_given_directory() {
         assert!(token_path(Path::new("/tmp/gunda")).ends_with("capture-token"));
+    }
+
+    #[test]
+    fn stores_and_reads_the_capture_endpoint() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let path = endpoint_path(directory.path());
+
+        assert_eq!(
+            load_endpoint(&path).expect("a missing endpoint is not an error"),
+            None
+        );
+
+        save_endpoint(&path, "ws://127.0.0.1:48123/capture").expect("the endpoint is stored");
+
+        assert_eq!(
+            load_endpoint(&path)
+                .expect("the endpoint is readable")
+                .as_deref(),
+            Some("ws://127.0.0.1:48123/capture")
+        );
     }
 }

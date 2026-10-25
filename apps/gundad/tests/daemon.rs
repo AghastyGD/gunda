@@ -1,9 +1,10 @@
 use std::time::Duration;
 
-use gunda_capture::load_token;
 use gunda_capture::test_client::TestClient;
+use gunda_capture::{endpoint_path, load_token, token_path};
 use gunda_ipc::{
-    ClientMessage, Command, Connection, NativePath, ServerMessage, Snapshot, connect, read_endpoint,
+    CaptureTrackChoice, ClientMessage, Command, Connection, NativePath, ServerMessage, Snapshot,
+    connect, read_endpoint,
 };
 use tempfile::tempdir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -21,6 +22,10 @@ async fn capture_continues_while_no_client_is_connected() {
         .unwrap();
     let (client, initial) = connect(&endpoint, token.as_str()).await.unwrap();
     let capture = initial.capture.expect("capture starts with the daemon");
+    let published_endpoint = std::fs::read_to_string(endpoint_path(directory.path())).unwrap();
+    let published_token = load_token(&token_path(directory.path())).unwrap().unwrap();
+    assert_eq!(published_endpoint.trim(), capture.endpoint);
+    assert_eq!(published_token.as_str(), capture.token);
     drop(client);
 
     let mut extension = TestClient::connect(capture_address(&capture.endpoint), "/capture", None)
@@ -28,7 +33,7 @@ async fn capture_continues_while_no_client_is_connected() {
         .0;
     extension
         .send(&format!(
-            r#"{{"kind":"hello","version":1,"token":"{}","agent":"gundad-test"}}"#,
+            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
             capture.token
         ))
         .await;
@@ -92,14 +97,8 @@ async fn daemon_inspects_the_qualities_of_a_capture() {
     const MASTER: &str = "#EXTM3U\n\
 #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\n\
 low.m3u8\n";
-    const VARIANT: &str = "#EXTM3U\n\
-#EXT-X-MAP:URI=\"init.mp4\"\n\
-#EXTINF:4,\n\
-s0.m4s\n\
-#EXT-X-ENDLIST\n";
-
     let directory = tempdir().unwrap();
-    let (base, server) = playlist_server(MASTER, VARIANT).await;
+    let (base, server) = playlist_server(MASTER).await;
     let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
     let endpoint = wait_for_endpoint(directory.path()).await;
     let token = load_token(&directory.path().join("gundad-token"))
@@ -112,7 +111,7 @@ s0.m4s\n\
         .0;
     extension
         .send(&format!(
-            r#"{{"kind":"hello","version":1,"token":"{}","agent":"gundad-test"}}"#,
+            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
             capture.token
         ))
         .await;
@@ -154,6 +153,87 @@ s0.m4s\n\
     assert_eq!(tracks.tracks.len(), 1);
     assert!(tracks.tracks[0].label.contains("640x360"));
     assert!(tracks.tracks[0].details.starts_with("video | "));
+
+    server.await.unwrap();
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_downloads_a_selected_progressive_source_variant() {
+    let directory = tempdir().unwrap();
+    let (address, server) = file_server(b"high quality video").await;
+    let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
+    let endpoint = wait_for_endpoint(directory.path()).await;
+    let token = load_token(&directory.path().join("gundad-token"))
+        .unwrap()
+        .unwrap();
+    let (mut client, initial) = connect(&endpoint, token.as_str()).await.unwrap();
+    let capture = initial.capture.expect("capture starts with the daemon");
+    let mut extension = TestClient::connect(capture_address(&capture.endpoint), "/capture", None)
+        .await
+        .0;
+    extension
+        .send(&format!(
+            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
+            capture.token
+        ))
+        .await;
+    extension.receive().await.unwrap();
+
+    let source = format!(
+        r#"{{"kind":"source","source_url":"https://www.instagram.com/api/graphql","page_url":"https://www.instagram.com/reels/example/","page_title":"A reel","document":{{"media":{{"pk":"7","video_versions":[{{"url":"https://cdn.example/low.mp4","width":640,"height":360}},{{"url":"http://{address}/high.mp4","width":1080,"height":1920}}]}}}}}}"#
+    );
+    extension.send(&source).await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"recorded""#)
+    );
+
+    let captured = wait_for_capture(&mut client).await;
+    let capture = &captured.captures[0];
+    assert!(capture.selectable);
+
+    client
+        .send(&ClientMessage::Command {
+            command: Command::InspectCapture { id: capture.id },
+        })
+        .await
+        .unwrap();
+    let inspected = wait_for_tracks(&mut client).await;
+    let tracks = inspected.capture_tracks.unwrap().tracks;
+    assert_eq!(tracks.len(), 2);
+    assert_eq!(tracks[0].label, "1080x1920");
+    let selected = tracks[0].clone();
+
+    client
+        .send(&ClientMessage::Command {
+            command: Command::DownloadCapture {
+                id: capture.id,
+                directory: NativePath::from_path(directory.path()).unwrap(),
+                track: Some(CaptureTrackChoice {
+                    url: selected.url,
+                    filename: selected.filename,
+                    selection: selected.selection,
+                }),
+            },
+        })
+        .await
+        .unwrap();
+
+    let completed = wait_for_completed(&mut client).await;
+    let job = completed
+        .jobs
+        .iter()
+        .find(|job| job.state == "completed")
+        .unwrap();
+    let output = job.output.as_ref().unwrap().to_path().unwrap();
+    assert_eq!(
+        output.file_name().and_then(|name| name.to_str()),
+        Some("A reel.mp4")
+    );
 
     server.await.unwrap();
     daemon.abort();
@@ -387,33 +467,23 @@ async fn file_server(body: &'static [u8]) -> (std::net::SocketAddr, tokio::task:
     (address, server)
 }
 
-async fn playlist_server(
-    master: &'static str,
-    variant: &'static str,
-) -> (url::Url, tokio::task::JoinHandle<()>) {
+async fn playlist_server(master: &'static str) -> (url::Url, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let base = url::Url::parse(&format!("http://{address}/")).unwrap();
     let server = tokio::spawn(async move {
-        for _ in 0..2 {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let request = read_request(&mut socket).await;
-            let body = if request.contains("GET /master.m3u8") {
-                master
-            } else {
-                variant
-            };
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/vnd.apple.mpegurl\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/vnd.apple.mpegurl\r\nconnection: close\r\n\r\n{master}",
+                    master.len()
                 )
-                .await
-                .unwrap();
-        }
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
     });
     (base, server)
 }

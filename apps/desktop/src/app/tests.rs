@@ -499,6 +499,7 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
             page_title: Some("A movie page".into()),
             seen: 2,
             segmented: false,
+            selectable: false,
         }],
         ..Default::default()
     });
@@ -542,6 +543,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
             page_title: Some("A film".into()),
             seen: 1,
             segmented: true,
+            selectable: true,
         }],
         capture_tracks: Some(CaptureTracks {
             id: 3,

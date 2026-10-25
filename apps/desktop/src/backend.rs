@@ -77,6 +77,8 @@ pub struct CaptureView {
     pub seen: u32,
     /// Whether the resource is a presentation whose tracks can be listed.
     pub segmented: bool,
+    /// Whether more than one quality or track can be selected.
+    pub selectable: bool,
 }
 
 /// The tracks one captured presentation offers, once they have been read.
@@ -1132,6 +1134,8 @@ impl CaptureView {
             page_title: candidate.page_title().map(str::to_owned),
             seen: candidate.seen(),
             segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
+            selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)
+                || candidate.variants().len() > 1,
         }
     }
 }
