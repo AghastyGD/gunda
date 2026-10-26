@@ -33,7 +33,7 @@ async fn capture_continues_while_no_client_is_connected() {
         .0;
     extension
         .send(&format!(
-            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
             capture.token
         ))
         .await;
@@ -111,7 +111,7 @@ low.m3u8\n";
         .0;
     extension
         .send(&format!(
-            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
             capture.token
         ))
         .await;
@@ -174,7 +174,7 @@ async fn daemon_downloads_a_selected_progressive_source_variant() {
         .0;
     extension
         .send(&format!(
-            r#"{{"kind":"hello","version":2,"token":"{}","agent":"gundad-test"}}"#,
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
             capture.token
         ))
         .await;
@@ -195,6 +195,14 @@ async fn daemon_downloads_a_selected_progressive_source_variant() {
     let captured = wait_for_capture(&mut client).await;
     let capture = &captured.captures[0];
     assert!(capture.selectable);
+
+    extension
+        .send(r#"{"kind":"list_formats","page_url":"https://www.instagram.com/reels/example/"}"#)
+        .await;
+    let formats = extension.receive().await.unwrap();
+    assert!(formats.contains(r#""kind":"page_formats""#));
+    assert!(formats.contains(r#"variant:1"#));
+    assert!(formats.contains(r#"1080x1920"#));
 
     client
         .send(&ClientMessage::Command {
@@ -235,6 +243,95 @@ async fn daemon_downloads_a_selected_progressive_source_variant() {
         Some("A reel.mp4")
     );
 
+    server.await.unwrap();
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn player_button_queues_the_best_capture_with_the_last_folder() {
+    let directory = tempdir().unwrap();
+    let (address, server) = file_server(b"from the player button").await;
+    let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
+    let endpoint = wait_for_endpoint(directory.path()).await;
+    let token = load_token(&directory.path().join("gundad-token"))
+        .unwrap()
+        .unwrap();
+    let (mut client, initial) = connect(&endpoint, token.as_str()).await.unwrap();
+    let capture = initial.capture.expect("capture starts with the daemon");
+    let mut extension = TestClient::connect(capture_address(&capture.endpoint), "/capture", None)
+        .await
+        .0;
+    extension
+        .send(&format!(
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
+            capture.token
+        ))
+        .await;
+    extension.receive().await.unwrap();
+    extension
+        .send(&format!(
+            r#"{{"kind":"candidate","url":"http://{address}/player.mp4","content_type":"video/mp4","page_url":"https://example.test/watch","page_title":"A player video"}}"#
+        ))
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"accepted""#)
+    );
+
+    let captured = wait_for_capture(&mut client).await;
+    let capture_id = captured.captures[0].id;
+    client
+        .send(&ClientMessage::Command {
+            command: Command::DownloadCapture {
+                id: capture_id,
+                directory: NativePath::from_path(directory.path()).unwrap(),
+                track: Some(CaptureTrackChoice {
+                    url: "http://127.0.0.1:1/unreachable.mp4".into(),
+                    filename: None,
+                    selection: None,
+                }),
+            },
+        })
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match client.receive::<ServerMessage>().await.unwrap() {
+                ServerMessage::Snapshot { snapshot } if !snapshot.jobs.is_empty() => break,
+                ServerMessage::Snapshot { .. } => {}
+                ServerMessage::Error { message } => panic!("daemon error: {message}"),
+            }
+        }
+    })
+    .await
+    .expect("the folder-setting job is visible");
+
+    extension
+        .send(r#"{"kind":"download_page","page_url":"https://example.test/watch"}"#)
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"download_queued""#)
+    );
+
+    let completed = wait_for_completed(&mut client).await;
+    let output = completed
+        .jobs
+        .iter()
+        .find(|job| job.state == "completed")
+        .and_then(|job| job.output.as_ref())
+        .expect("the player download is published")
+        .to_path()
+        .unwrap();
+
+    assert_eq!(std::fs::read(output).unwrap(), b"from the player button");
     server.await.unwrap();
     daemon.abort();
 }

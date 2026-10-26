@@ -22,7 +22,7 @@
       "run_at": "document_start"
     },
     {
-      "matches": ["*://*.instagram.com/*", "*://*.facebook.com/*", "*://*.youtube.com/*"],
+      "matches": ["<all_urls>"],
       "js": ["page.js"],
       "all_frames": true,
       "run_at": "document_start",

@@ -19,10 +19,18 @@ use serde_json::Value;
 use crate::error::CaptureError;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Largest message accepted, in bytes.
 pub use crate::websocket::MAX_MESSAGE_BYTES;
+
+/// One downloadable format shown by the browser player control.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFormat {
+    pub label: String,
+    pub details: String,
+    pub format: String,
+}
 
 /// Why a report was not turned into a candidate.
 ///
@@ -39,6 +47,10 @@ pub enum Refusal {
     SegmentStream,
     /// No extractor is available for the page that supplied the source.
     UnsupportedSource,
+    /// The page has no captured presentation to download.
+    NoCapture,
+    /// The daemon is not ready to accept the requested download.
+    CaptureUnavailable,
     /// The extension speaks a protocol this build does not.
     UnsupportedVersion,
 }
@@ -50,6 +62,8 @@ impl fmt::Display for Refusal {
             Self::UnsupportedMedia => "the resource is not downloadable media",
             Self::SegmentStream => "the report is a stream segment, not a stream",
             Self::UnsupportedSource => "the page source is not supported",
+            Self::NoCapture => "the page has no captured media",
+            Self::CaptureUnavailable => "the capture service is unavailable",
             Self::UnsupportedVersion => "the extension speaks a newer protocol",
         };
 
@@ -97,6 +111,21 @@ pub enum ClientMessage {
         /// Parsed JSON, already bounded by the message limit.
         document: Value,
     },
+
+    /// Queues the newest captured presentation for one page.
+    DownloadPage {
+        /// The page whose media should be downloaded.
+        page_url: String,
+        /// The selected format from [`ServerMessage::PageFormats`].
+        #[serde(default)]
+        format: Option<String>,
+    },
+
+    /// Lists the formats captured for one page.
+    ListFormats {
+        /// The page whose formats should be listed.
+        page_url: String,
+    },
 }
 
 /// A message to the extension.
@@ -123,6 +152,17 @@ pub enum ServerMessage {
         accepted: Vec<u64>,
         duplicates: Vec<u64>,
     },
+    /// A page download was queued by the daemon.
+    DownloadQueued { id: u64 },
+    /// Formats available for the player control on one page.
+    PageFormats {
+        capture_id: u64,
+        formats: Vec<MediaFormat>,
+    },
+    /// Formats could not be listed for the requested page.
+    FormatsUnavailable { reason: Refusal },
+    /// A requested page download could not be queued.
+    DownloadUnavailable { reason: Refusal },
     /// The report was refused, with a stable reason.
     Refused {
         /// Why the report was refused.
@@ -169,14 +209,14 @@ mod tests {
     #[test]
     fn parses_a_greeting() {
         let message = parse_client_message(
-            r#"{"kind":"hello","version":2,"token":"aabb","agent":"gunda-extension"}"#,
+            r#"{"kind":"hello","version":3,"token":"aabb","agent":"gunda-extension"}"#,
         )
         .expect("the greeting is valid");
 
         assert_eq!(
             message,
             ClientMessage::Hello {
-                version: 2,
+                version: 3,
                 token: "aabb".to_owned(),
                 agent: "gunda-extension".to_owned(),
             }
@@ -239,6 +279,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_page_download_request() {
+        let message = parse_client_message(
+            r#"{"kind":"download_page","page_url":"https://www.instagram.com/reels/example/"}"#,
+        )
+        .expect("the request is valid");
+
+        assert_eq!(
+            message,
+            ClientMessage::DownloadPage {
+                page_url: "https://www.instagram.com/reels/example/".into(),
+                format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_format_list_request() {
+        let message = parse_client_message(
+            r#"{"kind":"list_formats","page_url":"https://www.instagram.com/reels/example/"}"#,
+        )
+        .expect("the request is valid");
+
+        assert_eq!(
+            message,
+            ClientMessage::ListFormats {
+                page_url: "https://www.instagram.com/reels/example/".into(),
+            }
+        );
+    }
+
+    #[test]
     fn refuses_an_unknown_kind() {
         let error = parse_client_message(r#"{"kind":"teleport"}"#).expect_err("unknown kinds fail");
 
@@ -264,8 +335,8 @@ mod tests {
     #[test]
     fn encodes_server_messages_as_stable_json() {
         assert_eq!(
-            encode_server_message(&ServerMessage::Ready { version: 2 }),
-            r#"{"kind":"ready","version":2}"#
+            encode_server_message(&ServerMessage::Ready { version: 3 }),
+            r#"{"kind":"ready","version":3}"#
         );
         assert_eq!(
             encode_server_message(&ServerMessage::Accepted { id: 3 }),
@@ -287,6 +358,10 @@ mod tests {
                 duplicates: vec![2],
             }),
             r#"{"kind":"recorded","accepted":[4],"duplicates":[2]}"#
+        );
+        assert_eq!(
+            encode_server_message(&ServerMessage::DownloadQueued { id: 5 }),
+            r#"{"kind":"download_queued","id":5}"#
         );
     }
 }

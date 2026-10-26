@@ -20,6 +20,7 @@ function install(
   const messages = [];
   const window = {
     fetch,
+    addEventListener() {},
     postMessage(message) {
       messages.push(message);
     },
@@ -90,7 +91,7 @@ test('forwards bounded Instagram JSON for daemon extraction', async () => {
 });
 
 test('ignores unrelated JSON responses', async () => {
-  const response = new Response(JSON.stringify({ video_versions: [] }), {
+  const response = new Response(JSON.stringify({ title: 'No media here' }), {
     headers: { 'content-type': 'application/json' },
   });
   Object.defineProperty(response, 'url', {
@@ -185,4 +186,30 @@ test('reports complete media URLs from resource timing', () => {
       url: 'https://cdn.example.com/reel.mp4?token=public',
     },
   ]);
+});
+
+test('forwards media hints from JSON on an unrecognised site', async () => {
+  const response = new Response(
+    JSON.stringify({
+      player: { video_url: 'https://cdn.example.com/unknown-site.mp4' },
+    }),
+    { headers: { 'content-type': 'application/json' } },
+  );
+  Object.defineProperty(response, 'url', {
+    value: 'https://example.com/api/player',
+  });
+  const { messages, window } = install(
+    async () => response,
+    'https://example.com/watch',
+  );
+
+  await window.fetch(response.url);
+  await settle();
+
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].kind, 'source');
+  assert.equal(
+    messages[0].document.player.video_url,
+    'https://cdn.example.com/unknown-site.mp4',
+  );
 });

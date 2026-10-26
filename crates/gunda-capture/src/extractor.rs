@@ -15,7 +15,7 @@ use crate::protocol::Refusal;
 const MAX_DEPTH: usize = 32;
 
 /// Largest source value count inspected by one extraction.
-const MAX_NODES: usize = 50_000;
+const MAX_NODES: usize = 200_000;
 
 /// Largest number of presentations returned by one source.
 const MAX_PRESENTATIONS: usize = 16;
@@ -120,8 +120,7 @@ impl ExtractedPresentation {
 ///
 /// # Errors
 ///
-/// Returns [`Refusal::UnsupportedSource`] for an unsupported page and
-/// [`Refusal::UnsupportedMedia`] when the document contains no media.
+/// Returns [`Refusal::UnsupportedMedia`] when the document contains no media.
 pub fn extract(
     page_url: &Url,
     source_url: &Url,
@@ -142,6 +141,7 @@ enum Platform {
     Instagram,
     Facebook,
     YouTube,
+    Generic,
 }
 
 impl Platform {
@@ -155,7 +155,7 @@ impl Platform {
         } else if host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtu.be" {
             Some(Self::YouTube)
         } else {
-            None
+            Some(Self::Generic)
         }
     }
 }
@@ -164,6 +164,7 @@ struct Collector<'a> {
     platform: Platform,
     source_url: &'a Url,
     presentations: BTreeMap<String, PresentationBuilder>,
+    fallback_variants: Vec<MediaVariant>,
     nodes: usize,
 }
 
@@ -173,6 +174,7 @@ impl<'a> Collector<'a> {
             platform,
             source_url,
             presentations: BTreeMap::new(),
+            fallback_variants: Vec::new(),
             nodes: 0,
         }
     }
@@ -206,6 +208,17 @@ impl<'a> Collector<'a> {
                         );
                     }
                 }
+                Value::String(value) => {
+                    if let Some(variant) = media_url_variant(value)
+                        && self.fallback_variants.len() < MAX_VARIANTS
+                        && !self
+                            .fallback_variants
+                            .iter()
+                            .any(|existing| existing.url == variant.url)
+                    {
+                        self.fallback_variants.push(variant);
+                    }
+                }
                 _ => {}
             }
         }
@@ -216,6 +229,7 @@ impl<'a> Collector<'a> {
             Platform::Instagram => self.consider_instagram(object),
             Platform::Facebook => self.consider_facebook(object),
             Platform::YouTube => self.consider_youtube(object),
+            Platform::Generic => self.consider_generic(object),
         }
     }
 
@@ -348,6 +362,71 @@ impl<'a> Collector<'a> {
         self.add_presentation(object, variants, manifest, title);
     }
 
+    fn consider_generic(&mut self, object: &Map<String, Value>) {
+        let mut variants = Vec::new();
+
+        for name in [
+            "video_url",
+            "videoUrl",
+            "playback_url",
+            "playbackUrl",
+            "playable_url",
+            "playableUrl",
+            "stream_url",
+            "streamUrl",
+            "manifest_url",
+            "manifestUrl",
+            "hlsManifestUrl",
+            "dashManifestUrl",
+            "contentUrl",
+            "file",
+            "src",
+        ] {
+            add_variant(&mut variants, object.get(name), None, object);
+        }
+
+        for name in [
+            "sources",
+            "formats",
+            "adaptiveFormats",
+            "progressive",
+            "progressive_urls",
+            "video_versions",
+            "videos",
+            "versions",
+        ] {
+            if let Some(items) = object.get(name).and_then(Value::as_array) {
+                for item in items {
+                    if let Some(item) = item.as_object() {
+                        add_variant(
+                            &mut variants,
+                            item.get("url").or_else(|| item.get("src")),
+                            None,
+                            item,
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(url) = object.get("url") {
+            let content_type = string_field(object, &["mimeType", "mime_type", "content_type"]);
+            let named_as_media = url
+                .as_str()
+                .is_some_and(|url| media_path(Url::parse(url).ok().as_ref()));
+            if content_type.as_deref().is_some_and(|content_type| {
+                content_type.starts_with("video/") || content_type.starts_with("audio/")
+            }) || named_as_media
+            {
+                add_variant(&mut variants, Some(url), content_type.as_deref(), object);
+            }
+        }
+
+        if !variants.is_empty() {
+            self.add_presentation(object, variants, None, None);
+        }
+    }
+
     fn add_presentation(
         &mut self,
         object: &Map<String, Value>,
@@ -373,6 +452,16 @@ impl<'a> Collector<'a> {
     }
 
     fn finish(self) -> Result<Vec<ExtractedPresentation>, Refusal> {
+        if self.presentations.is_empty() && !self.fallback_variants.is_empty() {
+            let mut builder = PresentationBuilder::default();
+            for variant in self.fallback_variants {
+                builder.add_variant(variant);
+            }
+            if let Some(presentation) = builder.finish() {
+                return Ok(vec![presentation]);
+            }
+        }
+
         let mut presentations = self
             .presentations
             .into_values()
@@ -520,6 +609,47 @@ fn media_variant(
         label: string_field(metadata, &["quality_label", "quality"]),
         rank: 0,
     })
+}
+
+fn media_url_variant(raw: &str) -> Option<MediaVariant> {
+    if raw.len() > MAX_URL_BYTES {
+        return None;
+    }
+    let url = Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !media_path(Some(&url)) {
+        return None;
+    }
+
+    Some(MediaVariant {
+        url,
+        content_type: None,
+        width: None,
+        height: None,
+        bitrate: None,
+        codecs: None,
+        label: None,
+        rank: 0,
+    })
+}
+
+fn media_path(url: Option<&Url>) -> bool {
+    let Some(url) = url else {
+        return false;
+    };
+    url.path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .is_some_and(|segment| {
+            [
+                "mp4", "m4v", "webm", "mkv", "mov", "flv", "avi", "wmv", "mpeg", "mpg", "3gp",
+                "ogv", "m3u8", "mpd", "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav",
+            ]
+            .iter()
+            .any(|extension| {
+                segment
+                    .rsplit_once('.')
+                    .is_some_and(|(_, actual)| actual.eq_ignore_ascii_case(extension))
+            })
+        })
 }
 
 fn presentation_key(
@@ -694,8 +824,6 @@ mod tests {
     use url::Url;
 
     use super::extract;
-    use crate::protocol::Refusal;
-
     fn page(value: &str) -> Url {
         Url::parse(value).expect("the page URL is valid")
     }
@@ -789,15 +917,49 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_unsupported_page() {
+    fn extracts_media_from_an_unrecognised_site() {
+        let presentations = extract(
+            &page("https://example.com/watch"),
+            &page("https://example.com/data.json"),
+            &json!({
+                "player": {
+                    "id": "movie-1",
+                    "video_url": "https://cdn.example/movie.mp4",
+                    "width": 1920,
+                    "height": 1080
+                }
+            }),
+        )
+        .expect("generic media is extracted");
+
+        assert_eq!(presentations.len(), 1);
         assert_eq!(
-            extract(
-                &page("https://example.com/watch"),
-                &page("https://example.com/data.json"),
-                &json!({"video_url": "https://cdn.example/movie.mp4"})
-            )
-            .expect_err("the page needs a supported extractor"),
-            Refusal::UnsupportedSource
+            presentations[0].url().as_str(),
+            "https://cdn.example/movie.mp4"
+        );
+        assert_eq!(
+            presentations[0].variants()[0].resolution(),
+            Some((1920, 1080))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_media_urls_in_unstructured_json() {
+        let presentations = extract(
+            &page("https://example.com/watch"),
+            &page("https://example.com/data.json"),
+            &json!({
+                "payload": [
+                    "metadata",
+                    "https://cdn.example/fallback.webm"
+                ]
+            }),
+        )
+        .expect("a full media URL is enough");
+
+        assert_eq!(
+            presentations[0].url().as_str(),
+            "https://cdn.example/fallback.webm"
         );
     }
 }

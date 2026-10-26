@@ -20,17 +20,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::debug;
 use url::Url;
+
+use gunda_core::download::ResourceKind;
 
 use crate::candidate::{Candidate, CandidateId, Catalog, DEFAULT_CAPACITY, Recorded, Report};
 use crate::error::CaptureError;
 use crate::extractor;
 use crate::pairing::PairingToken;
 use crate::protocol::{
-    ClientMessage, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
+    ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
     parse_client_message,
 };
 use crate::websocket::WebSocket;
@@ -68,6 +70,42 @@ enum CaptureCommand {
 
 /// A report on its way to the catalog, with the sender that acknowledges it.
 type Submission = (Report, oneshot::Sender<Recorded>);
+
+/// Formats returned by the daemon for one page capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormatsResponse {
+    pub capture_id: CandidateId,
+    pub formats: Vec<MediaFormat>,
+}
+
+/// One event delivered to the daemon that owns the capture handle.
+pub enum CaptureEvent {
+    /// The candidate catalog changed.
+    Changed,
+    /// The extension requested formats for the newest presentation on one page.
+    FormatsRequested {
+        candidate: Box<Candidate>,
+        reply: oneshot::Sender<Result<FormatsResponse, Refusal>>,
+    },
+    /// The extension requested one format of the newest presentation on a page.
+    DownloadRequested {
+        candidate: Box<Candidate>,
+        format: Option<String>,
+        reply: oneshot::Sender<Result<CandidateId, Refusal>>,
+    },
+}
+
+enum CaptureRequest {
+    Formats {
+        page_url: Url,
+        reply: oneshot::Sender<Result<FormatsResponse, Refusal>>,
+    },
+    Download {
+        page_url: Url,
+        format: Option<String>,
+        reply: oneshot::Sender<Result<CandidateId, Refusal>>,
+    },
+}
 
 /// A snapshot of the capture catalog.
 ///
@@ -117,6 +155,9 @@ pub struct CaptureServer {
     catalog: Catalog,
     updates: watch::Sender<CatalogView>,
     commands: mpsc::Receiver<CaptureCommand>,
+    capture_requests: mpsc::Receiver<CaptureRequest>,
+    request_captures: mpsc::Sender<CaptureRequest>,
+    events: mpsc::UnboundedSender<CaptureEvent>,
 }
 
 impl CaptureServer {
@@ -147,6 +188,8 @@ impl CaptureServer {
 
         let (updates, view) = watch::channel(CatalogView::default());
         let (commands, incoming) = mpsc::channel(COMMAND_CAPACITY);
+        let (download_commands, download_incoming) = mpsc::channel(COMMAND_CAPACITY);
+        let (events, event_events) = mpsc::unbounded_channel();
 
         let token = Arc::new(token);
 
@@ -156,6 +199,9 @@ impl CaptureServer {
             catalog: Catalog::new(DEFAULT_CAPACITY),
             updates,
             commands: incoming,
+            capture_requests: download_incoming,
+            request_captures: download_commands.clone(),
+            events,
         };
 
         let handle = CaptureHandle {
@@ -163,6 +209,7 @@ impl CaptureServer {
             token,
             view,
             commands,
+            events: Arc::new(Mutex::new(event_events)),
         };
 
         Ok((server, handle))
@@ -185,9 +232,12 @@ impl CaptureServer {
 
                         let token = Arc::clone(&self.token);
                         let submissions = submissions.clone();
+                        let download_commands = self.request_captures.clone();
 
                         tokio::spawn(async move {
-                            if let Err(error) = converse(stream, &token, &submissions).await {
+                            if let Err(error) =
+                                converse(stream, &token, &submissions, &download_commands).await
+                            {
                                 debug!(%error, "a capture connection ended");
                             }
 
@@ -199,6 +249,50 @@ impl CaptureServer {
                 Some((report, recorded)) = reports.recv() => {
                     let _ = recorded.send(self.catalog.record(report));
                     self.publish();
+                }
+                Some(request) = self.capture_requests.recv() => {
+                    let page_url = match &request {
+                        CaptureRequest::Formats { page_url, .. }
+                        | CaptureRequest::Download { page_url, .. } => page_url,
+                    };
+                    let candidate = self
+                        .catalog
+                        .candidates()
+                        .iter()
+                        .filter(|candidate| same_page(candidate.page_url(), page_url))
+                        .max_by_key(|candidate| page_candidate_score(candidate))
+                        .cloned();
+                    match (candidate, request) {
+                        (Some(candidate), CaptureRequest::Formats { reply, .. }) => {
+                            if let Err(event) =
+                                self.events.send(CaptureEvent::FormatsRequested {
+                                    candidate: Box::new(candidate),
+                                    reply,
+                                })
+                                && let CaptureEvent::FormatsRequested { reply, .. } = event.0
+                            {
+                                let _ = reply.send(Err(Refusal::CaptureUnavailable));
+                            }
+                        }
+                        (Some(candidate), CaptureRequest::Download { format, reply, .. }) => {
+                            if let Err(event) =
+                                self.events.send(CaptureEvent::DownloadRequested {
+                                    candidate: Box::new(candidate),
+                                    format,
+                                    reply,
+                                })
+                                && let CaptureEvent::DownloadRequested { reply, .. } = event.0
+                            {
+                                let _ = reply.send(Err(Refusal::CaptureUnavailable));
+                            }
+                        }
+                        (None, CaptureRequest::Formats { reply, .. }) => {
+                            let _ = reply.send(Err(Refusal::NoCapture));
+                        }
+                        (None, CaptureRequest::Download { reply, .. }) => {
+                            let _ = reply.send(Err(Refusal::NoCapture));
+                        }
+                    }
                 }
                 command = self.commands.recv() => match command {
                     Some(CaptureCommand::Clear) => {
@@ -231,6 +325,7 @@ pub struct CaptureHandle {
     token: Arc<PairingToken>,
     view: watch::Receiver<CatalogView>,
     commands: mpsc::Sender<CaptureCommand>,
+    events: Arc<Mutex<mpsc::UnboundedReceiver<CaptureEvent>>>,
 }
 
 impl CaptureHandle {
@@ -270,6 +365,28 @@ impl CaptureHandle {
             .map_err(|_| CaptureError::Protocol("the capture listener stopped"))
     }
 
+    /// Waits for the next catalog or download event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error once the listener has stopped.
+    pub async fn next_event(&mut self) -> Result<CaptureEvent, CaptureError> {
+        let events = Arc::clone(&self.events);
+        let capture_event = async move {
+            let mut events = events.lock().await;
+            events.recv().await
+        };
+
+        tokio::select! {
+            changed = self.view.changed() => {
+                changed.map_err(|_| CaptureError::Protocol("the capture listener stopped"))?;
+                Ok(CaptureEvent::Changed)
+            }
+            event = capture_event => event
+                .ok_or(CaptureError::Protocol("the capture event channel stopped")),
+        }
+    }
+
     /// Forgets every candidate.
     ///
     /// # Errors
@@ -301,6 +418,7 @@ async fn converse(
     stream: TcpStream,
     token: &PairingToken,
     submissions: &mpsc::Sender<Submission>,
+    download_commands: &mpsc::Sender<CaptureRequest>,
 ) -> Result<(), CaptureError> {
     let mut socket = WebSocket::new(stream);
 
@@ -352,7 +470,10 @@ async fn converse(
 
             debug!("a capture client connected");
         }
-        ClientMessage::Candidate { .. } | ClientMessage::Source { .. } => {
+        ClientMessage::Candidate { .. }
+        | ClientMessage::Source { .. }
+        | ClientMessage::DownloadPage { .. }
+        | ClientMessage::ListFormats { .. } => {
             respond(
                 &mut socket,
                 ServerMessage::Malformed {
@@ -427,6 +548,31 @@ async fn converse(
                 }
                 Err(reason) => ServerMessage::Refused { reason },
             },
+            Ok(ClientMessage::DownloadPage { page_url, format }) => {
+                let page_url = Url::parse(&page_url).map_err(|_| Refusal::UnsupportedUrl);
+                match page_url {
+                    Ok(page_url) => {
+                        match request_download(download_commands, page_url, format).await? {
+                            Ok(id) => ServerMessage::DownloadQueued { id },
+                            Err(reason) => ServerMessage::DownloadUnavailable { reason },
+                        }
+                    }
+                    Err(reason) => ServerMessage::DownloadUnavailable { reason },
+                }
+            }
+            Ok(ClientMessage::ListFormats { page_url }) => {
+                let page_url = Url::parse(&page_url).map_err(|_| Refusal::UnsupportedUrl);
+                match page_url {
+                    Ok(page_url) => match request_formats(download_commands, page_url).await? {
+                        Ok(formats) => ServerMessage::PageFormats {
+                            capture_id: formats.capture_id,
+                            formats: formats.formats,
+                        },
+                        Err(reason) => ServerMessage::FormatsUnavailable { reason },
+                    },
+                    Err(reason) => ServerMessage::FormatsUnavailable { reason },
+                }
+            }
             Ok(ClientMessage::Hello { .. }) => ServerMessage::Malformed {
                 reason: String::from("the greeting was already sent"),
             },
@@ -440,6 +586,102 @@ async fn converse(
 
         respond(&mut socket, response).await?;
     }
+}
+
+fn same_page(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+        && left.path() == right.path()
+        && page_query_key(left) == page_query_key(right)
+}
+
+fn page_query_key(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    if host == "youtube.com" || host.ends_with(".youtube.com") {
+        return url
+            .query_pairs()
+            .find(|(name, _)| name == "v")
+            .map_or_else(String::new, |(_, value)| value.into_owned());
+    }
+    if host == "instagram.com" || host.ends_with(".instagram.com") {
+        return String::new();
+    }
+    if host == "facebook.com" || host.ends_with(".facebook.com") {
+        return url
+            .query_pairs()
+            .find(|(name, _)| name == "v")
+            .map_or_else(String::new, |(_, value)| value.into_owned());
+    }
+
+    let mut parts = url
+        .query_pairs()
+        .filter(|(name, _)| {
+            let name = name.to_ascii_lowercase();
+            name != "t"
+                && name != "si"
+                && name != "feature"
+                && name != "fbclid"
+                && name != "gclid"
+                && name != "igsh"
+                && name != "igshid"
+                && name != "rdid"
+                && !name.starts_with("utm_")
+        })
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>();
+    parts.sort();
+    parts.join("&")
+}
+
+fn page_candidate_score(candidate: &Candidate) -> (u8, u8, u64) {
+    let url = candidate.url().as_str().to_ascii_lowercase();
+    let variant_list = u8::from(candidate.variants().len() > 1);
+    let media_rank = if url.contains("hls_variant") || url.contains("/master") {
+        4
+    } else if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+        3
+    } else {
+        1
+    };
+
+    (variant_list, media_rank, candidate.id())
+}
+
+async fn request_download(
+    download_commands: &mpsc::Sender<CaptureRequest>,
+    page_url: Url,
+    format: Option<String>,
+) -> Result<Result<CandidateId, Refusal>, CaptureError> {
+    let (acknowledge, acknowledged) = oneshot::channel();
+    download_commands
+        .send(CaptureRequest::Download {
+            page_url,
+            format,
+            reply: acknowledge,
+        })
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))?;
+    acknowledged
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))
+}
+
+async fn request_formats(
+    download_commands: &mpsc::Sender<CaptureRequest>,
+    page_url: Url,
+) -> Result<Result<FormatsResponse, Refusal>, CaptureError> {
+    let (acknowledge, acknowledged) = oneshot::channel();
+    download_commands
+        .send(CaptureRequest::Formats {
+            page_url,
+            reply: acknowledge,
+        })
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))?;
+    acknowledged
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))
 }
 
 fn source_reports(
@@ -508,6 +750,7 @@ mod tests {
     use std::future::Future;
 
     use tokio::time::{Duration, timeout};
+    use url::Url;
 
     use super::{CaptureHandle, CaptureServer, DEFAULT_PATH};
     use crate::pairing::PairingToken;
@@ -554,6 +797,16 @@ mod tests {
         )
     }
 
+    #[test]
+    fn youtube_tracking_parameters_do_not_split_video_pages() {
+        let first = Url::parse("https://www.youtube.com/watch?v=video-1&t=20").unwrap();
+        let second = Url::parse("https://www.youtube.com/watch?v=video-1&si=tracking").unwrap();
+        let other = Url::parse("https://www.youtube.com/watch?v=video-2").unwrap();
+
+        assert!(super::same_page(&first, &second));
+        assert!(!super::same_page(&first, &other));
+    }
+
     /// Connects, greets, and returns the live client.
     async fn connected(handle: &CaptureHandle) -> TestClient {
         let (mut client, head) = within(TestClient::connect(
@@ -572,7 +825,7 @@ mod tests {
 
         assert_eq!(
             within(client.receive()).await.as_deref(),
-            Some(r#"{"kind":"ready","version":2}"#)
+            Some(r#"{"kind":"ready","version":3}"#)
         );
 
         client
@@ -701,6 +954,105 @@ mod tests {
 
         assert_eq!(candidate.url().as_str(), "https://cdn.example/high.mp4");
         assert_eq!(candidate.variants().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn requests_the_newest_capture_for_a_downloaded_page() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        within(client.send(&report("movie"))).await;
+        within(client.receive()).await;
+
+        within(client.send(r#"{"kind":"download_page","page_url":"https://example.com/watch"}"#))
+            .await;
+
+        let (candidate, format, reply) = within(async {
+            loop {
+                if let super::CaptureEvent::DownloadRequested {
+                    candidate,
+                    format,
+                    reply,
+                } = handle.next_event().await.expect("the listener runs")
+                {
+                    break (candidate, format, reply);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(candidate.id(), 0);
+        assert_eq!(format, None);
+        assert_eq!(
+            candidate.url().as_str(),
+            "https://cdn.example.com/movie.mp4"
+        );
+        reply
+            .send(Ok(candidate.id()))
+            .expect("the connection waits for the result");
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"download_queued","id":0}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_formats_for_the_newest_capture_on_a_page() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        within(client.send(&report("hls_variant/master"))).await;
+        within(client.receive()).await;
+        within(client.send(&report("hls_playlist/index"))).await;
+        within(client.receive()).await;
+        within(client.send(r#"{"kind":"list_formats","page_url":"https://example.com/watch"}"#))
+            .await;
+
+        let (candidate, reply) = within(async {
+            loop {
+                if let super::CaptureEvent::FormatsRequested { candidate, reply } =
+                    handle.next_event().await.expect("the listener runs")
+                {
+                    break (candidate, reply);
+                }
+            }
+        })
+        .await;
+        reply
+            .send(Ok(super::FormatsResponse {
+                capture_id: candidate.id(),
+                formats: vec![crate::protocol::MediaFormat {
+                    label: String::from("Original"),
+                    details: String::from("video/mp4"),
+                    format: String::from("best"),
+                }],
+            }))
+            .expect("the connection waits for formats");
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(
+                r#"{"kind":"page_formats","capture_id":0,"formats":[{"label":"Original","details":"video/mp4","format":"best"}]}"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_page_download_without_a_capture() {
+        let (server, handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        within(client.send(r#"{"kind":"download_page","page_url":"https://example.com/missing"}"#))
+            .await;
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"download_unavailable","reason":"no_capture"}"#)
+        );
     }
 
     #[tokio::test]

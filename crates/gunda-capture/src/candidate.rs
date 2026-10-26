@@ -367,8 +367,8 @@ fn classify(url: &Url, content_type: Option<&str>) -> Classification {
         Some("m3u8") => Classification::Media(ResourceKind::Hls),
         Some("mpd") => Classification::Media(ResourceKind::Dash),
         Some(
-            "mp4" | "m4v" | "webm" | "mkv" | "mov" | "mp3" | "m4a" | "aac" | "ogg" | "oga" | "opus"
-            | "flac" | "wav",
+            "mp4" | "m4v" | "webm" | "mkv" | "mov" | "flv" | "avi" | "wmv" | "mpeg" | "mpg" | "3gp"
+            | "ogv" | "mp3" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "flac" | "wav",
         ) => Classification::Media(ResourceKind::File),
         Some("ts" | "m4s") => Classification::Segment,
         _ => Classification::Unknown,

@@ -1,9 +1,9 @@
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 3;
 const AGENT = 'gunda-capture/0.1.0';
 const NATIVE_HOST_NAME = 'com.gunda.capture';
 const NATIVE_HOST_PROTOCOL_VERSION = 1;
-const MAX_PENDING = 64;
-const MAX_SOURCE_MESSAGE_BYTES = 480 * 1024;
+const MAX_PENDING = 32;
+const MAX_SOURCE_MESSAGE_BYTES = 1792 * 1024;
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const DEDUP_LIMIT = 2048;
 
@@ -11,7 +11,8 @@ const MEDIA_TYPES = /^(video|audio)\//i;
 const PLAYLIST_TYPES =
   /^(application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml)|audio\/(x-)?mpegurl)$/i;
 const SEGMENT_TYPES = /^video\/(mp2t|iso\.segment)$/i;
-const MEDIA_EXTENSIONS = /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|mp3|m4a|aac|ogg|oga|opus|flac|wav)$/i;
+const MEDIA_EXTENSIONS =
+  /\.(m3u8|mpd|mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|mp3|m4a|aac|ogg|oga|opus|flac|wav)$/i;
 const SEGMENT_EXTENSIONS = /\.(ts|m4s)$/i;
 
 let connection: WebSocket | null = null;
@@ -22,6 +23,14 @@ let automaticPairing: PairingSettings | null = null;
 
 const pending: string[] = [];
 const seen = new Map<string, number>();
+const downloadRequests: {
+  resolve: (response: DownloadResponse) => void;
+  timer: ReturnType<typeof setTimeout>;
+}[] = [];
+const formatRequests: {
+  resolve: (response: FormatResponse) => void;
+  timer: ReturnType<typeof setTimeout>;
+}[] = [];
 
 async function nativePairing(): Promise<PairingSettings | null> {
   return new Promise((resolve) => {
@@ -157,6 +166,14 @@ function connect(): void {
       }
       automaticPairing = null;
       greeted = false;
+      for (const request of downloadRequests.splice(0)) {
+        clearTimeout(request.timer);
+        request.resolve({ kind: 'unavailable', reason: 'connection_closed' });
+      }
+      for (const request of formatRequests.splice(0)) {
+        clearTimeout(request.timer);
+        request.resolve({ kind: 'unavailable', reason: 'connection_closed' });
+      }
       void setStatus({ state: 'closed' });
       scheduleReconnect();
     });
@@ -215,6 +232,22 @@ function handle(message: unknown): void {
     case 'recorded':
       void count('accepted', server.accepted.length);
       void count('duplicate', server.duplicates.length);
+      break;
+    case 'download_queued':
+      finishDownloadRequest({ kind: 'queued', id: server.id });
+      break;
+    case 'download_unavailable':
+      finishDownloadRequest({ kind: 'unavailable', reason: server.reason });
+      break;
+    case 'page_formats':
+      finishFormatRequest({
+        kind: 'formats',
+        capture_id: server.capture_id,
+        formats: server.formats,
+      });
+      break;
+    case 'formats_unavailable':
+      finishFormatRequest({ kind: 'unavailable', reason: server.reason });
       break;
     case 'refused':
       void count('refused');
@@ -290,6 +323,77 @@ function reportSource(
   connect();
 }
 
+function finishDownloadRequest(response: DownloadResponse): void {
+  const request = downloadRequests.shift();
+  if (request) {
+    clearTimeout(request.timer);
+    request.resolve(response);
+  }
+}
+
+function finishFormatRequest(response: FormatResponse): void {
+  const request = formatRequests.shift();
+  if (request) {
+    clearTimeout(request.timer);
+    request.resolve(response);
+  }
+}
+
+async function waitForCaptureConnection(): Promise<boolean> {
+  connect();
+  const deadline = Date.now() + 6000;
+  while (
+    !connection ||
+    connection.readyState !== WebSocket.OPEN ||
+    !greeted
+  ) {
+    if (Date.now() >= deadline) {
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return true;
+}
+
+async function requestPageFormats(pageUrl: string): Promise<FormatResponse> {
+  if (!(await waitForCaptureConnection())) {
+    return { kind: 'unavailable', reason: 'connection_unavailable' };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const index = formatRequests.findIndex((request) => request.resolve === resolve);
+      if (index >= 0) {
+        formatRequests.splice(index, 1);
+      }
+      resolve({ kind: 'unavailable', reason: 'timeout' });
+    }, 15000);
+    formatRequests.push({ resolve, timer });
+    connection?.send(JSON.stringify({ kind: 'list_formats', page_url: pageUrl }));
+  });
+}
+
+async function requestPageDownload(
+  pageUrl: string,
+  format?: string,
+): Promise<DownloadResponse> {
+  if (!(await waitForCaptureConnection())) {
+    return { kind: 'unavailable', reason: 'connection_unavailable' };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const index = downloadRequests.findIndex((request) => request.resolve === resolve);
+      if (index >= 0) {
+        downloadRequests.splice(index, 1);
+      }
+      resolve({ kind: 'unavailable', reason: 'timeout' });
+    }, 6000);
+    downloadRequests.push({ resolve, timer });
+    connection?.send(JSON.stringify({ kind: 'download_page', page_url: pageUrl, format }));
+  });
+}
+
 function headerValue(headers: chrome.webRequest.HttpHeader[] | undefined, name: string): string | null {
   const found = headers?.find((header) => header.name.toLowerCase() === name);
   return found?.value ?? null;
@@ -346,7 +450,11 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
   ) {
     return message;
   }
-  return message.kind === 'reconnect' ? message : null;
+  return message.kind === 'reconnect' ||
+    message.kind === 'list-formats' ||
+    message.kind === 'download-page'
+    ? message
+    : null;
 }
 
 chrome.webRequest.onResponseStarted.addListener(
@@ -383,7 +491,7 @@ chrome.webRequest.onResponseStarted.addListener(
   ['responseHeaders'],
 );
 
-chrome.runtime.onMessage.addListener((value: unknown, sender) => {
+chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
   const message = runtimeMessage(value);
   if (!message) {
     return;
@@ -393,6 +501,22 @@ chrome.runtime.onMessage.addListener((value: unknown, sender) => {
     disconnect();
     connect();
     return;
+  }
+
+  if (message.kind === 'download-page') {
+    if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
+      return;
+    }
+    void requestPageDownload(sender.tab.url, message.format).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'list-formats') {
+    if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
+      return;
+    }
+    void requestPageFormats(sender.tab.url).then(sendResponse);
+    return true;
   }
 
   if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {

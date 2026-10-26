@@ -56,8 +56,10 @@ pub use pairing::{
     save_token, token_path,
 };
 pub use protocol::{
-    ClientMessage, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
+    ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
     parse_client_message,
 };
-pub use server::{CaptureHandle, CaptureServer, CatalogView, DEFAULT_PATH};
+pub use server::{
+    CaptureEvent, CaptureHandle, CaptureServer, CatalogView, DEFAULT_PATH, FormatsResponse,
+};
 pub use websocket::{MAX_MESSAGE_BYTES, WebSocketError};

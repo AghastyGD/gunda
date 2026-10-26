@@ -29,7 +29,7 @@ const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 ///
 /// The channel carries a handful of short JSON objects, so this is generous
 /// while still bounding what one connection can make the process allocate.
-pub const MAX_MESSAGE_BYTES: usize = 512 * 1024;
+pub const MAX_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Frame opcodes from RFC 6455 section 5.2.
 const OP_CONTINUATION: u8 = 0x0;

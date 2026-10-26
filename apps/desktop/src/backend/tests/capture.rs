@@ -612,11 +612,11 @@ impl Extension {
     /// Greets the channel and checks it came up.
     async fn greet(&mut self, token: &str) {
         self.send(&format!(
-            r#"{{"kind":"hello","version":2,"token":"{token}","agent":"gunda-test"}}"#
+            r#"{{"kind":"hello","version":3,"token":"{token}","agent":"gunda-test"}}"#
         ))
         .await;
 
-        assert_eq!(self.receive().await, r#"{"kind":"ready","version":2}"#);
+        assert_eq!(self.receive().await, r#"{"kind":"ready","version":3}"#);
     }
 
     /// Reports one media resource and checks the identifier it was given.

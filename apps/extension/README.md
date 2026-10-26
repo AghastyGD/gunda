@@ -16,7 +16,8 @@ Three sources, because none is enough on its own:
 | --- | --- | --- |
 | Response sniffing | `background.js` | every response the browser fetches, including the manifests and media files that Media Source Extensions hide from the page |
 | DOM scanning | `content.js` | `<video>`, `<audio>`, and `<source>` elements the page declares, including ones a page builds from data it already had |
-| Page source capture | `page.js` | bounded Instagram, Facebook, and YouTube JSON responses forwarded to the daemon extractor |
+| Page source capture | `page.js` | bounded JSON responses from any site, with dedicated Instagram, Facebook, and YouTube handling |
+| Player control | `content.js` | a Shadow DOM download button over visible video elements |
 
 A direct media report is `{ url, content_type, page_url, page_title }`. A source
 report adds a bounded JSON document and its response URL. The daemon interprets
@@ -26,6 +27,11 @@ download carries none of the browser's session with it.
 
 Stream segments (`video/mp2t`, `.ts`, `.m4s`, partial responses, and URLs with
 range parameters) are deliberately **not** reported as complete files.
+
+The player control asks the page agent to refresh media detection before it
+lists the formats of the newest capture for that exact page. Choosing a format
+queues that download. Gunda uses the last folder chosen in the desktop
+application, or the operating system's Downloads folder.
 
 ## Installing it
 

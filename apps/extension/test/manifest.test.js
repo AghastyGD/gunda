@@ -19,7 +19,7 @@ test('page agent runs in the page world before site scripts', () => {
   assert.ok(agent);
   assert.equal(agent.world, 'MAIN');
   assert.equal(agent.run_at, 'document_start');
-  assert.ok(agent.matches.some((match) => match.includes('instagram.com')));
+  assert.deepEqual(agent.matches, ['<all_urls>']);
 });
 
 test('manifest key resolves to the registered extension id', () => {

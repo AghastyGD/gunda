@@ -1,7 +1,10 @@
-const MAX_BODY_BYTES = 384 * 1024;
+const MAX_BODY_BYTES = 1536 * 1024;
 const YOUTUBE_POLL_MS = 500;
 const YOUTUBE_POLL_LIMIT = 30;
-const MEDIA_FILE_PATH = /\.(mp4|m4v|webm|mkv|mov|mp3|m4a|aac|ogg|oga|opus|flac|wav)$/i;
+const MEDIA_FILE_PATH =
+  /\.(mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|mp3|m4a|aac|ogg|oga|opus|flac|wav)$/i;
+const MEDIA_SOURCE_HINT =
+  /video(?:_versions|_url|Url)|playable_url|playableUrl|browser_native_\w+_url|progressive_urls|hlsManifestUrl|dashManifestUrl|manifest_url|stream_url|playback_url|contentUrl|\.(?:mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|m3u8|mpd|mp3|m4a|aac|ogg|oga|opus|flac|wav)(?:["'\\?])/i;
 
 if (!window.__gundaPageAgent) {
   window.__gundaPageAgent = true;
@@ -106,6 +109,35 @@ function installPageAgent(): void {
     }
   }
 
+  async function refreshPageMedia(): Promise<void> {
+    reportPerformanceMedia();
+    reportJsonScripts();
+
+    if (!location.hostname.endsWith('instagram.com')) {
+      return;
+    }
+
+    try {
+      const url = new URL(location.href);
+      url.searchParams.set('__a', '1');
+      url.searchParams.set('__d', 'dis');
+      const response = await originalFetch(url, { credentials: 'include' });
+      await capture(response.url || url.href, response);
+    } catch {
+      return;
+    }
+  }
+
+  window.addEventListener('message', (event) => {
+    if (event.source !== window || event.origin !== location.origin) {
+      return;
+    }
+    const message = event.data as Partial<PageRefresh> | null;
+    if (message?.source === 'gunda-page' && message.kind === 'refresh') {
+      void refreshPageMedia();
+    }
+  });
+
   async function boundedText(response: Response): Promise<string | null> {
     const length = Number(response.headers.get('content-length'));
     if (Number.isFinite(length) && length > MAX_BODY_BYTES) {
@@ -151,9 +183,7 @@ function installPageAgent(): void {
   }
 
   async function capture(url: string, response: Response): Promise<void> {
-    if (!target(url)) {
-      return;
-    }
+    const knownSource = target(url);
     const type = response.headers.get('content-type') ?? '';
     if (!/json|text\/plain/i.test(type)) {
       return;
@@ -162,6 +192,9 @@ function installPageAgent(): void {
     try {
       const text = await boundedText(response);
       if (!text) {
+        return;
+      }
+      if (!knownSource && !MEDIA_SOURCE_HINT.test(text)) {
         return;
       }
       const value = jsonBody(text);

@@ -10,8 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gunda_capture::{
-    Candidate, CandidateId, CaptureHandle, CaptureServer, MediaVariant, PairingToken,
-    endpoint_path, load_or_create_token, save_endpoint, token_path,
+    Candidate, CandidateId, CaptureEvent, CaptureHandle, CaptureServer, FormatsResponse,
+    MediaFormat, MediaVariant, PairingToken, Refusal, endpoint_path, load_or_create_token,
+    save_endpoint, token_path,
 };
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError, ExecutionOutput,
@@ -125,6 +126,7 @@ struct Daemon {
     capture: Option<CaptureHandle>,
     capture_problem: Option<String>,
     capture_tracks: Option<CaptureTracks>,
+    last_download_directory: Option<PathBuf>,
     inspection_sequence: u64,
     notice: Option<String>,
 }
@@ -413,6 +415,7 @@ impl Daemon {
         let directory = directory
             .to_path()
             .map_err(|_| "Invalid destination folder.")?;
+        let remembered_directory = directory.clone();
         let (url, track_filename, selection) = match track {
             Some(track) => {
                 let url = validate_url(&track.url)?;
@@ -453,6 +456,7 @@ impl Daemon {
             .download_id();
 
         self.pending_engines.insert(id, captured.engine);
+        self.last_download_directory = Some(remembered_directory);
         self.capture_tracks = None;
         self.inspection_sequence = self.inspection_sequence.saturating_add(1);
         Ok(())
@@ -730,6 +734,7 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
         capture,
         capture_problem,
         capture_tracks: None,
+        last_download_directory: None,
         inspection_sequence: 0,
         notice: None,
     };
@@ -750,8 +755,9 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
                 daemon.handle_worker_event(event).await;
                 publish_snapshot(&daemon, &snapshot_tx).await?;
             }
-            changed = capture_changed(&mut daemon.capture) => {
-                daemon.handle_capture_change(changed);
+            event = capture_event(&mut daemon.capture) => {
+                daemon.handle_capture_event(event).await;
+                daemon.schedule_jobs();
                 publish_snapshot(&daemon, &snapshot_tx).await?;
             }
             _ = tokio::signal::ctrl_c() => break,
@@ -803,14 +809,149 @@ async fn start_capture(directory: &Path) -> (Option<CaptureHandle>, Option<Strin
     }
 }
 
-async fn capture_changed(capture: &mut Option<CaptureHandle>) -> bool {
+async fn capture_event(
+    capture: &mut Option<CaptureHandle>,
+) -> Result<CaptureEvent, gunda_capture::CaptureError> {
     match capture {
-        Some(handle) => handle.changed().await.is_ok(),
+        Some(handle) => handle.next_event().await,
         None => std::future::pending().await,
     }
 }
 
 impl Daemon {
+    async fn handle_capture_event(
+        &mut self,
+        event: Result<CaptureEvent, gunda_capture::CaptureError>,
+    ) {
+        match event {
+            Ok(CaptureEvent::Changed) => {}
+            Ok(CaptureEvent::FormatsRequested { candidate, reply }) => {
+                let formats = self.formats_for_candidate(&candidate).await;
+                let _ = reply.send(formats);
+            }
+            Ok(CaptureEvent::DownloadRequested {
+                candidate,
+                format,
+                reply,
+            }) => {
+                let Some(directory) = self
+                    .last_download_directory
+                    .clone()
+                    .or_else(default_download_directory)
+                else {
+                    self.notice =
+                        Some("Choose a download folder before using the page button.".into());
+                    let _ = reply.send(Err(Refusal::CaptureUnavailable));
+                    return;
+                };
+                let Ok(directory) = NativePath::from_path(&directory) else {
+                    self.notice = Some("The download folder is invalid.".into());
+                    let _ = reply.send(Err(Refusal::CaptureUnavailable));
+                    return;
+                };
+                let choice = capture_choice(&candidate, format.as_deref());
+                let result = match choice {
+                    Ok(choice) => {
+                        let selected_url = choice
+                            .as_ref()
+                            .and_then(|choice| Url::parse(&choice.url).ok())
+                            .unwrap_or_else(|| candidate.url().clone());
+                        let already_active = self.manager.jobs().iter().any(|job| {
+                            job.request().url() == &selected_url
+                                && matches!(
+                                    job.state(),
+                                    DownloadState::Queued | DownloadState::Downloading
+                                )
+                        });
+                        if already_active {
+                            Ok(candidate.id())
+                        } else {
+                            self.download_capture(candidate.id(), directory, choice)
+                                .await
+                                .map(|_| candidate.id())
+                                .map_err(|message| {
+                                    self.notice = Some(message);
+                                    Refusal::CaptureUnavailable
+                                })
+                        }
+                    }
+                    Err(message) => {
+                        self.notice = Some(message);
+                        Err(Refusal::CaptureUnavailable)
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            Err(_) => self.handle_capture_change(false),
+        }
+    }
+
+    async fn formats_for_candidate(
+        &self,
+        candidate: &Candidate,
+    ) -> Result<FormatsResponse, Refusal> {
+        let formats = if !candidate.variants().is_empty() {
+            candidate
+                .variants()
+                .iter()
+                .enumerate()
+                .map(|(index, variant)| {
+                    let view = capture_variant_view(variant);
+                    MediaFormat {
+                        label: view.label,
+                        details: view.details,
+                        format: format!("variant:{index}"),
+                    }
+                })
+                .collect()
+        } else if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+            let request = RequestContext::new(candidate.url().clone(), Vec::new());
+            let presentation = self
+                .engines
+                .stream
+                .inspect(&request)
+                .await
+                .map_err(|_| Refusal::CaptureUnavailable)?;
+            presentation
+                .tracks()
+                .iter()
+                .enumerate()
+                .map(|(index, track)| {
+                    let mut details = vec![track_kind_name(track.kind()).to_owned()];
+                    if let Some(codecs) = track.codecs() {
+                        details.push(codecs.to_owned());
+                    }
+                    if let Some(bytes) = track.size().bytes() {
+                        details.push(format_size(bytes));
+                    }
+                    MediaFormat {
+                        label: track.label().to_owned(),
+                        details: details.join(" | "),
+                        format: track.selection().map_or_else(
+                            || format!("track:{index}"),
+                            |selection| format!("selection:{}", selection.as_str()),
+                        ),
+                    }
+                })
+                .collect()
+        } else {
+            vec![MediaFormat {
+                label: candidate.page_title().unwrap_or("Original file").to_owned(),
+                details: candidate.content_type().unwrap_or("media").to_owned(),
+                format: String::from("best"),
+            }]
+        };
+
+        if formats.is_empty() {
+            Err(Refusal::CaptureUnavailable)
+        } else {
+            Ok(FormatsResponse {
+                capture_id: candidate.id(),
+                formats,
+            })
+        }
+    }
+
     fn handle_capture_change(&mut self, running: bool) {
         if running {
             return;
@@ -821,6 +962,11 @@ impl Daemon {
         self.capture_tracks = None;
         self.inspection_sequence = self.inspection_sequence.saturating_add(1);
     }
+}
+
+fn default_download_directory() -> Option<PathBuf> {
+    directories::UserDirs::new()
+        .and_then(|directories| directories.download_dir().map(Path::to_path_buf))
 }
 
 async fn publish_snapshot(
@@ -1005,6 +1151,12 @@ fn content_type_extension(content_type: &str) -> Option<&'static str> {
         "video/mp4" => Some("mp4"),
         "video/webm" => Some("webm"),
         "video/quicktime" => Some("mov"),
+        "video/x-flv" | "video/flv" => Some("flv"),
+        "video/x-msvideo" | "video/avi" => Some("avi"),
+        "video/x-ms-wmv" | "video/wmv" => Some("wmv"),
+        "video/mpeg" => Some("mpg"),
+        "video/3gpp" => Some("3gp"),
+        "video/ogg" => Some("ogv"),
         "audio/mp4" | "audio/x-m4a" => Some("m4a"),
         "audio/mpeg" => Some("mp3"),
         "audio/aac" => Some("aac"),
@@ -1065,6 +1217,45 @@ fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
         filename: None,
         selection: None,
     }
+}
+
+fn capture_choice(
+    candidate: &Candidate,
+    format: Option<&str>,
+) -> Result<Option<CaptureTrackChoice>, String> {
+    let Some(format) = format.filter(|format| !format.is_empty() && *format != "best") else {
+        return Ok(None);
+    };
+
+    if let Some(index) = format.strip_prefix("variant:") {
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| "That capture format is invalid.".to_string())?;
+        let variant = candidate
+            .variants()
+            .get(index)
+            .ok_or_else(|| "That capture format is no longer available.".to_string())?;
+
+        return Ok(Some(CaptureTrackChoice {
+            url: variant.url().as_str().to_owned(),
+            filename: None,
+            selection: None,
+        }));
+    }
+
+    if let Some(selection) = format.strip_prefix("selection:") {
+        return Ok(Some(CaptureTrackChoice {
+            url: candidate.url().as_str().to_owned(),
+            filename: None,
+            selection: Some(selection.to_owned()),
+        }));
+    }
+
+    if format.starts_with("track:") {
+        return Ok(None);
+    }
+
+    Err("That capture format is invalid.".into())
 }
 
 fn capture_track_view(track: &PresentationTrack) -> CaptureTrackView {
