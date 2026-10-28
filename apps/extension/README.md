@@ -1,6 +1,9 @@
 # Gunda Capture (browser extension)
 
-Reports the media a page plays to the Gunda daemon over a loopback WebSocket.
+Download files with Gunda over a loopback WebSocket. The current build detects
+media resources; capturing arbitrary file downloads is tracked in
+[#39](https://github.com/AghastyGD/gunda/issues/39).
+
 This is the browser half of the capture channel documented in
 [`docs/design/media-capture.md`](../../docs/design/media-capture.md); the daemon
 half is the `gunda-capture` crate.

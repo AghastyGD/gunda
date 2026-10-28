@@ -7,6 +7,10 @@ const manifest = JSON.parse(
   readFileSync(new URL('../src/manifest.json', import.meta.url), 'utf8'),
 );
 
+test('manifest describes file downloads rather than media only', () => {
+  assert.equal(manifest.description, 'Download files with Gunda.');
+});
+
 test('manifest declares automatic native pairing', () => {
   assert.ok(manifest.permissions.includes('nativeMessaging'));
   assert.ok(!manifest.permissions.includes('scripting'));
