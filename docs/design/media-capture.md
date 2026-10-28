@@ -53,21 +53,44 @@ The pipeline has these responsibilities:
 
 The packaged extension prefers a native-messaging host named
 `com.gunda.capture`. The desktop registers the host for detected Chromium
-browsers on Linux, and the host returns the current daemon endpoint and capture
-token.
+browsers on Linux. `gundad` publishes its active WebSocket endpoint in
+`capture.endpoint`, and the host returns that endpoint with the separate
+`capture-token`. These values are distinct from the daemon IPC endpoint and
+`gundad-token`.
 Manual endpoint and token entry remains available when native messaging cannot
 be registered.
-- **A native overlay, if the UI is one.** A window drawn over a video cannot
-  receive DOM input, so the content script has to report the element's
-  rectangle, device-pixel ratio, visibility and clipped ancestor box, the
-  window's inner size, and mirror mouse, keyboard, scroll, resize and blur
-  events.
+- **A Shadow DOM player control.** The content script places a small download
+  control over each visible video. It follows the element through scrolling and
+  resizing without changing the page's own DOM or styles. Activating it asks the
+  page agent to refresh media detection, lists the formats of the newest
+  captured presentation for that exact page, and opens a start window for the
+  selected format.
 
-The page-response agent also reads bounded JSON from Instagram and Facebook.
-Instagram `video_versions` and `video_url` fields identify progressive MP4
-files. Facebook `browser_native_*_url` and `progressive_urls` fields provide the
-same fallback. Partial responses and range-addressed URLs are not accepted as
-standalone files.
+The page-response agent scans bounded JSON from any site for media hints and
+forwards the source to the daemon. `gunda-capture::extractor` has dedicated
+Instagram, Facebook, and YouTube interpretation plus a generic extractor for
+common stream, progressive, manifest, and nested media fields. Unknown sites
+also fall back to complete media URLs found anywhere in the bounded JSON. The
+extension does not choose a quality. It sends the source document, and the
+daemon validates, deduplicates, and ranks the complete presentation. The
+YouTube page agent also reads the bounded initial player response exposed by
+the player.
+
+Instagram capture recognises GraphQL, media-info, route-definition, and
+`__a=1` response routes. Extracted records may carry `shortcode_media`,
+`carousel_media`, `video_versions`, `video_url`, caption metadata, and
+`video_dash_manifest`. Response recursion handles nested sidecars and media
+edges without assuming one fixed JSON path.
+
+The page agent is registered as a `MAIN`-world content script at
+`document_start` on every HTTP page. It patches `fetch` and XHR before site
+application code starts, including XHR responses whose `responseType` is
+`json`. Resource timing supplies a fallback for complete progressive media URLs
+that a player has already loaded.
+
+Partial responses and range-addressed URLs are not accepted as standalone
+files. Raw source JSON is held in memory only and is not added to the candidate
+catalog or download record.
 
 ### Engine requirements
 
@@ -80,11 +103,10 @@ them in-process without an external tool or subprocess.
 1. **The browser side pushes to a local listener.** `gundad` listens on
    loopback and the extension delivers detected media candidates to it. The
    daemon decides what a candidate becomes.
-2. **Detection keys off MIME type, not URL shape.** The manifest types Gunda
-   recognises (`application/vnd.apple.mpegurl`, `application/dash+xml`,
+2. **Generic detection keys off MIME type, not URL shape.** The manifest types
+   Gunda recognises (`application/vnd.apple.mpegurl`, `application/dash+xml`,
    `application/vnd.yt-ump`, `application/octet-stream-m3u8`, and similar
-   manifest types) are what make detection work across sites without per-site
-   code.
+   manifest types) cover most sites without a site adapter.
 3. **Correlation by request tagging.** The extension marks requests it can see
    so a detected element can be tied to the response that carries it.
 4. **Segmented download is part of the engine, not a parallel lifecycle.** It
@@ -95,9 +117,12 @@ them in-process without an external tool or subprocess.
 
 Design choices:
 
-- **No per-site player adapters.** Site-specific selectors require ongoing
-  maintenance and break whenever a player changes. Gunda relies on
-  manifest MIME detection and the reported `<video>`/MSE sources instead.
+- **No per-site player DOM adapters.** Player selectors require ongoing
+  maintenance and break whenever a player changes. Gunda relies on manifest
+  MIME detection and the reported `<video>`/MSE sources instead. A small set of
+  JSON source extractors handles sites that publish complete media URLs only in
+  application data. These extractors produce normalized variants, not download
+  policy.
 - **JSON over WebSocket, not a bespoke binary framing.** There is no legacy
   client to stay compatible with, and a self-describing protocol is easier to
   audit.
@@ -164,12 +189,20 @@ Implemented components:
   `EXT-X-STREAM-INF` variant, each with the rendition the presentation pairs
   with it, plus each `TYPE=AUDIO` rendition that has a playlist of its own. A
   variant whose sound is a separate rendition is therefore still offered at
-  every quality: its reported size and duration combine both halves, and the
-  download carries a selector rather than the variant's own playlist URL. For
-  DASH it describes every representation of the chosen video adaptation set
-  with the default audio representation, plus audio-only tracks. Describing an
-  HLS variant costs one request for its playlist, so the number described is
-  capped (`MAX_DESCRIBED_VARIANTS`).
+  every quality, and the download carries a selector rather than the variant's
+  own playlist URL. HLS quality discovery reads the master playlist once and
+  does not fetch each variant before showing the picker. Size, duration, and
+  container are resolved when the selected download is prepared. Video qualities
+  that share an audio rendition carry that rendition as their group heading, so
+  each language appears once followed by its resolutions. For DASH it
+  describes every representation of the chosen video adaptation set with the
+  default audio representation, plus audio-only tracks. The number of
+  qualities returned is capped (`MAX_DESCRIBED_VARIANTS`).
+
+When segment metadata cannot produce an exact total, the stream executor uses
+the selected representation's declared bandwidth and duration as a size
+estimate. The visible total is replaced by measured progress and finalized with
+the published byte count when the transfer completes.
 
 Naming and size rules:
 
@@ -261,18 +294,29 @@ payloads are capped, and the reserved bits must be clear.
 ### Protocol
 
 JSON objects tagged with a `kind` (`serde` internally tagged enums), versioned by
-the greeting, limited to `MAX_MESSAGE_BYTES` (256 KiB).
+the greeting, limited to `MAX_MESSAGE_BYTES` (2 MiB).
 
 | Extension to desktop | Payload |
 | --- | --- |
 | `hello` | `version`, `token`, `agent`; the first message on every connection |
 | `candidate` | `url`, `content_type?`, `page_url`, `page_title?` |
+| `source` | `source_url`, `page_url`, `page_title?`, `document`; a bounded JSON response for daemon extraction |
+| `list_formats` | `page_url`; list formats for the player control |
+| `download_page` | `page_url`, `capture_id?`, `format?`, `directory?`, `filename?`; queue the selected format |
+| `download_status` | `id`; read progress of a browser-created download |
 
 | Desktop to extension | Meaning |
 | --- | --- |
 | `ready` | the greeting was accepted; `version` is the desktop's protocol version |
 | `accepted` | the report is now a candidate, with its `id` |
 | `duplicate` | the report matched a candidate already known, with its `id` |
+| `recorded` | one source produced one or more accepted or duplicate candidate IDs |
+| `download_queued` | the daemon accepted the page download and the job is being created |
+| `download_unavailable` | the page download could not be queued |
+| `download_status` | filename, state, written bytes, total bytes, and failure state |
+| `download_status_unavailable` | the download status could not be read |
+| `page_formats` | the capture ID, its formats, and the suggested folder and filename |
+| `formats_unavailable` | formats could not be listed |
 | `refused` | a stable `reason` (below) |
 | `malformed` | the message could not be read at all |
 
@@ -287,6 +331,10 @@ Refusal reasons, as sent on the wire:
 | `unsupported_url` | not an absolute `http`/`https` URL, or a page URL that cannot be a base |
 | `unsupported_media` | not media this build recognises |
 | `segment_stream` | one segment of a segmented stream (`video/mp2t`, `.ts`, `.m4s`), not a stream |
+| `unsupported_source` | no extractor is available for the page that supplied a source |
+| `no_capture` | no captured presentation matches the requested page or capture |
+| `no_download` | the browser window asked for a download that does not exist |
+| `capture_unavailable` | the daemon could not accept the page download request |
 | `unsupported_version` | the extension speaks a newer protocol |
 
 ### The candidate model
@@ -300,6 +348,8 @@ resource is refused at the boundary instead of failing later in the engine:
   (`hls`, `dash`, `file`, else refused);
 - `video/mp2t` and `.ts`/`.m4s` paths are refused as segments: the manifest is
   the resource worth downloading, and reporting every segment would bury it;
+- extracted progressive qualities are attached to one candidate, with the best
+  variant used as its default URL;
 - page titles are stripped of control characters and bounded.
 
 The catalog holds the newest 256 candidates, newest first, and evicts the oldest
@@ -336,7 +386,9 @@ session cookie is out of scope until there is a deliberate place to keep one.
 
 | Limit | Value | Where |
 | --- | --- | --- |
-| message size | 256 KiB | `protocol::MAX_MESSAGE_BYTES`, `websocket::MAX_MESSAGE_BYTES` |
+| message size | 2 MiB | `protocol::MAX_MESSAGE_BYTES`, `websocket::MAX_MESSAGE_BYTES` |
+| page JSON body | 1.5 MiB | `apps/extension/src/page.ts` |
+| serialized source message | 1.75 MiB | `apps/extension/src/background.ts` |
 | handshake size | 16 KiB | `websocket` |
 | open connections | 8 | `server::MAX_CONNECTIONS` |
 | time to handshake, time to greet | 10 s each | `server::GREETING_DEADLINE` |
@@ -437,11 +489,11 @@ Implemented:
 2. HTTP byte ranges: `HttpClient::open_byte_range`, and the shared validated
    name (`url_filename`) the stream engine names its output with.
 3. `crates/gunda-capture`: the loopback listener, the RFC 6455 subset, the
-   versioned JSON protocol, the pairing token, and the candidate catalog with
-   deduplication.
-4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, reads
-   bounded page JSON for progressive media, and reports candidates, with an
-   options page for pairing.
+   versioned JSON protocol, the pairing token, the bounded source extractor, and
+   the candidate catalog with deduplication.
+4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, forwards
+   bounded Instagram, Facebook, and YouTube source JSON, and reports direct
+   media candidates, with an options page for pairing.
 5. Daemon and desktop wiring: `gundad` owns capture and quality inspection, and
    the desktop panel shows pairing, candidates, per-candidate download and
    dismiss actions, and the quality picker.
@@ -462,6 +514,22 @@ Implemented:
    persist the plan fingerprint and each track's next resource and durable byte
    count. Pause keeps staging, cancels and restarts remove it, and resumed
    downloads truncate any bytes beyond the last checkpoint before continuing.
+10. **Daemon-side source extraction:** Instagram, Facebook, and YouTube JSON
+    produce validated presentations. Progressive variants are grouped on one
+    candidate and the existing quality picker can download the selected
+    variant.
+11. **Player download control:** a Shadow DOM button follows each visible video.
+    It refreshes page detection, lists the formats of the newest captured
+    presentation, and opens the start window for the selected format without
+    requiring the desktop window. The last desktop-selected folder is reused;
+    the OS Downloads folder is the fallback.
+12. **Browser download window:** selecting a format opens an extension-hosted
+    setup window with filename, destination folder, format summary, Start, and
+    Cancel. The window reuses the exact capture whose formats were listed, so a
+    newer capture on the same page cannot replace that choice. The folder picker
+    uses the native-messaging host. Starting switches the same window to a
+    progress view with current state, bytes written, total size, failures, and
+    progress without opening the desktop.
 
 Planned:
 

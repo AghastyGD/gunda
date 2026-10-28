@@ -31,6 +31,10 @@ const formatRequests: {
   resolve: (response: FormatResponse) => void;
   timer: ReturnType<typeof setTimeout>;
 }[] = [];
+const statusRequests: {
+  resolve: (response: DownloadStatusResponse) => void;
+  timer: ReturnType<typeof setTimeout>;
+}[] = [];
 
 async function nativePairing(): Promise<PairingSettings | null> {
   return new Promise((resolve) => {
@@ -174,6 +178,10 @@ function connect(): void {
         clearTimeout(request.timer);
         request.resolve({ kind: 'unavailable', reason: 'connection_closed' });
       }
+      for (const request of statusRequests.splice(0)) {
+        clearTimeout(request.timer);
+        request.resolve({ kind: 'unavailable', reason: 'connection_closed' });
+      }
       void setStatus({ state: 'closed' });
       scheduleReconnect();
     });
@@ -244,10 +252,18 @@ function handle(message: unknown): void {
         kind: 'formats',
         capture_id: server.capture_id,
         formats: server.formats,
+        directory: server.directory,
+        filename: server.filename,
       });
       break;
     case 'formats_unavailable':
       finishFormatRequest({ kind: 'unavailable', reason: server.reason });
+      break;
+    case 'download_status':
+      finishStatusRequest({ kind: 'status', status: server.status });
+      break;
+    case 'download_status_unavailable':
+      finishStatusRequest({ kind: 'unavailable', reason: server.reason });
       break;
     case 'refused':
       void count('refused');
@@ -339,6 +355,14 @@ function finishFormatRequest(response: FormatResponse): void {
   }
 }
 
+function finishStatusRequest(response: DownloadStatusResponse): void {
+  const request = statusRequests.shift();
+  if (request) {
+    clearTimeout(request.timer);
+    request.resolve(response);
+  }
+}
+
 async function waitForCaptureConnection(): Promise<boolean> {
   connect();
   const deadline = Date.now() + 6000;
@@ -375,7 +399,10 @@ async function requestPageFormats(pageUrl: string): Promise<FormatResponse> {
 
 async function requestPageDownload(
   pageUrl: string,
+  captureId: number,
   format?: string,
+  directory?: string,
+  filename?: string,
 ): Promise<DownloadResponse> {
   if (!(await waitForCaptureConnection())) {
     return { kind: 'unavailable', reason: 'connection_unavailable' };
@@ -390,7 +417,89 @@ async function requestPageDownload(
       resolve({ kind: 'unavailable', reason: 'timeout' });
     }, 6000);
     downloadRequests.push({ resolve, timer });
-    connection?.send(JSON.stringify({ kind: 'download_page', page_url: pageUrl, format }));
+    connection?.send(
+      JSON.stringify({
+        kind: 'download_page',
+        page_url: pageUrl,
+        capture_id: captureId,
+        format,
+        directory,
+        filename,
+      }),
+    );
+  });
+}
+
+async function chooseDownloadFolder(): Promise<{ path?: string; error?: string }> {
+  try {
+    const response = (await chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, {
+      kind: 'choose_directory',
+      version: NATIVE_HOST_PROTOCOL_VERSION,
+    })) as { kind?: string; path?: string; message?: string };
+    if (response.kind === 'directory' && typeof response.path === 'string') {
+      return { path: response.path };
+    }
+    return {
+      error: response.message || 'The folder picker did not return a folder.',
+    };
+  } catch {
+    return { error: 'The native folder picker is unavailable.' };
+  }
+}
+
+function openDownloadWindow(
+  pageUrl: string,
+  pageTitle: string | undefined,
+  message: Extract<RuntimeMessage, { kind: 'open-download' }>,
+): void {
+  const url = new URL(chrome.runtime.getURL('download.html'));
+  url.searchParams.set('page_url', pageUrl);
+  url.searchParams.set('capture_id', String(message.capture_id));
+  url.searchParams.set('format', message.format);
+  url.searchParams.set('label', message.label);
+  url.searchParams.set('details', message.details);
+  if (message.directory) {
+    url.searchParams.set('directory', message.directory);
+  }
+  url.searchParams.set(
+    'filename',
+    message.filename ?? titleFilename(pageTitle ?? '', 'mp4'),
+  );
+  void chrome.windows.create({
+    url: url.href,
+    type: 'popup',
+    width: 520,
+    height: 340,
+  });
+}
+
+function titleFilename(title: string, extension: string): string {
+  const cleaned = title
+    .replace(/\s*-\s*YouTube\s*$/i, '')
+    .replace(/\s*\|\s*(Instagram|Facebook)\s*$/i, '')
+    .replace(/[~/\\?%*:|"<>\u0000-\u001f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  const name = cleaned || 'download';
+  return /\.[a-z0-9]{2,5}$/i.test(name) ? name : `${name}.${extension}`;
+}
+
+async function requestDownloadStatus(id: number): Promise<DownloadStatusResponse> {
+  if (!(await waitForCaptureConnection())) {
+    return { kind: 'unavailable', reason: 'connection_unavailable' };
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const index = statusRequests.findIndex((request) => request.resolve === resolve);
+      if (index >= 0) {
+        statusRequests.splice(index, 1);
+      }
+      resolve({ kind: 'unavailable', reason: 'timeout' });
+    }, 5000);
+    statusRequests.push({ resolve, timer });
+    connection?.send(JSON.stringify({ kind: 'download_status', id }));
   });
 }
 
@@ -452,7 +561,10 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
   }
   return message.kind === 'reconnect' ||
     message.kind === 'list-formats' ||
-    message.kind === 'download-page'
+    message.kind === 'download-status' ||
+    message.kind === 'open-download' ||
+    message.kind === 'choose-folder' ||
+    message.kind === 'start-download'
     ? message
     : null;
 }
@@ -503,19 +615,41 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
     return;
   }
 
-  if (message.kind === 'download-page') {
-    if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
-      return;
-    }
-    void requestPageDownload(sender.tab.url, message.format).then(sendResponse);
-    return true;
-  }
-
   if (message.kind === 'list-formats') {
     if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
       return;
     }
     void requestPageFormats(sender.tab.url).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'download-status') {
+    void requestDownloadStatus(message.id).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'open-download') {
+    if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
+      return;
+    }
+    openDownloadWindow(sender.tab.url, sender.tab.title, message);
+    sendResponse({ opened: true });
+    return;
+  }
+
+  if (message.kind === 'choose-folder') {
+    void chooseDownloadFolder().then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'start-download') {
+    void requestPageDownload(
+      message.page_url,
+      message.capture_id,
+      message.format,
+      message.directory,
+      message.filename,
+    ).then(sendResponse);
     return true;
   }
 

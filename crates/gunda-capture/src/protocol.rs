@@ -28,8 +28,22 @@ pub use crate::websocket::MAX_MESSAGE_BYTES;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaFormat {
     pub label: String,
+    /// Heading that groups qualities sharing the same audio rendition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub details: String,
     pub format: String,
+}
+
+/// Live state of a browser-created download.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureDownloadStatus {
+    pub id: u64,
+    pub name: String,
+    pub state: String,
+    pub written: u64,
+    pub total: Option<u64>,
+    pub failure: Option<String>,
 }
 
 /// Why a report was not turned into a candidate.
@@ -49,6 +63,8 @@ pub enum Refusal {
     UnsupportedSource,
     /// The page has no captured presentation to download.
     NoCapture,
+    /// The requested daemon download does not exist.
+    NoDownload,
     /// The daemon is not ready to accept the requested download.
     CaptureUnavailable,
     /// The extension speaks a protocol this build does not.
@@ -63,6 +79,7 @@ impl fmt::Display for Refusal {
             Self::SegmentStream => "the report is a stream segment, not a stream",
             Self::UnsupportedSource => "the page source is not supported",
             Self::NoCapture => "the page has no captured media",
+            Self::NoDownload => "the download does not exist",
             Self::CaptureUnavailable => "the capture service is unavailable",
             Self::UnsupportedVersion => "the extension speaks a newer protocol",
         };
@@ -112,19 +129,34 @@ pub enum ClientMessage {
         document: Value,
     },
 
-    /// Queues the newest captured presentation for one page.
+    /// Queues a captured presentation for one page.
     DownloadPage {
         /// The page whose media should be downloaded.
         page_url: String,
+        /// The exact capture chosen by the format list, when known.
+        #[serde(default)]
+        capture_id: Option<u64>,
         /// The selected format from [`ServerMessage::PageFormats`].
         #[serde(default)]
         format: Option<String>,
+        /// Destination folder chosen in the browser download window.
+        #[serde(default)]
+        directory: Option<String>,
+        /// Preferred output filename chosen in the browser download window.
+        #[serde(default)]
+        filename: Option<String>,
     },
 
     /// Lists the formats captured for one page.
     ListFormats {
         /// The page whose formats should be listed.
         page_url: String,
+    },
+
+    /// Reads the progress of a browser-created download.
+    DownloadStatus {
+        /// Daemon download identifier.
+        id: u64,
     },
 }
 
@@ -158,11 +190,17 @@ pub enum ServerMessage {
     PageFormats {
         capture_id: u64,
         formats: Vec<MediaFormat>,
+        directory: Option<String>,
+        filename: Option<String>,
     },
     /// Formats could not be listed for the requested page.
     FormatsUnavailable { reason: Refusal },
     /// A requested page download could not be queued.
     DownloadUnavailable { reason: Refusal },
+    /// Current progress of a browser-created download.
+    DownloadStatus { status: CaptureDownloadStatus },
+    /// The requested download status could not be read.
+    DownloadStatusUnavailable { reason: Refusal },
     /// The report was refused, with a stable reason.
     Refused {
         /// Why the report was refused.
@@ -289,7 +327,29 @@ mod tests {
             message,
             ClientMessage::DownloadPage {
                 page_url: "https://www.instagram.com/reels/example/".into(),
+                capture_id: None,
                 format: None,
+                directory: None,
+                filename: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_page_download_for_an_exact_capture() {
+        let message = parse_client_message(
+            r#"{"kind":"download_page","page_url":"https://example.com/watch","capture_id":7,"format":"best"}"#,
+        )
+        .expect("the request is valid");
+
+        assert_eq!(
+            message,
+            ClientMessage::DownloadPage {
+                page_url: "https://example.com/watch".into(),
+                capture_id: Some(7),
+                format: Some("best".into()),
+                directory: None,
+                filename: None,
             }
         );
     }
@@ -307,6 +367,14 @@ mod tests {
                 page_url: "https://www.instagram.com/reels/example/".into(),
             }
         );
+    }
+
+    #[test]
+    fn parses_a_download_status_request() {
+        let message =
+            parse_client_message(r#"{"kind":"download_status","id":42}"#).expect("valid status");
+
+        assert_eq!(message, ClientMessage::DownloadStatus { id: 42 });
     }
 
     #[test]

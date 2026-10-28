@@ -83,8 +83,9 @@ the jobs visible to every connected client.
 ### `gundad`
 
 Owns the runtime lease, SQLite repository, download manager, capture listener,
-candidate catalog, protocol engines, and bounded scheduler. It executes transfers
-and records browser discoveries independently of the desktop window.
+bounded browser source extractors, candidate catalog, protocol engines, and
+scheduler. It executes transfers and records browser discoveries independently
+of the desktop window.
 
 ## Dependency direction
 

@@ -248,7 +248,7 @@ async fn daemon_downloads_a_selected_progressive_source_variant() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn player_button_queues_the_best_capture_with_the_last_folder() {
+async fn player_button_starts_a_named_download_and_reports_its_status() {
     let directory = tempdir().unwrap();
     let (address, server) = file_server(b"from the player button").await;
     let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
@@ -281,45 +281,37 @@ async fn player_button_queues_the_best_capture_with_the_last_folder() {
             .contains(r#""kind":"accepted""#)
     );
 
-    let captured = wait_for_capture(&mut client).await;
-    let capture_id = captured.captures[0].id;
-    client
-        .send(&ClientMessage::Command {
-            command: Command::DownloadCapture {
-                id: capture_id,
-                directory: NativePath::from_path(directory.path()).unwrap(),
-                track: Some(CaptureTrackChoice {
-                    url: "http://127.0.0.1:1/unreachable.mp4".into(),
-                    filename: None,
-                    selection: None,
-                }),
-            },
-        })
-        .await
-        .unwrap();
-
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match client.receive::<ServerMessage>().await.unwrap() {
-                ServerMessage::Snapshot { snapshot } if !snapshot.jobs.is_empty() => break,
-                ServerMessage::Snapshot { .. } => {}
-                ServerMessage::Error { message } => panic!("daemon error: {message}"),
-            }
-        }
-    })
-    .await
-    .expect("the folder-setting job is visible");
-
+    wait_for_capture(&mut client).await;
     extension
-        .send(r#"{"kind":"download_page","page_url":"https://example.test/watch"}"#)
+        .send(r#"{"kind":"list_formats","page_url":"https://example.test/watch"}"#)
         .await;
-    assert!(
-        extension
-            .receive()
-            .await
-            .unwrap()
-            .contains(r#""kind":"download_queued""#)
+    let formats = extension.receive().await.unwrap();
+    let capture_id = formats
+        .split(r#""capture_id":"#)
+        .nth(1)
+        .and_then(|value| value.split([',', '}']).next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .expect("the formats response names the capture");
+    let download = format!(
+        r#"{{"kind":"download_page","page_url":"https://example.test/watch","capture_id":{capture_id},"directory":"{}","filename":"Chosen name.mp4"}}"#,
+        directory.path().display()
     );
+    extension.send(&download).await;
+    let queued = extension.receive().await.unwrap();
+    assert!(queued.contains(r#""kind":"download_queued""#));
+    let download_id = queued
+        .split(r#""id":"#)
+        .nth(1)
+        .and_then(|value| value.trim_end_matches('}').parse::<u64>().ok())
+        .expect("the queued response names the download");
+    extension
+        .send(&format!(
+            r#"{{"kind":"download_status","id":{download_id}}}"#
+        ))
+        .await;
+    let status = extension.receive().await.unwrap();
+    assert!(status.contains(r#""kind":"download_status""#));
+    assert!(status.contains(r#""name":"Chosen name.mp4""#));
 
     let completed = wait_for_completed(&mut client).await;
     let output = completed

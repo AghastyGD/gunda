@@ -208,6 +208,7 @@ pub struct StreamPreparedTransfer {
     headers: Vec<RequestHeader>,
     content_type: Option<String>,
     total_bytes: Option<u64>,
+    total_is_estimated: bool,
     destination: DownloadDestination,
     planned_destination: ResolvedDestination,
     resume_store: Option<Arc<dyn ResumePersistence>>,
@@ -273,10 +274,17 @@ impl DownloadExecutor for StreamExecutor {
 
         // What the media is and how large it will be are both judgements about
         // the bytes, not about the manifest, and neither depends on the other.
-        let (container, total_bytes) = tokio::join!(
+        let (container, measured_bytes) = tokio::join!(
             self.container(&request, &plan),
             self.measure(&request, &plan)
         );
+        let (total_bytes, total_is_estimated) = match measured_bytes {
+            Some(total) => (Some(total), false),
+            None => match plan.estimated_total_bytes() {
+                Some(total) => (Some(total), true),
+                None => (None, false),
+            },
+        };
 
         // A presentation whose tracks are fetched apart is published as the
         // one file they are muxed into, not as whichever track happened to be
@@ -319,14 +327,17 @@ impl DownloadExecutor for StreamExecutor {
                         })?,
                 };
 
-                if let (Some(saved), Some(now)) = (progress.total_bytes(), total_bytes)
+                if !total_is_estimated
+                    && let (Some(saved), Some(now)) = (progress.total_bytes(), total_bytes)
                     && saved != now
                 {
                     return Err(recovery_integrity(
                         "saved download size does not match the segmented media",
                     ));
                 }
-                if total_bytes.is_some_and(|total| state.starting_bytes() > total) {
+                if !total_is_estimated
+                    && total_bytes.is_some_and(|total| state.starting_bytes() > total)
+                {
                     return Err(recovery_integrity(
                         "saved progress exceeds the segmented media size",
                     ));
@@ -345,6 +356,7 @@ impl DownloadExecutor for StreamExecutor {
             headers: request.headers().to_vec(),
             content_type,
             total_bytes,
+            total_is_estimated,
             destination,
             planned_destination,
             resume_store: self.resume_store.clone(),
@@ -377,8 +389,16 @@ impl StreamExecutor {
         match plan_hls_selected(&base, &playlist, request.selection()).map_err(manifest_failure)? {
             // The entry point was already a media playlist.
             HlsOutcome::Ready(plan) => Ok((plan, content_type)),
-            HlsOutcome::FetchVariant { url, audio, .. } => {
-                let video = self.fetch_media_playlist(&url, &base, request, 0).await?;
+            HlsOutcome::FetchVariant {
+                url,
+                audio,
+                bandwidth,
+                declared_total,
+                ..
+            } => {
+                let video = self
+                    .fetch_media_playlist(&url, &base, request, 0, bandwidth, declared_total)
+                    .await?;
 
                 // A variant that names audio renditions carries no audio of its
                 // own, so the rendition the master points at is part of the
@@ -387,7 +407,9 @@ impl StreamExecutor {
                     return Ok((video, content_type));
                 };
 
-                let track = self.fetch_media_playlist(&audio, &base, request, 1).await?;
+                let track = self
+                    .fetch_media_playlist(&audio, &base, request, 1, None, None)
+                    .await?;
 
                 Ok((
                     video.with_audio(track).map_err(manifest_failure)?,
@@ -404,6 +426,8 @@ impl StreamExecutor {
         base: &Url,
         request: &RequestContext,
         track: u8,
+        bandwidth: Option<u64>,
+        declared_total: Option<u64>,
     ) -> Result<TrackPlan, DownloadFailure> {
         let playlist_request = segment_request(url, base, request.headers());
         let (bytes, _) = open_manifest(&self.client, &playlist_request).await?;
@@ -411,7 +435,10 @@ impl StreamExecutor {
         let playlist = hls::parse(text).map_err(manifest_failure)?;
 
         match plan_hls(url, &playlist).map_err(manifest_failure)? {
-            HlsOutcome::Ready(plan) => Ok(plan.retracked(track)),
+            HlsOutcome::Ready(plan) => Ok(plan
+                .retracked(track)
+                .with_bandwidth(bandwidth)
+                .with_declared_total(declared_total)),
             HlsOutcome::FetchVariant { .. } => Err(DownloadFailure::new(
                 FailureKind::UnsupportedResource,
                 "nested master playlists are not supported",
@@ -613,6 +640,10 @@ impl PreparedTransfer for StreamPreparedTransfer {
         self.total_bytes
     }
 
+    fn total_bytes_is_estimated(&self) -> bool {
+        self.total_is_estimated
+    }
+
     fn starting_bytes(&self) -> u64 {
         self.resume
             .as_ref()
@@ -621,6 +652,10 @@ impl PreparedTransfer for StreamPreparedTransfer {
 
     fn supports_pause(&self) -> bool {
         self.resume.is_some()
+    }
+
+    fn stopped_progress_may_rewind(&self) -> bool {
+        true
     }
 
     fn planned_destination(&self) -> ResolvedDestination {

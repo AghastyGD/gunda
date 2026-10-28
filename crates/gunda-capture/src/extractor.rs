@@ -37,6 +37,7 @@ pub struct MediaVariant {
     width: Option<u32>,
     height: Option<u32>,
     bitrate: Option<u64>,
+    size: Option<u64>,
     codecs: Option<String>,
     label: Option<String>,
     rank: u8,
@@ -64,6 +65,11 @@ impl MediaVariant {
     #[must_use]
     pub const fn bitrate(&self) -> Option<u64> {
         self.bitrate
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> Option<u64> {
+        self.size
     }
 
     #[must_use]
@@ -342,10 +348,12 @@ impl<'a> Collector<'a> {
         }
 
         let mut variants = Vec::new();
-        if let Some(formats) = streaming.get("formats").and_then(Value::as_array) {
-            for format in formats {
-                if let Some(format) = format.as_object() {
-                    add_variant(&mut variants, format.get("url"), None, format);
+        for name in ["formats", "adaptiveFormats"] {
+            if let Some(formats) = streaming.get(name).and_then(Value::as_array) {
+                for format in formats {
+                    if let Some(format) = format.as_object() {
+                        add_variant(&mut variants, format.get("url"), None, format);
+                    }
                 }
             }
         }
@@ -515,7 +523,7 @@ impl PresentationBuilder {
                 url: manifest.url,
                 content_type: manifest.content_type,
                 title: self.title,
-                variants: Vec::new(),
+                variants: self.variants,
             });
         }
 
@@ -543,6 +551,7 @@ impl MediaVariant {
         self.width = other.width.or(self.width);
         self.height = other.height.or(self.height);
         self.bitrate = other.bitrate.or(self.bitrate);
+        self.size = other.size.or(self.size);
         self.codecs = other.codecs.or(self.codecs.take());
         self.label = other.label.or(self.label.take());
         self.rank = self.rank.max(other.rank);
@@ -605,6 +614,7 @@ fn media_variant(
         height: integer_field(metadata, &["height", "config_height"])
             .and_then(|value| u32::try_from(value).ok()),
         bitrate: integer_field(metadata, &["bitrate", "bit_rate", "bandwidth"]),
+        size: integer_field(metadata, &["contentLength", "filesize", "filesize_approx"]),
         codecs,
         label: string_field(metadata, &["quality_label", "quality"]),
         rank: 0,
@@ -626,6 +636,7 @@ fn media_url_variant(raw: &str) -> Option<MediaVariant> {
         width: None,
         height: None,
         bitrate: None,
+        size: None,
         codecs: None,
         label: None,
         rank: 0,
@@ -823,7 +834,7 @@ mod tests {
     use serde_json::json;
     use url::Url;
 
-    use super::extract;
+    use super::{MediaVariant, extract};
     fn page(value: &str) -> Url {
         Url::parse(value).expect("the page URL is valid")
     }
@@ -896,6 +907,14 @@ mod tests {
                 "hlsManifestUrl": "https://cdn.example/master.m3u8",
                 "formats": [
                     {"url": "https://cdn.example/video.mp4", "width": 1280, "height": 720}
+                ],
+                "adaptiveFormats": [
+                    {
+                        "url": "https://cdn.example/video-only.mp4",
+                        "width": 1920,
+                        "height": 1080,
+                        "contentLength": "345678"
+                    }
                 ]
             }
         });
@@ -913,7 +932,14 @@ mod tests {
             "https://cdn.example/master.m3u8"
         );
         assert_eq!(presentations[0].title(), Some("A film"));
-        assert!(presentations[0].variants().is_empty());
+        assert_eq!(
+            presentations[0]
+                .variants()
+                .iter()
+                .find(|variant| variant.resolution() == Some((1920, 1080)))
+                .and_then(MediaVariant::size),
+            Some(345_678)
+        );
     }
 
     #[test]

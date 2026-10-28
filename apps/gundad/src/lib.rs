@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gunda_capture::{
-    Candidate, CandidateId, CaptureEvent, CaptureHandle, CaptureServer, FormatsResponse,
-    MediaFormat, MediaVariant, PairingToken, Refusal, endpoint_path, load_or_create_token,
-    save_endpoint, token_path,
+    Candidate, CandidateId, CaptureDownloadStatus, CaptureEvent, CaptureHandle, CaptureServer,
+    FormatsResponse, MediaFormat, MediaVariant, PairingToken, Refusal, endpoint_path,
+    load_or_create_token, save_endpoint, token_path,
 };
 use gunda_core::application::{
     DownloadCancellation, DownloadExecutor, DownloadManager, DownloadManagerError, ExecutionOutput,
@@ -165,7 +165,10 @@ impl Daemon {
                 id,
                 directory,
                 track,
-            } => self.download_capture(id, directory, track).await,
+            } => self
+                .download_capture(id, directory, track)
+                .await
+                .map(|_| ()),
             Command::DismissCapture { id } => self.dismiss_capture(id).await,
             Command::ClearCaptures => self.clear_captures().await,
         }
@@ -410,7 +413,7 @@ impl Daemon {
         id: CandidateId,
         directory: NativePath,
         track: Option<CaptureTrackChoice>,
-    ) -> Result<(), String> {
+    ) -> Result<DownloadId, String> {
         let captured = self.captured(id)?;
         let directory = directory
             .to_path()
@@ -429,16 +432,19 @@ impl Daemon {
             None => (captured.url.clone(), None, None),
         };
         let extension = capture_extension(&captured, track_filename.as_deref());
-        let fallback_filename = track_filename.or_else(|| {
-            extension
-                .as_deref()
-                .map(|extension| format!("download.{extension}"))
-        });
-        let filename = captured
-            .page_title
-            .as_deref()
-            .and_then(|title| title_filename(title, extension.as_deref()))
-            .or(fallback_filename);
+        let filename = track_filename
+            .clone()
+            .or_else(|| {
+                captured
+                    .page_title
+                    .as_deref()
+                    .and_then(|title| title_filename(title, extension.as_deref()))
+            })
+            .or_else(|| {
+                extension
+                    .as_deref()
+                    .map(|extension| format!("download.{extension}"))
+            });
         let mut request = RequestContext::new(url, Vec::new());
         if let Some(selection) = selection {
             request = request.with_selection(selection);
@@ -459,7 +465,7 @@ impl Daemon {
         self.last_download_directory = Some(remembered_directory);
         self.capture_tracks = None;
         self.inspection_sequence = self.inspection_sequence.saturating_add(1);
-        Ok(())
+        Ok(id)
     }
 
     async fn dismiss_capture(&mut self, id: CandidateId) -> Result<(), String> {
@@ -832,11 +838,14 @@ impl Daemon {
             Ok(CaptureEvent::DownloadRequested {
                 candidate,
                 format,
+                directory,
+                filename,
                 reply,
             }) => {
-                let Some(directory) = self
-                    .last_download_directory
-                    .clone()
+                let Some(directory) = directory
+                    .filter(|directory| !directory.trim().is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| self.last_download_directory.clone())
                     .or_else(default_download_directory)
                 else {
                     self.notice =
@@ -849,30 +858,35 @@ impl Daemon {
                     let _ = reply.send(Err(Refusal::CaptureUnavailable));
                     return;
                 };
-                let choice = capture_choice(&candidate, format.as_deref());
+                let choice = capture_choice(&candidate, format.as_deref(), filename);
                 let result = match choice {
                     Ok(choice) => {
                         let selected_url = choice
                             .as_ref()
                             .and_then(|choice| Url::parse(&choice.url).ok())
                             .unwrap_or_else(|| candidate.url().clone());
-                        let already_active = self.manager.jobs().iter().any(|job| {
-                            job.request().url() == &selected_url
+                        let already_active = self.manager.jobs().into_iter().find_map(|job| {
+                            (job.request().url() == &selected_url
                                 && matches!(
                                     job.state(),
                                     DownloadState::Queued | DownloadState::Downloading
-                                )
+                                ))
+                            .then(|| download_id_value(job.id()))
+                            .flatten()
                         });
-                        if already_active {
-                            Ok(candidate.id())
+                        if let Some(id) = already_active {
+                            Ok(id)
                         } else {
-                            self.download_capture(candidate.id(), directory, choice)
+                            match self
+                                .download_capture(candidate.id(), directory, choice)
                                 .await
-                                .map(|_| candidate.id())
-                                .map_err(|message| {
+                            {
+                                Ok(id) => download_id_value(id).ok_or(Refusal::CaptureUnavailable),
+                                Err(message) => {
                                     self.notice = Some(message);
-                                    Refusal::CaptureUnavailable
-                                })
+                                    Err(Refusal::CaptureUnavailable)
+                                }
+                            }
                         }
                     }
                     Err(message) => {
@@ -882,6 +896,26 @@ impl Daemon {
                 };
                 let _ = reply.send(result);
             }
+            Ok(CaptureEvent::StatusRequested { id, reply }) => {
+                let status = i64::try_from(id)
+                    .ok()
+                    .and_then(|id| DownloadId::new(id).ok())
+                    .and_then(|id| self.manager.job(id))
+                    .and_then(|job| {
+                        Some(CaptureDownloadStatus {
+                            id: download_id_value(job.id())?,
+                            name: job_name(&job),
+                            state: state_name(job.state()).to_owned(),
+                            written: job.progress().downloaded_bytes(),
+                            total: job.progress().total_bytes(),
+                            failure: job
+                                .last_failure()
+                                .map(|failure| failure_kind_name(failure.kind()).to_owned()),
+                        })
+                    })
+                    .ok_or(Refusal::NoDownload);
+                let _ = reply.send(status);
+            }
             Err(_) => self.handle_capture_change(false),
         }
     }
@@ -890,7 +924,8 @@ impl Daemon {
         &self,
         candidate: &Candidate,
     ) -> Result<FormatsResponse, Refusal> {
-        let formats = if !candidate.variants().is_empty() {
+        let formats = if candidate.kind() == ResourceKind::File && !candidate.variants().is_empty()
+        {
             candidate
                 .variants()
                 .iter()
@@ -899,6 +934,7 @@ impl Daemon {
                     let view = capture_variant_view(variant);
                     MediaFormat {
                         label: view.label,
+                        group: view.group,
                         details: view.details,
                         format: format!("variant:{index}"),
                     }
@@ -917,19 +953,26 @@ impl Daemon {
                 .iter()
                 .enumerate()
                 .map(|(index, track)| {
+                    let size = declared_track_size(candidate, track);
                     let mut details = vec![track_kind_name(track.kind()).to_owned()];
                     if let Some(codecs) = track.codecs() {
                         details.push(codecs.to_owned());
                     }
-                    if let Some(bytes) = track.size().bytes() {
+                    if let Some(bytes) = size.or_else(|| track.size().bytes()) {
                         details.push(format_size(bytes));
                     }
                     MediaFormat {
                         label: track.label().to_owned(),
+                        group: track.group().map(str::to_owned),
                         details: details.join(" | "),
                         format: track.selection().map_or_else(
                             || format!("track:{index}"),
-                            |selection| format!("selection:{}", selection.as_str()),
+                            |selection| {
+                                format!(
+                                    "selection:{}",
+                                    selection_with_size(selection.as_str(), size)
+                                )
+                            },
                         ),
                     }
                 })
@@ -937,6 +980,7 @@ impl Daemon {
         } else {
             vec![MediaFormat {
                 label: candidate.page_title().unwrap_or("Original file").to_owned(),
+                group: None,
                 details: candidate.content_type().unwrap_or("media").to_owned(),
                 format: String::from("best"),
             }]
@@ -948,6 +992,23 @@ impl Daemon {
             Ok(FormatsResponse {
                 capture_id: candidate.id(),
                 formats,
+                directory: self
+                    .last_download_directory
+                    .clone()
+                    .or_else(default_download_directory)
+                    .and_then(|directory| directory.to_str().map(str::to_owned)),
+                filename: candidate
+                    .page_title()
+                    .and_then(|title| {
+                        let extension = suggested_capture_extension(candidate);
+                        title_filename(title, Some(&extension))
+                    })
+                    .or_else(|| {
+                        Some(format!(
+                            "download.{}",
+                            suggested_capture_extension(candidate)
+                        ))
+                    }),
             })
         }
     }
@@ -1212,6 +1273,7 @@ fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
 
     CaptureTrackView {
         label: variant.label(),
+        group: None,
         details: details.join(" | "),
         url: variant.url().as_str().to_owned(),
         filename: None,
@@ -1222,9 +1284,14 @@ fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
 fn capture_choice(
     candidate: &Candidate,
     format: Option<&str>,
+    filename: Option<String>,
 ) -> Result<Option<CaptureTrackChoice>, String> {
     let Some(format) = format.filter(|format| !format.is_empty() && *format != "best") else {
-        return Ok(None);
+        return Ok(filename.map(|filename| CaptureTrackChoice {
+            url: candidate.url().as_str().to_owned(),
+            filename: Some(filename),
+            selection: None,
+        }));
     };
 
     if let Some(index) = format.strip_prefix("variant:") {
@@ -1238,7 +1305,7 @@ fn capture_choice(
 
         return Ok(Some(CaptureTrackChoice {
             url: variant.url().as_str().to_owned(),
-            filename: None,
+            filename,
             selection: None,
         }));
     }
@@ -1246,21 +1313,80 @@ fn capture_choice(
     if let Some(selection) = format.strip_prefix("selection:") {
         return Ok(Some(CaptureTrackChoice {
             url: candidate.url().as_str().to_owned(),
-            filename: None,
+            filename,
             selection: Some(selection.to_owned()),
         }));
     }
 
     if format.starts_with("track:") {
-        return Ok(None);
+        return Ok(filename.map(|filename| CaptureTrackChoice {
+            url: candidate.url().as_str().to_owned(),
+            filename: Some(filename),
+            selection: None,
+        }));
     }
 
     Err("That capture format is invalid.".into())
 }
 
+fn suggested_capture_extension(candidate: &Candidate) -> String {
+    if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+        return String::from("mp4");
+    }
+    candidate
+        .content_type()
+        .and_then(content_type_extension)
+        .map(str::to_owned)
+        .or_else(|| {
+            url_filename(candidate.url()).and_then(|filename| {
+                Path::new(&filename)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_owned)
+            })
+        })
+        .unwrap_or_else(|| String::from("bin"))
+}
+
+fn declared_track_size(candidate: &Candidate, track: &PresentationTrack) -> Option<u64> {
+    let variants = candidate.variants();
+    let audio = variants
+        .iter()
+        .filter(|variant| variant.resolution().is_none())
+        .filter_map(MediaVariant::size)
+        .max();
+
+    match track.kind() {
+        TrackKind::Video => {
+            let video = variants
+                .iter()
+                .filter(|variant| variant.resolution() == track.resolution())
+                .filter_map(MediaVariant::size)
+                .max()?;
+            Some(video.saturating_add(audio.unwrap_or_default()))
+        }
+        TrackKind::Audio => audio,
+        TrackKind::Text | TrackKind::Unknown => track.size().bytes(),
+    }
+}
+
+fn selection_with_size(selection: &str, size: Option<u64>) -> String {
+    // Only HLS selectors carry an optional declared total; a DASH selector
+    // rejects any part it does not define.
+    if !selection.starts_with("hls:") {
+        return selection.to_owned();
+    }
+
+    size.map_or_else(
+        || selection.to_owned(),
+        |size| format!("{selection}:{size}"),
+    )
+}
+
 fn capture_track_view(track: &PresentationTrack) -> CaptureTrackView {
     CaptureTrackView {
         label: track.label().to_owned(),
+        group: track.group().map(str::to_owned),
         details: format!(
             "{} | {}",
             track_kind_name(track.kind()),
@@ -1376,6 +1502,10 @@ fn state_name(state: DownloadState) -> &'static str {
         DownloadState::Cancelled => "cancelled",
         DownloadState::Interrupted => "interrupted",
     }
+}
+
+fn download_id_value(id: DownloadId) -> Option<u64> {
+    u64::try_from(id.value()).ok()
 }
 
 fn failure_kind_name(kind: FailureKind) -> &'static str {

@@ -56,8 +56,8 @@ pub use pairing::{
     save_token, token_path,
 };
 pub use protocol::{
-    ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
-    parse_client_message,
+    CaptureDownloadStatus, ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage,
+    encode_server_message, parse_client_message,
 };
 pub use server::{
     CaptureEvent, CaptureHandle, CaptureServer, CatalogView, DEFAULT_PATH, FormatsResponse,

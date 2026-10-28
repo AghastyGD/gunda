@@ -14,3 +14,4 @@ execFileSync(
 );
 await cp(join(root, 'src', 'manifest.json'), join(dist, 'manifest.json'));
 await cp(join(root, 'src', 'options.html'), join(dist, 'options.html'));
+await cp(join(root, 'src', 'download.html'), join(dist, 'download.html'));

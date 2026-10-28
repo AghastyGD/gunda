@@ -41,6 +41,11 @@ pub trait PreparedTransfer: Send + Sized {
 
     fn total_bytes(&self) -> Option<u64>;
 
+    /// Whether the total is derived rather than measured from every resource.
+    fn total_bytes_is_estimated(&self) -> bool {
+        false
+    }
+
     /// Returns the reconciled byte count already present in staging.
     fn starting_bytes(&self) -> u64 {
         0
@@ -48,6 +53,14 @@ pub trait PreparedTransfer: Send + Sized {
 
     /// Returns whether this prepared transfer can stop at a durable checkpoint.
     fn supports_pause(&self) -> bool {
+        false
+    }
+
+    /// Whether a stopped transfer may report fewer bytes than it last reported.
+    ///
+    /// A segmented executor discards an incomplete resource and resumes from the
+    /// preceding durable boundary, so its stopped count can move backwards.
+    fn stopped_progress_may_rewind(&self) -> bool {
         false
     }
 

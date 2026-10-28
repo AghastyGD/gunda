@@ -11,13 +11,17 @@ use crate::error::ManifestError;
 use crate::hls::Variant;
 
 const HLS_VERSION: &str = "1";
+const HLS_AUDIO_VERSION: &str = "2";
 const DASH_VERSION: &str = "1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HlsSelection {
     pub(crate) variant: usize,
     pub(crate) bandwidth: Option<u64>,
     pub(crate) resolution: Option<(u32, u32)>,
+    pub(crate) declared_total: Option<u64>,
+    pub(crate) audio_rendition: Option<usize>,
+    pub(crate) audio_language: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,35 @@ pub(crate) fn hls_selection(
 
     ExecutionSelection::new(format!(
         "hls:{HLS_VERSION}:{variant_index}:{}:{width}:{height}",
+        optional_number(variant.bandwidth())
+    ))
+    .map_err(|_| ManifestError::Malformed)
+}
+
+pub(crate) fn hls_selection_with_audio(
+    variant_index: usize,
+    variant: &Variant,
+    audio_index: usize,
+    language: Option<&str>,
+) -> Result<ExecutionSelection, ManifestError> {
+    let (width, height) = match variant.resolution() {
+        Some((width, height)) => (width.to_string(), height.to_string()),
+        None => ("-".to_owned(), "-".to_owned()),
+    };
+    let language = language
+        .unwrap_or("-")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+
+    ExecutionSelection::new(format!(
+        "hls:{HLS_AUDIO_VERSION}:{variant_index}:{}:{width}:{height}:{audio_index}:{language}",
         optional_number(variant.bandwidth())
     ))
     .map_err(|_| ManifestError::Malformed)
@@ -80,7 +113,11 @@ pub(crate) fn dash_selection(
 pub(crate) fn parse_hls(selection: &ExecutionSelection) -> Result<HlsSelection, ManifestError> {
     let mut parts = selection.as_str().split(':');
 
-    if parts.next() != Some("hls") || parts.next() != Some(HLS_VERSION) {
+    if parts.next() != Some("hls") {
+        return Err(ManifestError::SelectionUnavailable);
+    }
+    let version = parts.next().ok_or(ManifestError::SelectionUnavailable)?;
+    if version != HLS_VERSION && version != HLS_AUDIO_VERSION {
         return Err(ManifestError::SelectionUnavailable);
     }
 
@@ -88,6 +125,16 @@ pub(crate) fn parse_hls(selection: &ExecutionSelection) -> Result<HlsSelection, 
     let bandwidth = optional_number_value(parts.next())?;
     let width = optional_number_value(parts.next())?;
     let height = optional_number_value(parts.next())?;
+    let (audio_rendition, audio_language, declared_total) = if version == HLS_AUDIO_VERSION {
+        let audio = optional_usize(parts.next())?;
+        let language = parts
+            .next()
+            .filter(|language| *language != "-")
+            .map(str::to_owned);
+        (audio, language, optional_number_value(parts.next())?)
+    } else {
+        (None, None, optional_number_value(parts.next())?)
+    };
 
     if parts.next().is_some() {
         return Err(ManifestError::SelectionUnavailable);
@@ -106,6 +153,9 @@ pub(crate) fn parse_hls(selection: &ExecutionSelection) -> Result<HlsSelection, 
         variant,
         bandwidth,
         resolution,
+        declared_total,
+        audio_rendition,
+        audio_language,
     })
 }
 
@@ -172,7 +222,7 @@ fn optional_number_value(value: Option<&str>) -> Result<Option<u64>, ManifestErr
 mod tests {
     use gunda_core::download::ExecutionSelection;
 
-    use super::{dash_selection, hls_selection, parse_dash, parse_hls};
+    use super::{dash_selection, hls_selection, hls_selection_with_audio, parse_dash, parse_hls};
     use crate::hls::{self, Playlist};
 
     #[test]
@@ -193,6 +243,16 @@ mod tests {
         assert_eq!(parsed.variant, 3);
         assert_eq!(parsed.bandwidth, Some(4_000_000));
         assert_eq!(parsed.resolution, Some((1920, 1080)));
+        assert_eq!(parsed.declared_total, None);
+
+        let sized = ExecutionSelection::new("hls:1:3:4000000:1920:1080:123456").unwrap();
+        assert_eq!(parse_hls(&sized).unwrap().declared_total, Some(123_456));
+
+        let localized =
+            hls_selection_with_audio(3, &master.variants()[0], 7, Some("pt-BR")).unwrap();
+        let parsed = parse_hls(&localized).unwrap();
+        assert_eq!(parsed.audio_rendition, Some(7));
+        assert_eq!(parsed.audio_language.as_deref(), Some("pt-BR"));
     }
 
     #[test]

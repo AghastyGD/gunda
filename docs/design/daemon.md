@@ -5,18 +5,19 @@ Status: implemented; the desktop is a daemon client
 ## Ownership
 
 `gundad` owns the runtime lease, SQLite repository, `DownloadManager`, HTTP and
-stream executors, browser capture listener, candidate catalog, and bounded job
-scheduler. It is the only production transfer owner, and downloads and capture
-continue when desktop clients disconnect.
+stream executors, browser capture listener, source extractors, candidate
+catalog, and bounded job scheduler. It is the only production transfer owner,
+and downloads and capture continue when desktop clients disconnect.
 
 The desktop connects through `gunda-ipc`. It starts `gunda-desktop --daemon`
 with the same data directory when no daemon is available, then reads snapshots
 and sends lifecycle commands. The executable therefore acts as either the
 desktop client or its background daemon.
 
-The daemon inspects captured presentations and creates jobs from captured
-candidates. The desktop capture panel renders daemon snapshots and sends
-inspection and download commands.
+The daemon validates browser source JSON, extracts supported presentations,
+inspects streamed qualities, and creates jobs from captured candidates. Source
+documents are not persisted. The desktop capture panel renders daemon snapshots
+and sends inspection and download commands.
 
 ## Transport
 

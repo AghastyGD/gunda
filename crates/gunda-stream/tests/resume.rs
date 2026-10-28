@@ -306,6 +306,80 @@ async fn manager_pause_rewinds_to_the_last_durable_segment_boundary() {
     );
 }
 
+#[tokio::test]
+async fn manager_pause_after_bytes_are_written_rewinds_without_failing() {
+    let output = tempdir().unwrap();
+    let (entry, mut partial_rx) = serve_partial_segment().await;
+    let manager = Arc::new(
+        DownloadManager::start(MemoryRepository::default())
+            .await
+            .expect("manager must start"),
+    );
+    let id = manager
+        .create(NewDownload::new(
+            RequestContext::new(entry, Vec::new()),
+            DownloadDestination::new(
+                output.path().to_path_buf(),
+                None,
+                FileConflictPolicy::Rename,
+            ),
+            DownloadOrigin::Desktop,
+        ))
+        .await
+        .expect("job must be created")
+        .download_id();
+    let store = MemoryStore::default();
+    let executor = StreamExecutor::with_resume_store(
+        HttpClient::new().expect("client must build"),
+        store.clone(),
+    );
+    let cancellation = DownloadCancellation::new();
+    let control = cancellation.clone();
+    let running_manager = Arc::clone(&manager);
+    let report = tokio::spawn(async move {
+        running_manager
+            .execute_controlled(id, &executor, control, |_| {})
+            .await
+    });
+
+    partial_rx
+        .recv()
+        .await
+        .expect("the segment starts arriving");
+    let staging = gunda_http::partial_path(output.path(), id);
+    let mut written = 0;
+    for _ in 0..200 {
+        written = std::fs::metadata(&staging).map_or(0, |metadata| metadata.len());
+        if written >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(written, 4, "the partial segment must reach the file first");
+
+    cancellation.request_pause();
+    let report = tokio::time::timeout(Duration::from_secs(3), report)
+        .await
+        .expect("pause must not hang")
+        .unwrap()
+        .expect("pause must be orderly");
+    assert!(matches!(
+        report.event,
+        gunda_core::application::DownloadEvent::StateChanged {
+            current: DownloadState::Paused,
+            ..
+        }
+    ));
+    assert_eq!(
+        manager
+            .job(id)
+            .expect("job must exist")
+            .progress()
+            .downloaded_bytes(),
+        0
+    );
+}
+
 const MUX_MASTER: &str = "#EXTM3U\n\
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",DEFAULT=YES,URI=\"audio.m3u8\"\n\
 #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360,AUDIO=\"aac\"\n\

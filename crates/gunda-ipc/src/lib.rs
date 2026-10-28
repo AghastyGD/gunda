@@ -30,6 +30,7 @@ pub const MAX_NATIVE_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NativeHostRequest {
     Pairing { version: u32, agent: String },
+    ChooseDirectory { version: u32 },
 }
 
 /// A response from the native host to the browser extension.
@@ -40,6 +41,9 @@ pub enum NativeHostResponse {
         version: u32,
         endpoint: String,
         token: String,
+    },
+    Directory {
+        path: String,
     },
     Error {
         message: String,
@@ -204,6 +208,9 @@ pub struct CaptureView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureTrackView {
     pub label: String,
+    /// Heading that groups qualities sharing the same audio rendition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub details: String,
     pub url: String,
     pub filename: Option<String>,
@@ -553,6 +560,7 @@ mod tests {
                     id: 7,
                     tracks: vec![CaptureTrackView {
                         label: "640x360".into(),
+                        group: Some("English (en)".into()),
                         details: "video | 1.0 MiB".into(),
                         url: "https://cdn.example.test/master.m3u8".into(),
                         filename: Some("presentation.mp4".into()),
@@ -609,6 +617,16 @@ mod tests {
                 version: 1,
                 agent: "test".into(),
             }
+        );
+
+        let body = br#"{"kind":"choose_directory","version":1}"#;
+        let mut frame = u32::try_from(body.len()).unwrap().to_le_bytes().to_vec();
+        frame.extend_from_slice(body);
+        let mut cursor = std::io::Cursor::new(frame);
+
+        assert_eq!(
+            read_native_host_request(&mut cursor).unwrap(),
+            NativeHostRequest::ChooseDirectory { version: 1 }
         );
     }
 

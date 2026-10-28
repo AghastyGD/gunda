@@ -93,6 +93,8 @@ pub struct CaptureTracks {
 #[derive(Clone)]
 pub struct TrackView {
     pub label: String,
+    /// Heading that groups qualities sharing the same audio rendition.
+    pub group: Option<String>,
     pub details: String,
     pub url: Url,
     pub filename: Option<String>,
@@ -1076,6 +1078,7 @@ impl TrackView {
     fn from_track(track: &PresentationTrack) -> Self {
         Self {
             label: track.label().to_owned(),
+            group: track.group().map(str::to_owned),
             details: format!("{} | {}", kind_name(track.kind()), size_hint(track.size())),
             url: track.url().clone(),
             filename: track.filename().map(str::to_owned),

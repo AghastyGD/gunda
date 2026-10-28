@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Gunda Download</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 18px;
+      }
+
+      h1 {
+        font-size: 16px;
+        margin: 0 0 8px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .state {
+        font-size: 12px;
+        opacity: 0.72;
+      }
+
+      .setup {
+        display: grid;
+        gap: 10px;
+      }
+
+      .format {
+        background: rgba(127, 127, 127, 0.12);
+        border-radius: 7px;
+        padding: 9px 11px;
+      }
+
+      .format strong,
+      .format span {
+        display: block;
+      }
+
+      .format span {
+        font-size: 11px;
+        margin-top: 3px;
+        opacity: 0.68;
+      }
+
+      .field {
+        display: grid;
+        gap: 4px;
+      }
+
+      .field label {
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      input {
+        box-sizing: border-box;
+        padding: 7px 9px;
+        width: 100%;
+      }
+
+      .directory {
+        display: flex;
+        gap: 7px;
+      }
+
+      .progress {
+        display: none;
+      }
+
+      .track {
+        background: rgba(127, 127, 127, 0.2);
+        border-radius: 999px;
+        height: 8px;
+        margin: 16px 0 8px;
+        overflow: hidden;
+      }
+
+      .bar {
+        background: #4f8cff;
+        height: 100%;
+        transition: width 180ms ease;
+        width: 0;
+      }
+
+      .sizes {
+        display: flex;
+        font-size: 12px;
+        justify-content: space-between;
+        opacity: 0.72;
+      }
+
+      .failure {
+        color: #d9534f;
+        font-size: 12px;
+        margin-top: 10px;
+        min-height: 16px;
+      }
+
+      .actions {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 14px;
+      }
+
+      button {
+        padding: 6px 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="setup" id="setup">
+      <div class="format">
+        <strong id="format-label">Selected format</strong>
+        <span id="format-details"></span>
+      </div>
+      <div class="field">
+        <label for="filename">File name</label>
+        <input id="filename" type="text" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="directory">Save to</label>
+        <div class="directory">
+          <input id="directory" type="text" spellcheck="false" />
+          <button id="choose" type="button">Choose...</button>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="cancel" type="button">Cancel</button>
+        <button id="start" type="button">Start Download</button>
+      </div>
+      <div class="failure" id="setup-failure"></div>
+    </div>
+
+    <div class="progress" id="progress">
+      <h1 id="name">Preparing download</h1>
+      <div class="state" id="state">Connecting to Gunda daemon...</div>
+      <div class="track"><div class="bar" id="bar"></div></div>
+      <div class="sizes">
+        <span id="written">0 B</span>
+        <span id="total">Size unknown</span>
+      </div>
+      <div class="failure" id="failure"></div>
+      <div class="actions">
+        <button id="close" type="button">Close</button>
+      </div>
+    </div>
+    <script src="download.js"></script>
+  </body>
+</html>

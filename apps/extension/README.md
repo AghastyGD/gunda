@@ -30,8 +30,8 @@ range parameters) are deliberately **not** reported as complete files.
 
 The player control asks the page agent to refresh media detection before it
 lists the formats of the newest capture for that exact page. Choosing a format
-queues that download. Gunda uses the last folder chosen in the desktop
-application, or the operating system's Downloads folder.
+opens a start window with the filename, folder picker, Start, and Cancel.
+Starting switches the same window to live progress without opening the desktop.
 
 ## Installing it
 

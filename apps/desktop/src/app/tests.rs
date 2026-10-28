@@ -550,6 +550,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
             tracks: vec![
                 TrackView {
                     label: "1920x1080 (5.0 Mbps)".into(),
+                    group: Some("English (en)".into()),
                     details: "video | 1.2 GiB".into(),
                     url: Url::parse("https://cdn.example.com/1080/index.m3u8")
                         .expect("the URL is valid"),
@@ -557,7 +558,26 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                     selection: None,
                 },
                 TrackView {
+                    label: "1280x720 (2.0 Mbps)".into(),
+                    group: Some("Português (pt)".into()),
+                    details: "video | 820.0 MiB".into(),
+                    url: Url::parse("https://cdn.example.com/720/index.m3u8")
+                        .expect("the URL is valid"),
+                    filename: Some("master.mp4".into()),
+                    selection: None,
+                },
+                TrackView {
+                    label: "854x480 (1.0 Mbps)".into(),
+                    group: Some("English (en)".into()),
+                    details: "video | 410.0 MiB".into(),
+                    url: Url::parse("https://cdn.example.com/480/index.m3u8")
+                        .expect("the URL is valid"),
+                    filename: Some("master.mp4".into()),
+                    selection: None,
+                },
+                TrackView {
                     label: "English (en)".into(),
+                    group: None,
                     details: "audio | 128.0 MiB".into(),
                     url: Url::parse("https://cdn.example.com/audio/index.m3u8")
                         .expect("the URL is valid"),
@@ -585,6 +605,19 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
         has("audio | 128.0 MiB"),
         "missing audio details: {labels:?}"
     );
+
+    let position = |needle: &str| {
+        labels
+            .iter()
+            .position(|label| label.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle}: {labels:?}"))
+    };
+
+    assert!(position("English (en)") < position("1920x1080 (5.0 Mbps)"));
+    assert!(position("1920x1080 (5.0 Mbps)") < position("854x480 (1.0 Mbps)"));
+    assert!(position("854x480 (1.0 Mbps)") < position("Português (pt)"));
+    assert!(position("Português (pt)") < position("1280x720 (2.0 Mbps)"));
+    assert!(position("1280x720 (2.0 Mbps)") < position("audio | 128.0 MiB"));
 }
 
 #[test]

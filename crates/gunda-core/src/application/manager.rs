@@ -284,7 +284,7 @@ where
 
         if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_stop(job, None, request, on_progress)
+                .record_execution_stop(job, None, request, false, false, on_progress)
                 .await;
         }
 
@@ -313,7 +313,7 @@ where
                     invalid_repository_data("execution stopped without a request")
                 })?;
                 return self
-                    .record_execution_stop(job, None, request, on_progress)
+                    .record_execution_stop(job, None, request, false, false, on_progress)
                     .await;
             }
             Some(Ok(prepared)) => prepared,
@@ -323,6 +323,8 @@ where
         };
 
         let total_bytes = prepared.total_bytes();
+        let total_is_estimated = prepared.total_bytes_is_estimated();
+        let stopped_progress_may_rewind = prepared.stopped_progress_may_rewind();
         let starting_bytes = prepared.starting_bytes();
         cancellation.set_pause_supported(prepared.supports_pause());
 
@@ -337,7 +339,7 @@ where
 
         if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_stop(job, None, request, on_progress)
+                .record_execution_stop(job, None, request, total_is_estimated, false, on_progress)
                 .await;
         }
 
@@ -375,6 +377,7 @@ where
                     let checkpoint = self.checkpoint_progress(
                         &mut job,
                         written_bytes,
+                        total_is_estimated,
                         on_progress,
                     );
                     tokio::pin!(checkpoint);
@@ -394,7 +397,7 @@ where
         };
 
         let reported_bytes = *progress_receiver.borrow();
-        validated_execution_progress(&job, reported_bytes)?;
+        execution_progress(&job, reported_bytes, total_is_estimated)?;
 
         let staged = match transfer_result {
             Ok(TransferOutcome::Finished(staged)) => staged,
@@ -406,7 +409,7 @@ where
                     )
                     .into());
                 };
-                if written_bytes < reported_bytes {
+                if written_bytes < reported_bytes && !stopped_progress_may_rewind {
                     return Err(invalid_repository_data(
                         "executor returned inconsistent stopped progress",
                     )
@@ -414,12 +417,19 @@ where
                 }
 
                 return self
-                    .record_execution_stop(job, Some(written_bytes), request, on_progress)
+                    .record_execution_stop(
+                        job,
+                        Some(written_bytes),
+                        request,
+                        total_is_estimated,
+                        stopped_progress_may_rewind,
+                        on_progress,
+                    )
                     .await;
             }
 
             Err(failure) => {
-                self.checkpoint_progress(&mut job, reported_bytes, on_progress)
+                self.checkpoint_progress(&mut job, reported_bytes, total_is_estimated, on_progress)
                     .await?;
 
                 return self.record_execution_failure(id, failure).await;
@@ -434,9 +444,15 @@ where
             .into());
         }
 
-        let progress = validated_execution_progress(&job, written_bytes)?;
+        let progress = if total_is_estimated {
+            DownloadProgress::new(written_bytes, Some(written_bytes))
+                .map_err(|_| invalid_repository_data("estimated progress is invalid"))?
+        } else {
+            validated_execution_progress(&job, written_bytes)?
+        };
 
-        if let Some(total) = total_bytes
+        if !total_is_estimated
+            && let Some(total) = total_bytes
             && written_bytes != total
         {
             return Err(
@@ -446,7 +462,14 @@ where
 
         if let Some(request) = cancellation.request_kind() {
             return self
-                .record_execution_stop(job, Some(written_bytes), request, on_progress)
+                .record_execution_stop(
+                    job,
+                    Some(written_bytes),
+                    request,
+                    total_is_estimated,
+                    false,
+                    on_progress,
+                )
                 .await;
         }
 
@@ -667,12 +690,13 @@ where
         &self,
         job: &mut DownloadJob,
         written_bytes: u64,
+        total_is_estimated: bool,
         on_progress: &mut F,
     ) -> Result<(), RepositoryError>
     where
         F: FnMut(DownloadEvent, &DownloadJob) + Send,
     {
-        let progress = validated_execution_progress(job, written_bytes)?;
+        let progress = execution_progress(job, written_bytes, total_is_estimated)?;
 
         if progress == job.progress() {
             return Ok(());
@@ -699,6 +723,8 @@ where
         mut job: DownloadJob,
         written_bytes: Option<u64>,
         request: DownloadControlRequest,
+        total_is_estimated: bool,
+        written_may_rewind: bool,
         on_progress: &mut F,
     ) -> Result<ExecutionReport, DownloadManagerError>
     where
@@ -713,7 +739,12 @@ where
             .progress();
 
         if let Some(written_bytes) = written_bytes {
-            let progress = stopped_execution_progress(&job, written_bytes)?;
+            let progress = stopped_execution_progress(
+                &job,
+                written_bytes,
+                total_is_estimated,
+                written_may_rewind,
+            )?;
             job.update_progress(progress, OffsetDateTime::now_utc());
         }
 
@@ -852,11 +883,53 @@ fn validated_execution_progress(
         .map_err(|_| invalid_repository_data("executor returned invalid progress"))
 }
 
+fn execution_progress(
+    job: &DownloadJob,
+    written_bytes: u64,
+    total_is_estimated: bool,
+) -> Result<DownloadProgress, RepositoryError> {
+    if written_bytes < job.progress().downloaded_bytes() {
+        return Err(invalid_repository_data("executor progress moved backwards"));
+    }
+
+    let total = if total_is_estimated {
+        Some(
+            job.progress()
+                .total_bytes()
+                .unwrap_or_default()
+                .max(written_bytes),
+        )
+    } else {
+        job.progress().total_bytes()
+    };
+
+    DownloadProgress::new(written_bytes, total)
+        .map_err(|_| invalid_repository_data("executor returned invalid progress"))
+}
+
+/// Accepts a durable stop position behind bytes that were reported but discarded.
+///
+/// A segmented executor truncates the incomplete resource before stopping, so
+/// the last reported count can belong to bytes that no longer exist in staging.
 fn stopped_execution_progress(
     job: &DownloadJob,
     written_bytes: u64,
+    total_is_estimated: bool,
+    may_rewind: bool,
 ) -> Result<DownloadProgress, RepositoryError> {
-    DownloadProgress::new(written_bytes, job.progress().total_bytes())
+    if !may_rewind {
+        return execution_progress(job, written_bytes, total_is_estimated);
+    }
+
+    let total = if total_is_estimated {
+        job.progress()
+            .total_bytes()
+            .map(|total| total.max(written_bytes))
+    } else {
+        job.progress().total_bytes()
+    };
+
+    DownloadProgress::new(written_bytes, total)
         .map_err(|_| invalid_repository_data("executor returned invalid stopped progress"))
 }
 #[cfg(test)]
@@ -2296,6 +2369,40 @@ mod tests {
                 .downloaded_bytes(),
             4,
         );
+    }
+
+    #[test]
+    fn stopped_progress_rewinds_only_when_the_executor_allows_it() {
+        let mut current = job(1);
+        current.update_progress(
+            crate::download::DownloadProgress::new(3, Some(5)).expect("progress must be valid"),
+            OffsetDateTime::now_utc(),
+        );
+
+        assert!(super::stopped_execution_progress(&current, 2, false, false).is_err());
+
+        let rewound = super::stopped_execution_progress(&current, 2, false, true)
+            .expect("a rewindable stop may move backwards");
+        assert_eq!(rewound.downloaded_bytes(), 2);
+        assert_eq!(rewound.total_bytes(), Some(5));
+    }
+
+    #[test]
+    fn stopped_progress_keeps_an_estimated_total_ahead_of_the_rewind() {
+        let mut current = job(1);
+        current.update_progress(
+            crate::download::DownloadProgress::new(4, Some(8)).expect("progress must be valid"),
+            OffsetDateTime::now_utc(),
+        );
+
+        let rewound = super::stopped_execution_progress(&current, 2, true, true)
+            .expect("a rewindable stop may move backwards");
+        assert_eq!(rewound.downloaded_bytes(), 2);
+        assert_eq!(rewound.total_bytes(), Some(8));
+
+        let grown = super::stopped_execution_progress(&current, 9, true, true)
+            .expect("an estimate may grow with reported bytes");
+        assert_eq!(grown.total_bytes(), Some(9));
     }
 
     #[tokio::test]

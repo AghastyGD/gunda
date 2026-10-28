@@ -448,7 +448,8 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     // pairs it with, so choosing a lower quality cannot produce a silent file.
     assert_eq!(tracks.len(), 3);
 
-    assert_eq!(tracks[0].label(), "1920x1080 (5.0 Mbps) with audio");
+    assert_eq!(tracks[0].label(), "1920x1080 (5.0 Mbps)");
+    assert_eq!(tracks[0].group(), Some("English (en)"));
     assert_eq!(tracks[0].kind(), TrackKind::Video);
     assert_eq!(tracks[0].url(), &entry);
     assert_eq!(tracks[0].resolution(), Some((1920, 1080)));
@@ -460,7 +461,8 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     // Neither size is declared in full, so the whole is not reported as exact.
     assert_eq!(tracks[0].size(), TrackSize::Unknown);
 
-    assert_eq!(tracks[1].label(), "640x360 (1.0 Mbps) with audio");
+    assert_eq!(tracks[1].label(), "640x360 (1.0 Mbps)");
+    assert_eq!(tracks[1].group(), Some("English (en)"));
     assert_eq!(tracks[1].kind(), TrackKind::Video);
     assert_eq!(tracks[1].url(), &entry);
     assert_eq!(tracks[1].resolution(), Some((640, 360)));
@@ -474,10 +476,42 @@ async fn inspection_describes_a_presentation_whose_qualities_share_one_rendition
     // its own, and is still named after the presentation rather than after its
     // own playlist.
     assert_eq!(tracks[2].label(), "English (en)");
+    assert_eq!(tracks[2].group(), None);
     assert_eq!(tracks[2].kind(), TrackKind::Audio);
     assert_eq!(tracks[2].size(), TrackSize::Unknown);
     assert_eq!(tracks[2].duration_millis(), None);
     assert_eq!(tracks[2].filename(), None);
+}
+
+#[tokio::test]
+async fn inspection_exposes_each_hls_audio_language() {
+    const LOCALIZED_MASTER: &str = "#EXTM3U\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,URI=\"en.m3u8\"\n\
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Português\",LANGUAGE=\"pt\",URI=\"pt.m3u8\"\n\
+#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720,AUDIO=\"aac\"\n\
+high.m3u8\n";
+    let entry = serve(
+        &[(
+            "/master.m3u8",
+            "application/vnd.apple.mpegurl",
+            LOCALIZED_MASTER.as_bytes(),
+        )],
+        "/master.m3u8",
+    )
+    .await;
+    let executor = StreamExecutor::new(HttpClient::new().expect("client must build"));
+    let presentation = executor
+        .inspect(&RequestContext::new(entry, Vec::new()))
+        .await
+        .expect("inspection must succeed");
+
+    let described = presentation
+        .tracks()
+        .iter()
+        .map(|track| (track.label(), track.group()))
+        .collect::<Vec<_>>();
+    assert!(described.contains(&("1280x720 (2.0 Mbps)", Some("English (en)"))));
+    assert!(described.contains(&("1280x720 (2.0 Mbps)", Some("Português (pt)"))));
 }
 
 #[tokio::test]
@@ -592,13 +626,15 @@ async fn inspection_lists_every_dash_video_quality_with_its_audio() {
     let tracks = presentation.tracks();
 
     assert_eq!(tracks.len(), 3);
-    assert_eq!(tracks[0].label(), "1920x1080 (v1) with audio");
+    assert_eq!(tracks[0].label(), "1920x1080 (v1)");
+    assert_eq!(tracks[0].group(), Some("Audio (en)"));
     assert_eq!(tracks[0].url(), &entry);
     assert!(tracks[0].selection().is_some());
     assert_eq!(tracks[0].resolution(), Some((1920, 1080)));
     assert_eq!(tracks[0].size(), TrackSize::Estimated(1_264_000));
 
-    assert_eq!(tracks[1].label(), "640x360 (v0) with audio");
+    assert_eq!(tracks[1].label(), "640x360 (v0)");
+    assert_eq!(tracks[1].group(), Some("Audio (en)"));
     assert!(tracks[1].selection().is_some());
     assert_eq!(tracks[1].resolution(), Some((640, 360)));
     assert_eq!(tracks[1].size(), TrackSize::Estimated(464_000));

@@ -32,8 +32,8 @@ use crate::error::CaptureError;
 use crate::extractor;
 use crate::pairing::PairingToken;
 use crate::protocol::{
-    ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage, encode_server_message,
-    parse_client_message,
+    CaptureDownloadStatus, ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage,
+    encode_server_message, parse_client_message,
 };
 use crate::websocket::WebSocket;
 
@@ -76,6 +76,8 @@ type Submission = (Report, oneshot::Sender<Recorded>);
 pub struct FormatsResponse {
     pub capture_id: CandidateId,
     pub formats: Vec<MediaFormat>,
+    pub directory: Option<String>,
+    pub filename: Option<String>,
 }
 
 /// One event delivered to the daemon that owns the capture handle.
@@ -91,7 +93,14 @@ pub enum CaptureEvent {
     DownloadRequested {
         candidate: Box<Candidate>,
         format: Option<String>,
-        reply: oneshot::Sender<Result<CandidateId, Refusal>>,
+        directory: Option<String>,
+        filename: Option<String>,
+        reply: oneshot::Sender<Result<u64, Refusal>>,
+    },
+    /// The extension requested progress for one daemon download.
+    StatusRequested {
+        id: u64,
+        reply: oneshot::Sender<Result<CaptureDownloadStatus, Refusal>>,
     },
 }
 
@@ -102,8 +111,15 @@ enum CaptureRequest {
     },
     Download {
         page_url: Url,
+        capture_id: Option<u64>,
         format: Option<String>,
-        reply: oneshot::Sender<Result<CandidateId, Refusal>>,
+        directory: Option<String>,
+        filename: Option<String>,
+        reply: oneshot::Sender<Result<u64, Refusal>>,
+    },
+    Status {
+        id: u64,
+        reply: oneshot::Sender<Result<CaptureDownloadStatus, Refusal>>,
     },
 }
 
@@ -251,17 +267,39 @@ impl CaptureServer {
                     self.publish();
                 }
                 Some(request) = self.capture_requests.recv() => {
+                    if let CaptureRequest::Status { id, reply } = request {
+                        if let Err(event) = self.events.send(CaptureEvent::StatusRequested {
+                            id,
+                            reply,
+                        }) && let CaptureEvent::StatusRequested { reply, .. } = event.0 {
+                            let _ = reply.send(Err(Refusal::CaptureUnavailable));
+                        }
+                        continue;
+                    }
+
                     let page_url = match &request {
                         CaptureRequest::Formats { page_url, .. }
                         | CaptureRequest::Download { page_url, .. } => page_url,
+                        CaptureRequest::Status { .. } => unreachable!("status returned above"),
                     };
-                    let candidate = self
-                        .catalog
-                        .candidates()
-                        .iter()
-                        .filter(|candidate| same_page(candidate.page_url(), page_url))
-                        .max_by_key(|candidate| page_candidate_score(candidate))
-                        .cloned();
+                    let candidate = match &request {
+                        // A start window names the capture it listed formats
+                        // for, so a newer capture on the same page cannot
+                        // replace the user's choice.
+                        CaptureRequest::Download {
+                            capture_id: Some(id),
+                            ..
+                        } => self.catalog.get(*id).cloned(),
+                        CaptureRequest::Formats { .. }
+                        | CaptureRequest::Download { .. }
+                        | CaptureRequest::Status { .. } => self
+                            .catalog
+                            .candidates()
+                            .iter()
+                            .filter(|candidate| same_page(candidate.page_url(), page_url))
+                            .max_by_key(|candidate| page_candidate_score(candidate))
+                            .cloned(),
+                    };
                     match (candidate, request) {
                         (Some(candidate), CaptureRequest::Formats { reply, .. }) => {
                             if let Err(event) =
@@ -274,11 +312,22 @@ impl CaptureServer {
                                 let _ = reply.send(Err(Refusal::CaptureUnavailable));
                             }
                         }
-                        (Some(candidate), CaptureRequest::Download { format, reply, .. }) => {
+                        (
+                            Some(candidate),
+                            CaptureRequest::Download {
+                                format,
+                                directory,
+                                filename,
+                                reply,
+                                ..
+                            },
+                        ) => {
                             if let Err(event) =
                                 self.events.send(CaptureEvent::DownloadRequested {
                                     candidate: Box::new(candidate),
                                     format,
+                                    directory,
+                                    filename,
                                     reply,
                                 })
                                 && let CaptureEvent::DownloadRequested { reply, .. } = event.0
@@ -291,6 +340,9 @@ impl CaptureServer {
                         }
                         (None, CaptureRequest::Download { reply, .. }) => {
                             let _ = reply.send(Err(Refusal::NoCapture));
+                        }
+                        (_, CaptureRequest::Status { .. }) => {
+                            unreachable!("status requests return before candidate lookup")
                         }
                     }
                 }
@@ -473,7 +525,8 @@ async fn converse(
         ClientMessage::Candidate { .. }
         | ClientMessage::Source { .. }
         | ClientMessage::DownloadPage { .. }
-        | ClientMessage::ListFormats { .. } => {
+        | ClientMessage::ListFormats { .. }
+        | ClientMessage::DownloadStatus { .. } => {
             respond(
                 &mut socket,
                 ServerMessage::Malformed {
@@ -548,11 +601,26 @@ async fn converse(
                 }
                 Err(reason) => ServerMessage::Refused { reason },
             },
-            Ok(ClientMessage::DownloadPage { page_url, format }) => {
+            Ok(ClientMessage::DownloadPage {
+                page_url,
+                capture_id,
+                format,
+                directory,
+                filename,
+            }) => {
                 let page_url = Url::parse(&page_url).map_err(|_| Refusal::UnsupportedUrl);
                 match page_url {
                     Ok(page_url) => {
-                        match request_download(download_commands, page_url, format).await? {
+                        match request_download(
+                            download_commands,
+                            page_url,
+                            capture_id,
+                            format,
+                            directory,
+                            filename,
+                        )
+                        .await?
+                        {
                             Ok(id) => ServerMessage::DownloadQueued { id },
                             Err(reason) => ServerMessage::DownloadUnavailable { reason },
                         }
@@ -567,10 +635,18 @@ async fn converse(
                         Ok(formats) => ServerMessage::PageFormats {
                             capture_id: formats.capture_id,
                             formats: formats.formats,
+                            directory: formats.directory,
+                            filename: formats.filename,
                         },
                         Err(reason) => ServerMessage::FormatsUnavailable { reason },
                     },
                     Err(reason) => ServerMessage::FormatsUnavailable { reason },
+                }
+            }
+            Ok(ClientMessage::DownloadStatus { id }) => {
+                match request_status(download_commands, id).await? {
+                    Ok(status) => ServerMessage::DownloadStatus { status },
+                    Err(reason) => ServerMessage::DownloadStatusUnavailable { reason },
                 }
             }
             Ok(ClientMessage::Hello { .. }) => ServerMessage::Malformed {
@@ -651,13 +727,19 @@ fn page_candidate_score(candidate: &Candidate) -> (u8, u8, u64) {
 async fn request_download(
     download_commands: &mpsc::Sender<CaptureRequest>,
     page_url: Url,
+    capture_id: Option<u64>,
     format: Option<String>,
-) -> Result<Result<CandidateId, Refusal>, CaptureError> {
+    directory: Option<String>,
+    filename: Option<String>,
+) -> Result<Result<u64, Refusal>, CaptureError> {
     let (acknowledge, acknowledged) = oneshot::channel();
     download_commands
         .send(CaptureRequest::Download {
             page_url,
+            capture_id,
             format,
+            directory,
+            filename,
             reply: acknowledge,
         })
         .await
@@ -675,6 +757,23 @@ async fn request_formats(
     download_commands
         .send(CaptureRequest::Formats {
             page_url,
+            reply: acknowledge,
+        })
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))?;
+    acknowledged
+        .await
+        .map_err(|_| CaptureError::Protocol("the capture listener is unavailable"))
+}
+
+async fn request_status(
+    download_commands: &mpsc::Sender<CaptureRequest>,
+    id: u64,
+) -> Result<Result<CaptureDownloadStatus, Refusal>, CaptureError> {
+    let (acknowledge, acknowledged) = oneshot::channel();
+    download_commands
+        .send(CaptureRequest::Status {
+            id,
             reply: acknowledge,
         })
         .await
@@ -974,6 +1073,7 @@ mod tests {
                     candidate,
                     format,
                     reply,
+                    ..
                 } = handle.next_event().await.expect("the listener runs")
                 {
                     break (candidate, format, reply);
@@ -984,6 +1084,49 @@ mod tests {
 
         assert_eq!(candidate.id(), 0);
         assert_eq!(format, None);
+        assert_eq!(
+            candidate.url().as_str(),
+            "https://cdn.example.com/movie.mp4"
+        );
+        reply
+            .send(Ok(candidate.id()))
+            .expect("the connection waits for the result");
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"download_queued","id":0}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_uses_the_capture_its_formats_were_listed_for() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        within(client.send(&report("movie"))).await;
+        within(client.receive()).await;
+        within(client.send(&report("newer"))).await;
+        within(client.receive()).await;
+
+        within(client.send(
+            r#"{"kind":"download_page","page_url":"https://example.com/watch","capture_id":0}"#,
+        ))
+        .await;
+
+        let (candidate, reply) = within(async {
+            loop {
+                if let super::CaptureEvent::DownloadRequested {
+                    candidate, reply, ..
+                } = handle.next_event().await.expect("the listener runs")
+                {
+                    break (candidate, reply);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(candidate.id(), 0);
         assert_eq!(
             candidate.url().as_str(),
             "https://cdn.example.com/movie.mp4"
@@ -1026,16 +1169,19 @@ mod tests {
                 capture_id: candidate.id(),
                 formats: vec![crate::protocol::MediaFormat {
                     label: String::from("Original"),
+                    group: None,
                     details: String::from("video/mp4"),
                     format: String::from("best"),
                 }],
+                directory: Some(String::from("/tmp")),
+                filename: Some(String::from("movie.mp4")),
             }))
             .expect("the connection waits for formats");
 
         assert_eq!(
             within(client.receive()).await.as_deref(),
             Some(
-                r#"{"kind":"page_formats","capture_id":0,"formats":[{"label":"Original","details":"video/mp4","format":"best"}]}"#
+                r#"{"kind":"page_formats","capture_id":0,"formats":[{"label":"Original","details":"video/mp4","format":"best"}],"directory":"/tmp","filename":"movie.mp4"}"#
             )
         );
     }
@@ -1052,6 +1198,44 @@ mod tests {
         assert_eq!(
             within(client.receive()).await.as_deref(),
             Some(r#"{"kind":"download_unavailable","reason":"no_capture"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn returns_download_status_through_the_capture_channel() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+        within(client.send(r#"{"kind":"download_status","id":42}"#)).await;
+
+        let reply = within(async {
+            loop {
+                if let super::CaptureEvent::StatusRequested { id, reply } =
+                    handle.next_event().await.expect("the listener runs")
+                {
+                    assert_eq!(id, 42);
+                    break reply;
+                }
+            }
+        })
+        .await;
+        reply
+            .send(Ok(crate::protocol::CaptureDownloadStatus {
+                id: 42,
+                name: String::from("movie.mp4"),
+                state: String::from("downloading"),
+                written: 10,
+                total: Some(100),
+                failure: None,
+            }))
+            .expect("the connection waits for status");
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(
+                r#"{"kind":"download_status","status":{"id":42,"name":"movie.mp4","state":"downloading","written":10,"total":100,"failure":null}}"#
+            )
         );
     }
 

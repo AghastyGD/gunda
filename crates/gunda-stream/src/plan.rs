@@ -118,6 +118,8 @@ pub struct TrackPlan {
     resources: Vec<StreamResource>,
     duration_millis: Option<u64>,
     label: Option<String>,
+    bandwidth: Option<u64>,
+    declared_total_bytes: Option<u64>,
     container_hint: Option<Container>,
 }
 
@@ -141,6 +143,8 @@ impl TrackPlan {
             resources,
             duration_millis,
             label,
+            bandwidth: None,
+            declared_total_bytes: None,
             container_hint: None,
         })
     }
@@ -155,6 +159,18 @@ impl TrackPlan {
     pub fn with_container_hint(mut self, hint: Container) -> Self {
         self.container_hint = Some(hint);
 
+        self
+    }
+
+    #[must_use]
+    pub fn with_bandwidth(mut self, bandwidth: Option<u64>) -> Self {
+        self.bandwidth = bandwidth;
+        self
+    }
+
+    #[must_use]
+    pub fn with_declared_total(mut self, total: Option<u64>) -> Self {
+        self.declared_total_bytes = total;
         self
     }
 
@@ -201,6 +217,15 @@ impl TrackPlan {
             .try_fold(0_u64, |total, length| {
                 length.and_then(|length| total.checked_add(length))
             })
+    }
+
+    #[must_use]
+    pub fn estimated_total_bytes(&self) -> Option<u64> {
+        self.declared_total_bytes.or_else(|| {
+            self.duration_millis
+                .zip(self.bandwidth)
+                .map(|(duration, bandwidth)| bandwidth.saturating_mul(duration) / 8000)
+        })
     }
 
     /// How many tracks of the presentation the plan carries.
@@ -261,6 +286,16 @@ impl TrackPlan {
         // long as its longest track.
         self.container_hint = Some(Container::Mp4);
         self.duration_millis = self.duration_millis.max(audio.duration_millis);
+        self.bandwidth = match (self.bandwidth, audio.bandwidth) {
+            (Some(video), Some(audio)) => Some(video.saturating_add(audio)),
+            (Some(bandwidth), None) | (None, Some(bandwidth)) => Some(bandwidth),
+            (None, None) => None,
+        };
+        self.declared_total_bytes = match (self.declared_total_bytes, audio.declared_total_bytes) {
+            (Some(video), Some(audio)) => Some(video.saturating_add(audio)),
+            (Some(total), None) | (None, Some(total)) => Some(total),
+            (None, None) => None,
+        };
 
         Ok(self)
     }
@@ -271,6 +306,8 @@ pub enum HlsOutcome {
     FetchVariant {
         url: Url,
         label: Option<String>,
+        bandwidth: Option<u64>,
+        declared_total: Option<u64>,
         /// The audio rendition that belongs with the variant, when the variant
         /// carries no audio of its own.
         audio: Option<Url>,
@@ -345,9 +382,8 @@ pub fn plan_hls_selected(
             // A variant that names an audio group whose renditions have URIs of
             // their own carries no audio itself, so the rendition is part of
             // the download rather than something to leave behind.
-            let audio = match master
-                .default_audio_rendition(variant)
-                .and_then(|rendition| rendition.uri())
+            let audio = match selected_audio_rendition(master, variant, selection)?
+                .and_then(hls::Rendition::uri)
             {
                 Some(uri) => Some(resolve(base, uri, None)?.url),
                 None => None,
@@ -356,6 +392,10 @@ pub fn plan_hls_selected(
             Ok(HlsOutcome::FetchVariant {
                 url,
                 label: label_for_variant(variant),
+                bandwidth: variant.bandwidth(),
+                declared_total: selection
+                    .and_then(|selection| selection::parse_hls(selection).ok())
+                    .and_then(|selection| selection.declared_total),
                 audio,
             })
         }
@@ -364,6 +404,33 @@ pub fn plan_hls_selected(
         }
         Playlist::Media(_) => Err(ManifestError::SelectionUnavailable),
     }
+}
+
+fn selected_audio_rendition<'a>(
+    master: &'a hls::MasterPlaylist,
+    variant: &hls::Variant,
+    selection: Option<&ExecutionSelection>,
+) -> Result<Option<&'a hls::Rendition>, ManifestError> {
+    let Some(selection) = selection else {
+        return Ok(master.default_audio_rendition(variant));
+    };
+    let selected = selection::parse_hls(selection)?;
+    let Some(index) = selected.audio_rendition else {
+        return Ok(master.default_audio_rendition(variant));
+    };
+    let rendition = master
+        .renditions()
+        .get(index)
+        .ok_or(ManifestError::SelectionUnavailable)?;
+    if !rendition.kind().eq_ignore_ascii_case("AUDIO")
+        || rendition.uri().is_none()
+        || rendition.group_id() != variant.audio_group()
+        || rendition.language() != selected.audio_language.as_deref()
+    {
+        return Err(ManifestError::SelectionUnavailable);
+    }
+
+    Ok(Some(rendition))
 }
 
 fn selected_variant<'a>(
@@ -621,9 +688,15 @@ fn plan_dash_track(
         container,
         duration_millis,
     } = plan_set(base, mpd, period, set, representation_index)?;
+    let bandwidth = set
+        .representations()
+        .get(representation_index)
+        .and_then(dash::Representation::bandwidth);
 
-    TrackPlan::new(StreamKind::Dash, resources, duration_millis, label)
-        .map(|plan| plan.with_container_hint(container))
+    TrackPlan::new(StreamKind::Dash, resources, duration_millis, label).map(|plan| {
+        plan.with_container_hint(container)
+            .with_bandwidth(bandwidth)
+    })
 }
 
 fn plan_set(
@@ -964,9 +1037,26 @@ mod tests {
     use url::Url;
 
     use super::{
-        Container, HlsOutcome, StreamKind, plan_dash, plan_dash_selected, plan_hls,
-        plan_hls_selected, substitute_template,
+        Container, HlsOutcome, StreamKind, StreamResource, TrackPlan, plan_dash,
+        plan_dash_selected, plan_hls, plan_hls_selected, substitute_template,
     };
+
+    #[test]
+    fn estimates_size_from_declared_bandwidth_and_duration() {
+        let plan = TrackPlan::new(
+            StreamKind::Hls,
+            vec![StreamResource::new(
+                url("https://cdn.example/segment.ts"),
+                None,
+            )],
+            Some(10_000),
+            None,
+        )
+        .unwrap()
+        .with_bandwidth(Some(800_000));
+
+        assert_eq!(plan.estimated_total_bytes(), Some(1_000_000));
+    }
     use crate::dash;
     use crate::error::{ManifestError, UnsupportedFeature};
     use crate::hls;
@@ -990,7 +1080,9 @@ mod tests {
             .expect("planning must succeed");
 
         match outcome {
-            HlsOutcome::FetchVariant { url, label, audio } => {
+            HlsOutcome::FetchVariant {
+                url, label, audio, ..
+            } => {
                 assert_eq!(url.as_str(), "https://cdn.example/vod/high.m3u8");
                 assert_eq!(label.as_deref(), Some("1920x1080 (2.4 Mbps)"));
                 assert!(audio.is_none());
@@ -1031,6 +1123,34 @@ mod tests {
             }
             HlsOutcome::Ready(_) => panic!("expected a variant fetch"),
         }
+    }
+
+    #[test]
+    fn a_selected_hls_variant_uses_the_requested_audio_language() {
+        let playlist = hls::parse(
+            "#EXTM3U\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"English\",LANGUAGE=\"en\",DEFAULT=YES,URI=\"en.m3u8\"\n\
+             #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"aac\",NAME=\"Portuguese\",LANGUAGE=\"pt\",URI=\"pt.m3u8\"\n\
+             #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,AUDIO=\"aac\"\n\
+             low.m3u8\n",
+        )
+        .expect("playlist must parse");
+        let selection = ExecutionSelection::new("hls:2:0:800000:640:360:1:pt").unwrap();
+
+        let outcome = plan_hls_selected(
+            &url("https://cdn.example/vod/master.m3u8"),
+            &playlist,
+            Some(&selection),
+        )
+        .expect("planning must succeed");
+
+        let HlsOutcome::FetchVariant { audio, .. } = outcome else {
+            panic!("expected a variant fetch");
+        };
+        assert_eq!(
+            audio.expect("the requested rendition is selected").as_str(),
+            "https://cdn.example/vod/pt.m3u8"
+        );
     }
 
     #[test]

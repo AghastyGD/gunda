@@ -270,6 +270,7 @@ fn to_capture_tracks(tracks: gunda_ipc::CaptureTracks) -> Option<CaptureTracks> 
 
                 Some(TrackView {
                     label: track.label,
+                    group: track.group,
                     details: track.details,
                     url,
                     filename: track.filename,

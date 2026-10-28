@@ -95,9 +95,7 @@ impl Report {
             title,
         )?;
 
-        if report.kind == ResourceKind::File {
-            report.variants = presentation.variants;
-        }
+        report.variants = presentation.variants;
 
         Ok(report)
     }

@@ -20,7 +20,7 @@ use crate::plan::{
     HlsOutcome, TrackPlan, audio_set_index, bandwidth_hint, best_representation_index,
     label_for_variant, plan_dash_selected, plan_hls, select_set_index,
 };
-use crate::selection::{dash_selection, hls_selection};
+use crate::selection::{dash_selection, hls_selection, hls_selection_with_audio};
 
 /// Most variants returned by one inspection.
 const MAX_DESCRIBED_VARIANTS: usize = 24;
@@ -46,6 +46,8 @@ impl Presentation {
 #[derive(Debug, Clone)]
 pub struct PresentationTrack {
     label: String,
+    /// Heading that groups qualities sharing the same audio rendition.
+    group: Option<String>,
     kind: TrackKind,
     url: Url,
     filename: Option<String>,
@@ -62,6 +64,12 @@ impl PresentationTrack {
     #[must_use]
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// The audio rendition this track belongs to, when it belongs to one.
+    #[must_use]
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
     }
 
     #[must_use]
@@ -174,14 +182,26 @@ pub async fn inspect(
         Playlist::Master(master) => {
             let mut tracks = Vec::new();
 
-            for (index, variant) in master
-                .variants()
-                .iter()
-                .take(MAX_DESCRIBED_VARIANTS)
-                .enumerate()
-            {
-                if let Some(track) = described_variant(&base, master, index, variant) {
-                    tracks.push(track);
+            'variants: for (index, variant) in master.variants().iter().enumerate() {
+                let audio = audio_renditions(master, variant);
+                if audio.is_empty() {
+                    if let Some(track) = described_variant(&base, index, variant, None) {
+                        tracks.push(track);
+                    }
+                } else {
+                    for (audio_index, rendition) in audio {
+                        if tracks.len() >= MAX_DESCRIBED_VARIANTS {
+                            break 'variants;
+                        }
+                        if let Some(track) =
+                            described_variant(&base, index, variant, Some((audio_index, rendition)))
+                        {
+                            tracks.push(track);
+                        }
+                    }
+                }
+                if tracks.len() >= MAX_DESCRIBED_VARIANTS {
+                    break;
                 }
             }
 
@@ -203,6 +223,7 @@ pub async fn inspect(
 
                 let track = PresentationTrack {
                     label: rendition_label(rendition),
+                    group: None,
                     kind: TrackKind::Audio,
                     url: url.clone(),
                     filename: None,
@@ -227,22 +248,24 @@ pub async fn inspect(
 
 fn described_variant(
     manifest: &Url,
-    master: &hls::MasterPlaylist,
     index: usize,
     variant: &hls::Variant,
+    audio: Option<(usize, &hls::Rendition)>,
 ) -> Option<PresentationTrack> {
-    let selection = hls_selection(index, variant).ok()?;
-    let with_audio = master
-        .default_audio_rendition(variant)
-        .and_then(hls::Rendition::uri)
-        .is_some();
-    let mut label = label_for_variant(variant).unwrap_or_else(|| format!("Variant {}", index + 1));
-    if with_audio {
-        label.push_str(" with audio");
-    }
+    let selection = audio
+        .map_or_else(
+            || hls_selection(index, variant),
+            |(audio_index, rendition)| {
+                hls_selection_with_audio(index, variant, audio_index, rendition.language())
+            },
+        )
+        .ok()?;
+    let label = label_for_variant(variant).unwrap_or_else(|| format!("Variant {}", index + 1));
+    let group = audio.map(|(_, rendition)| rendition_label(rendition));
 
     Some(PresentationTrack {
         label,
+        group,
         kind: TrackKind::Video,
         url: manifest.clone(),
         filename: None,
@@ -254,6 +277,26 @@ fn described_variant(
         container: None,
         selection: Some(selection),
     })
+}
+
+fn audio_renditions<'a>(
+    master: &'a hls::MasterPlaylist,
+    variant: &hls::Variant,
+) -> Vec<(usize, &'a hls::Rendition)> {
+    let Some(group) = variant.audio_group() else {
+        return Vec::new();
+    };
+
+    master
+        .renditions()
+        .iter()
+        .enumerate()
+        .filter(|(_, rendition)| {
+            rendition.kind().eq_ignore_ascii_case("AUDIO")
+                && rendition.group_id() == Some(group)
+                && rendition.uri().is_some()
+        })
+        .collect()
 }
 
 async fn described_dash_presentation(
@@ -296,6 +339,13 @@ async fn described_dash_presentation(
             )
         })
     });
+    let audio_group = audio_choice.map(|(set, _, _)| {
+        let set = &period.adaptation_sets()[set];
+        set.language().map_or_else(
+            || "Audio".to_owned(),
+            |language| format!("Audio ({language})"),
+        )
+    });
 
     if let Some(set_index) = video_set {
         let set = &period.adaptation_sets()[set_index];
@@ -312,20 +362,17 @@ async fn described_dash_presentation(
             )
             .map_err(manifest_failure)?;
             let plan = plan_dash_selected(base, mpd, Some(&selection)).ok();
-            let mut track = described_dash_track(DashTrackDescription {
+            let track = described_dash_track(DashTrackDescription {
                 base,
                 representation,
                 kind: TrackKind::Video,
                 label: dash_video_label(representation),
+                group: audio_group.clone(),
                 selection,
                 plan: plan.as_ref(),
                 duration,
                 estimate_bandwidth: combined_bandwidth(representation.bandwidth(), audio_choice),
             });
-
-            if audio_choice.is_some() {
-                track.label = format!("{} with audio", track.label);
-            }
 
             tracks.push(track);
         }
@@ -350,6 +397,7 @@ async fn described_dash_presentation(
                 representation,
                 kind: TrackKind::Audio,
                 label: dash_audio_label(set, representation),
+                group: None,
                 selection,
                 plan: plan.as_ref(),
                 duration,
@@ -378,6 +426,7 @@ struct DashTrackDescription<'a> {
     representation: &'a dash::Representation,
     kind: TrackKind,
     label: String,
+    group: Option<String>,
     selection: ExecutionSelection,
     plan: Option<&'a TrackPlan>,
     duration: Option<u64>,
@@ -390,6 +439,7 @@ fn described_dash_track(description: DashTrackDescription<'_>) -> PresentationTr
         representation,
         kind,
         label,
+        group,
         selection,
         plan,
         duration,
@@ -409,6 +459,7 @@ fn described_dash_track(description: DashTrackDescription<'_>) -> PresentationTr
 
     PresentationTrack {
         label,
+        group,
         kind,
         url: base.clone(),
         filename: output_filename(base, container),
@@ -465,6 +516,7 @@ fn described_playlist(base: &Url, playlist: &Playlist) -> PresentationTrack {
         // the option would leave the user with nothing to choose.
         _ => PresentationTrack {
             label: kind_label(TrackKind::Unknown).to_owned(),
+            group: None,
             kind: TrackKind::Unknown,
             url: base.clone(),
             filename: output_filename(base, None),
@@ -487,6 +539,7 @@ fn track_from_plan(manifest: &Url, url: &Url, plan: &TrackPlan) -> PresentationT
         label: plan
             .label()
             .map_or_else(|| kind_label(kind).to_owned(), str::to_owned),
+        group: None,
         kind,
         url: url.clone(),
         filename: output_filename(manifest, container),

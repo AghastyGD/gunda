@@ -126,23 +126,26 @@ function clearFormats(panel: HTMLElement): void {
   panel.style.display = 'none';
 }
 
-async function downloadFormat(
+async function openDownloadStart(
   button: HTMLButtonElement,
   panel: HTMLElement,
+  captureId: number,
   format: MediaFormat,
+  directory: string | null,
+  filename: string | null,
 ): Promise<void> {
-  setOverlayStatus(button, 'Queued...');
-  const response = await sendRuntimeMessage<DownloadResponse>({
-    kind: 'download-page',
+  const opened = await sendRuntimeMessage<{ opened?: boolean }>({
+    kind: 'open-download',
+    capture_id: captureId,
     format: format.format,
+    label: format.group ? `${format.group}: ${format.label}` : format.label,
+    details: format.details,
+    directory,
+    filename,
   });
-  if (response) {
+  if (opened !== undefined) {
     clearFormats(panel);
-    if (response?.kind === 'queued') {
-      setOverlayStatus(button, 'Queued', true);
-    } else {
-      setOverlayStatus(button, 'Not found', true);
-    }
+    setOverlayStatus(button, 'Gunda', true);
   } else {
     setOverlayStatus(button, 'Try again', true);
   }
@@ -151,51 +154,103 @@ async function downloadFormat(
 function showFormats(
   button: HTMLButtonElement,
   panel: HTMLElement,
+  captureId: number,
   formats: MediaFormat[],
+  directory: string | null,
+  filename: string | null,
 ): void {
   panel.replaceChildren();
-  for (const format of formats) {
-    const option = document.createElement('button');
-    option.type = 'button';
-    option.textContent = format.label;
-    option.title = format.details;
-    option.style.cssText = [
-      'all: initial',
-      'box-sizing: border-box',
-      'display: block',
-      'width: 100%',
-      'border: 0',
-      'border-radius: 4px',
-      'background: transparent',
-      'color: #fff',
-      'cursor: pointer',
-      'font: 600 12px/1.25 system-ui, sans-serif',
-      'padding: 8px',
-      'text-align: left',
-    ].join(';');
-    option.addEventListener('mouseenter', () => {
-      option.style.background = 'rgba(255,255,255,.12)';
-    });
-    option.addEventListener('mouseleave', () => {
-      option.style.background = 'transparent';
-    });
-    option.addEventListener('click', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      option.disabled = true;
-      void downloadFormat(button, panel, format);
-    });
 
-    const details = document.createElement('span');
-    details.textContent = format.details;
-    details.style.cssText =
-      'display:block;color:rgba(255,255,255,.65);font:400 10px/1.3 system-ui,sans-serif;margin-top:3px;';
-    option.append(details);
-    panel.append(option);
+  const groups = new Map<string | null, MediaFormat[]>();
+  for (const format of formats) {
+    const group = format.group ?? null;
+    const entries = groups.get(group);
+    if (entries) {
+      entries.push(format);
+    } else {
+      groups.set(group, [format]);
+    }
   }
+
+  for (const [group, entries] of groups) {
+    if (group) {
+      const heading = document.createElement('div');
+      heading.textContent = group;
+      heading.style.cssText = [
+        'box-sizing: border-box',
+        'color: rgba(255,255,255,.58)',
+        'font: 700 10px/1.3 system-ui, sans-serif',
+        'letter-spacing: .02em',
+        'padding: 8px 8px 2px',
+      ].join(';');
+      panel.append(heading);
+    }
+
+    for (const format of entries) {
+      panel.append(
+        formatOption(button, panel, captureId, format, directory, filename),
+      );
+    }
+  }
+
   panel.style.display = 'block';
   button.textContent = 'Formats';
   button.disabled = false;
+}
+
+function formatOption(
+  button: HTMLButtonElement,
+  panel: HTMLElement,
+  captureId: number,
+  format: MediaFormat,
+  directory: string | null,
+  filename: string | null,
+): HTMLButtonElement {
+  const option = document.createElement('button');
+  option.type = 'button';
+  option.textContent = format.label;
+  option.title = format.details;
+  option.style.cssText = [
+    'all: initial',
+    'box-sizing: border-box',
+    'display: block',
+    'width: 100%',
+    'border: 0',
+    'border-radius: 4px',
+    'background: transparent',
+    'color: #fff',
+    'cursor: pointer',
+    'font: 600 12px/1.25 system-ui, sans-serif',
+    'padding: 8px',
+    'text-align: left',
+  ].join(';');
+  option.addEventListener('mouseenter', () => {
+    option.style.background = 'rgba(255,255,255,.12)';
+  });
+  option.addEventListener('mouseleave', () => {
+    option.style.background = 'transparent';
+  });
+  option.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    option.disabled = true;
+    void openDownloadStart(
+      button,
+      panel,
+      captureId,
+      format,
+      directory,
+      filename,
+    );
+  });
+
+  const details = document.createElement('span');
+  details.textContent = format.details;
+  details.style.cssText =
+    'display:block;color:rgba(255,255,255,.65);font:400 10px/1.3 system-ui,sans-serif;margin-top:3px;';
+  option.append(details);
+
+  return option;
 }
 
 async function openFormats(
@@ -221,7 +276,14 @@ async function openFormats(
   });
   if (response) {
     if (response?.kind === 'formats' && response.formats.length > 0) {
-      showFormats(button, panel, response.formats);
+      showFormats(
+        button,
+        panel,
+        response.capture_id,
+        response.formats,
+        response.directory,
+        response.filename,
+      );
     } else {
       setOverlayStatus(button, 'Not found', true);
     }
@@ -265,7 +327,7 @@ function addOverlay(video: HTMLVideoElement): void {
   ].join(';');
   const button = document.createElement('button');
   button.type = 'button';
-  button.textContent = 'Gunda';
+  button.textContent = 'Download Video';
   button.title = 'Download this video with Gunda';
   button.style.cssText = [
     'all: initial',

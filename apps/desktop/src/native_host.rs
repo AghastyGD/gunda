@@ -63,28 +63,66 @@ pub fn run(directory: PathBuf) -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let NativeHostRequest::Pairing { version, .. } = request;
-    if version != NATIVE_HOST_PROTOCOL_VERSION {
-        write_native_host_response(
-            &mut stdout,
-            &NativeHostResponse::Error {
-                message: "The extension uses an unsupported native host protocol.".into(),
-            },
-        )?;
-        return Ok(());
-    }
-
-    let pairing = ensure_pairing(&directory);
-    let response = match pairing {
-        Ok((endpoint, token)) => NativeHostResponse::Pairing {
-            version: NATIVE_HOST_PROTOCOL_VERSION,
-            endpoint,
-            token,
-        },
-        Err(message) => NativeHostResponse::Error { message },
+    let response = match request {
+        NativeHostRequest::Pairing { version, .. } => {
+            if version != NATIVE_HOST_PROTOCOL_VERSION {
+                NativeHostResponse::Error {
+                    message: "The extension uses an unsupported native host protocol.".into(),
+                }
+            } else {
+                match ensure_pairing(&directory) {
+                    Ok((endpoint, token)) => NativeHostResponse::Pairing {
+                        version: NATIVE_HOST_PROTOCOL_VERSION,
+                        endpoint,
+                        token,
+                    },
+                    Err(message) => NativeHostResponse::Error { message },
+                }
+            }
+        }
+        NativeHostRequest::ChooseDirectory { version } => {
+            if version != NATIVE_HOST_PROTOCOL_VERSION {
+                NativeHostResponse::Error {
+                    message: "The extension uses an unsupported native host protocol.".into(),
+                }
+            } else {
+                match choose_directory().and_then(|path| path.to_str().map(str::to_owned)) {
+                    Some(path) => NativeHostResponse::Directory { path },
+                    None => NativeHostResponse::Error {
+                        message: "No folder was selected.".into(),
+                    },
+                }
+            }
+        }
     };
     write_native_host_response(&mut stdout, &response)?;
     Ok(())
+}
+
+fn choose_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Choose a Gunda download folder",
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8(output.stdout).ok()?;
+                return Some(PathBuf::from(path.trim()));
+            }
+            return None;
+        }
+    }
+
+    rfd::FileDialog::new()
+        .set_title("Choose a Gunda download folder")
+        .pick_folder()
 }
 
 fn launcher(directory: &Path, executable: &Path) -> Result<PathBuf, Box<dyn Error>> {

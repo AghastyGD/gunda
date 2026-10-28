@@ -1,7 +1,7 @@
 use eframe::egui::{self, RichText};
 use gunda_capture::CandidateId;
 
-use crate::backend::{CaptureStatus, CaptureTracks, CaptureView, Command, TrackChoice};
+use crate::backend::{CaptureStatus, CaptureTracks, CaptureView, Command, TrackChoice, TrackView};
 
 use super::Desktop;
 use super::theme::Palette;
@@ -226,25 +226,49 @@ fn tracks_of(
     }
 
     ui.indent(&capture.url, |ui| {
-        for track in &tracks.tracks {
-            ui.horizontal(|ui| {
-                if ui.button("Download").clicked() {
-                    actions.choose = Some((
-                        capture.id,
-                        TrackChoice {
-                            url: track.url.clone(),
-                            filename: track.filename.clone(),
-                            selection: track.selection.clone(),
-                        },
-                    ));
-                }
+        for (group, tracks) in grouped_tracks(&tracks.tracks) {
+            if let Some(group) = group {
+                ui.label(RichText::new(group).size(11.0).strong().color(colors.muted));
+                ui.add_space(2.0);
+            }
 
-                ui.label(RichText::new(&track.label).size(12.0));
-            });
+            for track in tracks {
+                ui.horizontal(|ui| {
+                    if ui.button("Download").clicked() {
+                        actions.choose = Some((
+                            capture.id,
+                            TrackChoice {
+                                url: track.url.clone(),
+                                filename: track.filename.clone(),
+                                selection: track.selection.clone(),
+                            },
+                        ));
+                    }
 
-            ui.label(RichText::new(&track.details).size(11.0).color(colors.muted));
+                    ui.label(RichText::new(&track.label).size(12.0));
+                });
 
-            ui.add_space(4.0);
+                ui.label(RichText::new(&track.details).size(11.0).color(colors.muted));
+
+                ui.add_space(4.0);
+            }
         }
     });
+}
+
+/// Keeps qualities of the same audio rendition together, in first-seen order.
+fn grouped_tracks(tracks: &[TrackView]) -> Vec<(Option<&str>, Vec<&TrackView>)> {
+    let mut groups: Vec<(Option<&str>, Vec<&TrackView>)> = Vec::new();
+
+    for track in tracks {
+        let group = track.group.as_deref();
+
+        if let Some((_, grouped)) = groups.iter_mut().find(|(name, _)| *name == group) {
+            grouped.push(track);
+        } else {
+            groups.push((group, vec![track]));
+        }
+    }
+
+    groups
 }
