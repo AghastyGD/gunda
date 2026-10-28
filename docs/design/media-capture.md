@@ -53,10 +53,12 @@ The pipeline has these responsibilities:
 
 The packaged extension prefers a native-messaging host named
 `com.gunda.capture`. The desktop registers the host for detected Chromium
-browsers on Linux. `gundad` publishes its active WebSocket endpoint in
-`capture.endpoint`, and the host returns that endpoint with the separate
-`capture-token`. These values are distinct from the daemon IPC endpoint and
-`gundad-token`.
+browsers on Linux and in the per-user registry for Chrome, Chromium, Edge, and
+Brave on Windows. On Windows the manifest points to a small `.cmd` launcher that
+passes the data directory to `--native-host`. `gundad` publishes its active
+WebSocket endpoint in `capture.endpoint`, and the host returns that endpoint
+with the separate `capture-token`. These values are distinct from the daemon IPC
+endpoint and `gundad-token`.
 Manual endpoint and token entry remains available when native messaging cannot
 be registered.
 - **A Shadow DOM player control.** The content script places a small download
@@ -266,8 +268,8 @@ The streaming engine uses four HTTP operations:
 
 ## 3.2 The capture channel (`crates/gunda-capture`, `apps/extension`)
 
-The Gunda daemon runs a loopback WebSocket listener because it requires no
-native host registration or extra executable:
+The Gunda daemon also runs a loopback WebSocket listener, so capture can work
+without native host registration or an extra executable:
 
 ```
 page -- runtime messages --> extension service worker -- WebSocket --> CaptureServer

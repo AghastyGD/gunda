@@ -31,18 +31,38 @@ const CHROMIUM_CONFIGS: &[&str] = &[
     "microsoft-edge-beta",
 ];
 
+#[cfg(any(windows, test))]
+const WINDOWS_CHROMIUM_HOSTS: &[&str] = &[
+    r"Software\Google\Chrome\NativeMessagingHosts",
+    r"Software\Chromium\NativeMessagingHosts",
+    r"Software\Microsoft\Edge\NativeMessagingHosts",
+    r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts",
+];
+
 pub fn install(directory: &Path) -> Result<(), Box<dyn Error>> {
-    let executable = env::current_exe()?;
-    let host = launcher(directory, &executable)?;
+    let directory = std::path::absolute(directory)?;
+    fs::create_dir_all(&directory)?;
 
     #[cfg(target_os = "linux")]
     {
+        let executable = env::current_exe()?;
+        let host = launcher(&directory, &executable)?;
         let config = directories::BaseDirs::new()
             .ok_or("Could not find the browser configuration folder.")?
             .config_dir()
             .to_path_buf();
         install_chromium_manifests(&config, &host, CHROME_EXTENSION_ID)?;
     }
+
+    #[cfg(windows)]
+    {
+        let executable = env::current_exe()?;
+        let host = windows_launcher(&directory, &executable)?;
+        install_windows_manifests(&directory, &host, CHROME_EXTENSION_ID)?;
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let _ = directory;
 
     Ok(())
 }
@@ -125,6 +145,7 @@ fn choose_directory() -> Option<PathBuf> {
         .pick_folder()
 }
 
+#[cfg(target_os = "linux")]
 fn launcher(directory: &Path, executable: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let host = directory.join("gunda-native-host");
     let executable = executable
@@ -140,18 +161,102 @@ fn launcher(directory: &Path, executable: &Path) -> Result<PathBuf, Box<dyn Erro
     );
     fs::write(&host, script)?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
 
-        fs::set_permissions(&host, fs::Permissions::from_mode(0o700))?;
-    }
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700))?;
 
     Ok(host)
 }
 
+#[cfg(target_os = "linux")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn windows_launcher(directory: &Path, executable: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let host = directory.join("gunda-native-host.cmd");
+    let executable = executable
+        .to_str()
+        .ok_or("The Gunda executable path is not valid Unicode.")?;
+    let directory = directory
+        .to_str()
+        .ok_or("The Gunda data path is not valid Unicode.")?;
+    fs::write(&host, batch_script(executable, directory))?;
+    Ok(host)
+}
+
+#[cfg(any(windows, test))]
+fn batch_script(executable: &str, directory: &str) -> String {
+    // Chrome launches a non-executable host through cmd.exe. The code page
+    // change keeps non-ASCII profile paths readable in the next line.
+    format!(
+        "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul 2>&1\r\n\"{}\" --native-host --data-dir \"{}\"\r\n",
+        batch_value(executable),
+        batch_value(directory),
+    )
+}
+
+/// Escapes the one character cmd.exe expands inside a quoted argument.
+#[cfg(any(windows, test))]
+fn batch_value(value: &str) -> String {
+    value.replace('%', "%%")
+}
+
+#[cfg(windows)]
+fn install_windows_manifests(
+    directory: &Path,
+    host: &Path,
+    extension_id: &str,
+) -> Result<(), Box<dyn Error>> {
+    let manifest = directory.join(format!("{NATIVE_HOST_NAME}.json"));
+    write_chrome_native_host_manifest(&manifest, host, extension_id)?;
+
+    for browser in WINDOWS_CHROMIUM_HOSTS {
+        let status = registration_status(windows_registration_arguments(browser, &manifest))?;
+        if !status.success() {
+            return Err(format!("The native host could not be registered for {browser}.").into());
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_registration_arguments(browser: &str, manifest: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "add".into(),
+        format!(r"HKCU\{browser}\{NATIVE_HOST_NAME}").into(),
+        "/ve".into(),
+        "/t".into(),
+        "REG_SZ".into(),
+        "/d".into(),
+        manifest.as_os_str().to_owned(),
+        "/f".into(),
+    ]
+}
+
+/// Runs `reg.exe` without opening a console window.
+#[cfg(windows)]
+fn registration_status(arguments: Vec<std::ffi::OsString>) -> io::Result<std::process::ExitStatus> {
+    let mut command = Command::new("reg");
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    hide_window(&mut command).status()
+}
+
+/// Keeps a console application from opening a visible window.
+#[cfg(windows)]
+fn hide_window(command: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    command.creation_flags(CREATE_NO_WINDOW)
 }
 
 #[cfg(target_os = "linux")]
@@ -233,13 +338,19 @@ fn capture_reachable(endpoint: &str) -> bool {
 
 fn spawn_daemon(directory: &Path) -> Result<(), String> {
     let executable = env::current_exe().map_err(|_| "Could not find the Gunda executable.")?;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--daemon")
         .arg("--data-dir")
         .arg(directory)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    hide_window(&mut command);
+
+    command
         .spawn()
         .map(|_| ())
         .map_err(|_| "Could not start Gundad.".into())
@@ -247,18 +358,56 @@ fn spawn_daemon(directory: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::fs;
+    use std::path::Path;
 
+    #[cfg(target_os = "linux")]
     use tempfile::tempdir;
 
+    #[cfg(target_os = "linux")]
     use super::{CHROME_EXTENSION_ID, install_chromium_manifests, shell_quote};
+    #[cfg(any(windows, test))]
+    use super::{WINDOWS_CHROMIUM_HOSTS, batch_script, windows_registration_arguments};
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn shell_quote_preserves_apostrophes() {
         assert_eq!(
             shell_quote("/tmp/Gunda's file"),
             "'/tmp/Gunda'\"'\"'s file'"
         );
+    }
+
+    #[test]
+    fn windows_launcher_quotes_paths_and_escapes_percent() {
+        assert_eq!(
+            batch_script(
+                r"C:\Program Files\Gunda\gunda-desktop.exe",
+                r"C:\Users\A%B\Gunda",
+            ),
+            "@echo off\r\nsetlocal DisableDelayedExpansion\r\nchcp 65001 >nul 2>&1\r\n\"C:\\Program Files\\Gunda\\gunda-desktop.exe\" --native-host --data-dir \"C:\\Users\\A%%B\\Gunda\"\r\n"
+        );
+    }
+
+    #[test]
+    fn windows_registration_points_each_browser_at_the_manifest() {
+        let manifest = Path::new(r"C:\Users\Gunda User\AppData\Local\gunda\com.gunda.capture.json");
+
+        for browser in WINDOWS_CHROMIUM_HOSTS {
+            let arguments = windows_registration_arguments(browser, manifest);
+
+            let expected_key = format!(r"HKCU\{browser}\com.gunda.capture");
+
+            assert_eq!(arguments[0], "add");
+            assert_eq!(arguments[1], expected_key.as_str());
+            assert_eq!(arguments[2], "/ve");
+            assert_eq!(arguments[3], "/t");
+            assert_eq!(arguments[4], "REG_SZ");
+            assert_eq!(arguments[5], "/d");
+            assert_eq!(arguments[6], manifest.as_os_str().to_owned());
+            assert_eq!(arguments[7], "/f");
+        }
     }
 
     #[cfg(target_os = "linux")]
