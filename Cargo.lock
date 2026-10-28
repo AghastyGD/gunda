@@ -1778,6 +1778,7 @@ dependencies = [
  "gunda-ipc",
  "gunda-storage",
  "gunda-stream",
+ "serde_json",
  "tempfile",
  "tokio",
  "url",

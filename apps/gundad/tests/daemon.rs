@@ -292,11 +292,14 @@ async fn player_button_starts_a_named_download_and_reports_its_status() {
         .and_then(|value| value.split([',', '}']).next())
         .and_then(|value| value.parse::<u64>().ok())
         .expect("the formats response names the capture");
-    let download = format!(
-        r#"{{"kind":"download_page","page_url":"https://example.test/watch","capture_id":{capture_id},"directory":"{}","filename":"Chosen name.mp4"}}"#,
-        directory.path().display()
-    );
-    extension.send(&download).await;
+    let download = serde_json::json!({
+        "kind": "download_page",
+        "page_url": "https://example.test/watch",
+        "capture_id": capture_id,
+        "directory": directory.path().to_string_lossy(),
+        "filename": "Chosen name.mp4",
+    });
+    extension.send(&download.to_string()).await;
     let queued = extension.receive().await.unwrap();
     assert!(queued.contains(r#""kind":"download_queued""#));
     let download_id = queued

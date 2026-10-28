@@ -19,5 +19,6 @@ url.workspace = true
 
 [dev-dependencies]
 gunda-capture = { path = "../../crates/gunda-capture", features = ["test-client"] }
+serde_json = "1"
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
