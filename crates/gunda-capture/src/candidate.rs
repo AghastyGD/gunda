@@ -2,9 +2,8 @@
 //!
 //! A report is validated before it becomes a candidate. Validation is the only
 //! place that decides what Gunda is willing to fetch, so it is deliberately
-//! strict: a bad URL, an unrecognised media type, or a single stream segment is
-//! refused with a typed reason instead of being handed to the download engine
-//! to fail later.
+//! strict: a bad URL or a single stream segment is refused with a typed reason
+//! instead of being handed to the download engine to fail later.
 
 use std::time::Instant;
 
@@ -23,6 +22,9 @@ const MAX_TITLE_CHARS: usize = 200;
 /// Largest content type kept, in bytes.
 const MAX_CONTENT_TYPE_BYTES: usize = 128;
 
+/// Largest suggested filename kept, in characters.
+const MAX_FILENAME_CHARS: usize = 200;
+
 /// Identifier of a captured candidate.
 pub type CandidateId = u64;
 
@@ -34,6 +36,7 @@ pub struct Report {
     content_type: Option<String>,
     page_url: Url,
     page_title: Option<String>,
+    filename: Option<String>,
     variants: Vec<MediaVariant>,
 }
 
@@ -63,9 +66,8 @@ impl Report {
 
         let content_type = content_type.map(|value| truncate(value, MAX_CONTENT_TYPE_BYTES));
         let kind = match classify(&url, content_type.as_deref()) {
-            Classification::Media(kind) => kind,
+            Classification::Downloadable(kind) => kind,
             Classification::Segment => return Err(Refusal::SegmentStream),
-            Classification::Unknown => return Err(Refusal::UnsupportedMedia),
         };
 
         let page_title = page_title
@@ -78,8 +80,16 @@ impl Report {
             content_type,
             page_url,
             page_title,
+            filename: None,
             variants: Vec::new(),
         })
+    }
+
+    /// Keeps the browser's suggested filename as a hint for the destination.
+    #[must_use]
+    pub fn with_filename(mut self, filename: Option<&str>) -> Self {
+        self.filename = filename.and_then(clean_filename);
+        self
     }
 
     pub(crate) fn from_extracted(
@@ -110,6 +120,7 @@ pub struct Candidate {
     content_type: Option<String>,
     page_url: Url,
     page_title: Option<String>,
+    filename: Option<String>,
     variants: Vec<MediaVariant>,
     first_seen: Instant,
     last_seen: Instant,
@@ -148,13 +159,19 @@ impl Candidate {
         self.page_title.as_deref()
     }
 
+    /// The filename the browser suggested, when it had one.
+    #[must_use]
+    pub fn filename(&self) -> Option<&str> {
+        self.filename.as_deref()
+    }
+
     /// Directly downloadable qualities discovered with this presentation.
     #[must_use]
     pub fn variants(&self) -> &[MediaVariant] {
         &self.variants
     }
 
-    /// The final path segment of the media URL, still percent-encoded.
+    /// The final path segment of the resource URL, still percent-encoded.
     ///
     /// This is for display only. The download engine derives the destination
     /// file name, and it decodes and sanitises it in one place.
@@ -240,6 +257,9 @@ impl Catalog {
             if report.content_type.is_some() {
                 existing.content_type = report.content_type;
             }
+            if report.filename.is_some() {
+                existing.filename = report.filename;
+            }
             if !report.variants.is_empty() {
                 existing.variants = report.variants;
             }
@@ -262,6 +282,7 @@ impl Catalog {
                 content_type: report.content_type,
                 page_url: report.page_url,
                 page_title: report.page_title,
+                filename: report.filename,
                 variants: report.variants,
                 first_seen: now,
                 last_seen: now,
@@ -318,18 +339,16 @@ impl Catalog {
 /// What a reported resource turned out to be.
 enum Classification {
     /// Something the download engine can fetch.
-    Media(ResourceKind),
+    Downloadable(ResourceKind),
     /// One piece of a segmented stream.
     Segment,
-    /// Not media this build recognises.
-    Unknown,
 }
 
 /// Classifies a reported resource by its content type, then by its path.
 ///
-/// The content type is authoritative when it is decisive. `application/
-/// octet-stream` is not: plenty of servers label video that way, so a path that
-/// names a media container is still accepted.
+/// A resource that is not a stream manifest or segment is a complete file. The
+/// extension only reports resources the user asked to download, so the content
+/// type does not have to be media.
 fn classify(url: &Url, content_type: Option<&str>) -> Classification {
     if range_query(url) {
         return Classification::Segment;
@@ -347,8 +366,8 @@ fn classify(url: &Url, content_type: Option<&str>) -> Classification {
             "application/vnd.apple.mpegurl"
             | "application/x-mpegurl"
             | "audio/mpegurl"
-            | "audio/x-mpegurl" => return Classification::Media(ResourceKind::Hls),
-            "application/dash+xml" => return Classification::Media(ResourceKind::Dash),
+            | "audio/x-mpegurl" => return Classification::Downloadable(ResourceKind::Hls),
+            "application/dash+xml" => return Classification::Downloadable(ResourceKind::Dash),
             // A transport stream is what an HLS segment is served as. The
             // manifest is the resource worth downloading, and reporting every
             // segment would bury it.
@@ -357,19 +376,15 @@ fn classify(url: &Url, content_type: Option<&str>) -> Classification {
         }
 
         if essence.starts_with("video/") || essence.starts_with("audio/") {
-            return Classification::Media(ResourceKind::File);
+            return Classification::Downloadable(ResourceKind::File);
         }
     }
 
     match extension(url).as_deref() {
-        Some("m3u8") => Classification::Media(ResourceKind::Hls),
-        Some("mpd") => Classification::Media(ResourceKind::Dash),
-        Some(
-            "mp4" | "m4v" | "webm" | "mkv" | "mov" | "flv" | "avi" | "wmv" | "mpeg" | "mpg" | "3gp"
-            | "ogv" | "mp3" | "m4a" | "aac" | "ogg" | "oga" | "opus" | "flac" | "wav",
-        ) => Classification::Media(ResourceKind::File),
+        Some("m3u8") => Classification::Downloadable(ResourceKind::Hls),
+        Some("mpd") => Classification::Downloadable(ResourceKind::Dash),
         Some("ts" | "m4s") => Classification::Segment,
-        _ => Classification::Unknown,
+        _ => Classification::Downloadable(ResourceKind::File),
     }
 }
 
@@ -404,6 +419,23 @@ fn clean_title(title: &str) -> String {
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// Keeps only the final component of a suggested filename and bounds it.
+fn clean_filename(filename: &str) -> Option<String> {
+    let filename = filename.rsplit(['/', '\\']).next().unwrap_or(filename);
+    let filename = filename
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_FILENAME_CHARS)
+        .collect::<String>();
+    let filename = filename.trim();
+
+    if filename.is_empty() {
+        None
+    } else {
+        Some(filename.to_owned())
+    }
 }
 
 /// Truncates a string to a byte budget, on a character boundary.
@@ -519,17 +551,39 @@ mod tests {
     }
 
     #[test]
-    fn refuses_something_that_is_not_media() {
-        assert_eq!(
-            Report::new(
-                "https://example.com/app.js",
-                Some("text/javascript"),
-                "https://example.com/watch",
-                None
-            )
-            .expect_err("scripts are not media"),
-            Refusal::UnsupportedMedia
-        );
+    fn accepts_a_generic_file() {
+        let report = Report::new(
+            "https://example.com/report",
+            Some("application/pdf"),
+            "https://example.com/files",
+            None,
+        )
+        .expect("a browser download is a complete file");
+
+        assert_eq!(report.kind, ResourceKind::File);
+        assert_eq!(report.content_type.as_deref(), Some("application/pdf"));
+    }
+
+    #[test]
+    fn keeps_a_bounded_suggested_filename() {
+        let report = Report::new(
+            "https://example.com/report",
+            Some("application/pdf"),
+            "https://example.com/files",
+            None,
+        )
+        .expect("the report is valid")
+        .with_filename(Some("C:\\Users\\owner\\Downloads\\report.pdf"));
+
+        assert_eq!(report.filename.as_deref(), Some("report.pdf"));
+
+        let long = format!("folder/report-{}.pdf", "x".repeat(400));
+        let report = report.with_filename(Some(&long));
+        let filename = report.filename.expect("a filename was kept");
+
+        assert_eq!(filename.chars().count(), 200);
+        assert!(filename.chars().all(|character| !character.is_control()));
+        assert!(!filename.contains('/'));
     }
 
     #[test]
@@ -587,7 +641,8 @@ mod tests {
                 "https://example.com/watch",
                 None,
             )
-            .expect("the report is valid"),
+            .expect("the report is valid")
+            .with_filename(Some("Chosen name.mp4")),
         );
 
         assert_eq!(first.id, second.id);
@@ -599,6 +654,7 @@ mod tests {
         assert_eq!(candidate.seen(), 2);
         assert!(candidate.last_seen() >= candidate.first_seen());
         assert_eq!(candidate.content_type(), Some("video/mp4"));
+        assert_eq!(candidate.filename(), Some("Chosen name.mp4"));
     }
 
     #[test]

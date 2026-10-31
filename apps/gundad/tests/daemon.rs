@@ -93,6 +93,149 @@ async fn capture_continues_while_no_client_is_connected() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn daemon_downloads_a_generic_file_with_its_suggested_name() {
+    let directory = tempdir().unwrap();
+    let (address, server) = typed_file_server(b"%PDF-1.7\nreport", "application/pdf").await;
+    let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
+    let endpoint = wait_for_endpoint(directory.path()).await;
+    let token = load_token(&directory.path().join("gundad-token"))
+        .unwrap()
+        .unwrap();
+    let (mut client, initial) = connect(&endpoint, token.as_str()).await.unwrap();
+    let capture = initial.capture.expect("capture starts with the daemon");
+    let mut extension = TestClient::connect(capture_address(&capture.endpoint), "/capture", None)
+        .await
+        .0;
+    extension
+        .send(&format!(
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
+            capture.token
+        ))
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"ready""#)
+    );
+    extension
+        .send(&format!(
+            r#"{{"kind":"candidate","url":"http://{address}/download","content_type":"application/pdf","page_url":"https://example.test/files","page_title":"Files","filename":"Quarterly report.pdf"}}"#
+        ))
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"accepted""#)
+    );
+
+    let captured = wait_for_capture(&mut client).await;
+    let capture = &captured.captures[0];
+
+    assert_eq!(capture.kind, "File");
+    assert_eq!(capture.filename.as_deref(), Some("Quarterly report.pdf"));
+    assert_eq!(capture.page_title.as_deref(), Some("Files"));
+
+    client
+        .send(&ClientMessage::Command {
+            command: Command::DownloadCapture {
+                id: capture.id,
+                directory: NativePath::from_path(directory.path()).unwrap(),
+                track: None,
+            },
+        })
+        .await
+        .unwrap();
+
+    let completed = wait_for_completed(&mut client).await;
+    let job = completed
+        .jobs
+        .iter()
+        .find(|job| job.state == "completed")
+        .unwrap();
+    let output = job.output.as_ref().unwrap().to_path().unwrap();
+
+    assert_eq!(job.origin, "Browser");
+    assert_eq!(
+        output.file_name().and_then(|name| name.to_str()),
+        Some("Quarterly report.pdf")
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"%PDF-1.7\nreport");
+    server.await.unwrap();
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_download_is_queued_and_named_by_the_browser() {
+    let directory = tempdir().unwrap();
+    let (address, server) = typed_file_server(b"%PDF-1.7\nbrowser", "application/pdf").await;
+    let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
+    let endpoint = wait_for_endpoint(directory.path()).await;
+    let token = load_token(&directory.path().join("gundad-token"))
+        .unwrap()
+        .unwrap();
+    let (mut client, initial) = connect(&endpoint, token.as_str()).await.unwrap();
+    let capture = initial.capture.expect("capture starts with the daemon");
+    let mut extension = TestClient::connect(capture_address(&capture.endpoint), "/capture", None)
+        .await
+        .0;
+    extension
+        .send(&format!(
+            r#"{{"kind":"hello","version":3,"token":"{}","agent":"gundad-test"}}"#,
+            capture.token
+        ))
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"ready""#)
+    );
+    extension
+        .send(
+            &serde_json::json!({
+                "kind": "download_browser",
+                "url": format!("http://{address}/download"),
+                "content_type": "application/pdf",
+                "page_url": "https://example.test/files",
+                "page_title": "Files",
+                "filename": "Browser report.pdf",
+                "directory": directory.path().display().to_string(),
+            })
+            .to_string(),
+        )
+        .await;
+    assert!(
+        extension
+            .receive()
+            .await
+            .unwrap()
+            .contains(r#""kind":"download_queued""#)
+    );
+
+    let completed = wait_for_completed(&mut client).await;
+    let job = completed
+        .jobs
+        .iter()
+        .find(|job| job.state == "completed")
+        .unwrap();
+    let output = job.output.as_ref().unwrap().to_path().unwrap();
+
+    assert_eq!(job.origin, "Browser");
+    assert_eq!(
+        output.file_name().and_then(|name| name.to_str()),
+        Some("Browser report.pdf")
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), b"%PDF-1.7\nbrowser");
+    server.await.unwrap();
+    daemon.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn daemon_inspects_the_qualities_of_a_capture() {
     const MASTER: &str = "#EXTM3U\n\
 #EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=640x360\n\
@@ -539,6 +682,13 @@ fn capture_address(endpoint: &str) -> std::net::SocketAddr {
 }
 
 async fn file_server(body: &'static [u8]) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    typed_file_server(body, "video/mp4").await
+}
+
+async fn typed_file_server(
+    body: &'static [u8],
+    content_type: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -547,7 +697,7 @@ async fn file_server(body: &'static [u8]) -> (std::net::SocketAddr, tokio::task:
         socket
             .write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: video/mp4\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: {content_type}\r\nconnection: close\r\n\r\n",
                     body.len()
                 )
                 .as_bytes(),

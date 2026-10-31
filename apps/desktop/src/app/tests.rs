@@ -497,6 +497,7 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
             kind: "File",
             content_type: Some("video/mp4".into()),
             page_title: Some("A movie page".into()),
+            filename: Some("A movie.mp4".into()),
             seen: 2,
             segmented: false,
             selectable: false,
@@ -514,6 +515,7 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
     assert!(has("Copy endpoint"), "missing endpoint copy: {labels:?}");
     assert!(has("video/mp4"), "missing content type: {labels:?}");
     assert!(has("A movie page"), "missing page title: {labels:?}");
+    assert!(has("A movie.mp4"), "missing suggested filename: {labels:?}");
     assert!(
         has("Download") && has("Dismiss"),
         "missing row actions: {labels:?}"
@@ -541,6 +543,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
             kind: "HLS",
             content_type: Some("application/vnd.apple.mpegurl".into()),
             page_title: Some("A film".into()),
+            filename: None,
             seen: 1,
             segmented: true,
             selectable: true,

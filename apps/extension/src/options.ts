@@ -12,6 +12,7 @@ const endpointField = element<HTMLInputElement>('endpoint');
 const tokenField = element<HTMLInputElement>('token');
 const statusField = element<HTMLElement>('status');
 const statsField = element<HTMLElement>('stats');
+const lastDownloadField = element<HTMLElement>('last-download');
 const saveButton = element<HTMLButtonElement>('save');
 const clearButton = element<HTMLButtonElement>('clear');
 
@@ -44,10 +45,33 @@ function describeStats(value: unknown): string {
     : 'Nothing reported yet.';
 }
 
+function describeLastDownload(value: unknown): string {
+  if (!value || typeof value !== 'object') {
+    return 'Last browser download: none seen yet.';
+  }
+
+  const download = value as Partial<BrowserDownloadDiagnostic>;
+  const address = `${download.scheme ?? ''}${download.host ?? ''}`.trim() || 'unknown address';
+  const parts = [
+    `Last browser download: ${download.outcome ?? 'unknown'}`,
+    address,
+    download.mime || 'unknown type',
+    download.filename || 'no filename',
+  ];
+  if (download.reason) {
+    parts.push(`reason: ${download.reason}`);
+  }
+  if (download.at) {
+    parts.push(new Date(download.at).toLocaleTimeString());
+  }
+  return parts.join(' | ');
+}
+
 async function refresh(): Promise<void> {
-  const stored = await chrome.storage.session.get(['status', 'stats']);
+  const stored = await chrome.storage.session.get(['status', 'stats', 'last_download']);
   statusField.textContent = describe(stored.status);
   statsField.textContent = describeStats(stored.stats);
+  lastDownloadField.textContent = describeLastDownload(stored.last_download);
 }
 
 async function save(): Promise<void> {
@@ -71,7 +95,7 @@ async function save(): Promise<void> {
 async function forget(): Promise<void> {
   await chrome.storage.local.remove(['endpoint', 'token']);
   await chrome.storage.session.clear();
-  await chrome.runtime.sendMessage({ kind: 'reconnect' });
+  await chrome.runtime.sendMessage({ kind: 'forget' });
   endpointField.value = '';
   tokenField.value = '';
   statusField.textContent = 'Forgotten. Nothing will be reported until a pairing is saved.';

@@ -17,6 +17,10 @@ test('manifest declares automatic native pairing', () => {
   assert.equal(typeof manifest.key, 'string');
 });
 
+test('manifest observes browser downloads', () => {
+  assert.ok(manifest.permissions.includes('downloads'));
+});
+
 test('page agent runs in the page world before site scripts', () => {
   const agent = manifest.content_scripts.find((script) => script.js.includes('page.js'));
 

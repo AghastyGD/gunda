@@ -3,6 +3,7 @@ type CandidateReport = {
   content_type: string | null;
   page_url: string;
   page_title: string | null;
+  filename?: string | null;
 };
 
 type PageSource = {
@@ -33,6 +34,7 @@ type RuntimeMessage =
       document: unknown;
     }
   | { kind: 'reconnect' }
+  | { kind: 'forget' }
   | { kind: 'list-formats' }
   | { kind: 'download-status'; id: number }
   | {
@@ -55,7 +57,7 @@ type RuntimeMessage =
     };
 
 type ServerMessage =
-  | { kind: 'ready'; version: number }
+  | { kind: 'ready'; version: number; features?: string[] }
   | { kind: 'accepted'; id: number }
   | { kind: 'duplicate'; id: number }
   | { kind: 'recorded'; accepted: number[]; duplicates: number[] }
@@ -83,6 +85,23 @@ type ChannelStatus = {
 };
 
 type ChannelStats = Record<string, number>;
+
+type BrowserDownloadOutcome =
+  | 'intercepted'
+  | 'kept'
+  | 'ignored_extension'
+  | 'ignored_non_http';
+
+type BrowserDownloadDiagnostic = {
+  at: number;
+  scheme: string;
+  host: string;
+  mime: string;
+  filename: string | null;
+  by_extension: boolean;
+  outcome: BrowserDownloadOutcome;
+  reason: string | null;
+};
 
 type PairingSettings = {
   endpoint: string;

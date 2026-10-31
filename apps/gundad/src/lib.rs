@@ -432,19 +432,13 @@ impl Daemon {
             None => (captured.url.clone(), None, None),
         };
         let extension = capture_extension(&captured, track_filename.as_deref());
-        let filename = track_filename
-            .clone()
-            .or_else(|| {
-                captured
-                    .page_title
-                    .as_deref()
-                    .and_then(|title| title_filename(title, extension.as_deref()))
-            })
-            .or_else(|| {
-                extension
-                    .as_deref()
-                    .map(|extension| format!("download.{extension}"))
-            });
+        let filename = track_filename.clone().or_else(|| {
+            preferred_capture_filename(
+                captured.filename.as_deref(),
+                captured.page_title.as_deref(),
+                extension.as_deref(),
+            )
+        });
         let mut request = RequestContext::new(url, Vec::new());
         if let Some(selection) = selection {
             request = request.with_selection(selection);
@@ -516,6 +510,7 @@ impl Daemon {
             kind: candidate.kind(),
             content_type: candidate.content_type().map(str::to_owned),
             page_title: candidate.page_title().map(str::to_owned),
+            filename: candidate.filename().map(str::to_owned),
             variants: candidate.variants().to_vec(),
         })
     }
@@ -849,7 +844,7 @@ impl Daemon {
                     .or_else(default_download_directory)
                 else {
                     self.notice =
-                        Some("Choose a download folder before using the page button.".into());
+                        Some("Choose a download folder before downloading a captured file.".into());
                     let _ = reply.send(Err(Refusal::CaptureUnavailable));
                     return;
                 };
@@ -979,9 +974,13 @@ impl Daemon {
                 .collect()
         } else {
             vec![MediaFormat {
-                label: candidate.page_title().unwrap_or("Original file").to_owned(),
+                label: candidate
+                    .filename()
+                    .or_else(|| candidate.page_title())
+                    .unwrap_or("Original file")
+                    .to_owned(),
                 group: None,
-                details: candidate.content_type().unwrap_or("media").to_owned(),
+                details: candidate.content_type().unwrap_or("file").to_owned(),
                 format: String::from("best"),
             }]
         };
@@ -989,6 +988,8 @@ impl Daemon {
         if formats.is_empty() {
             Err(Refusal::CaptureUnavailable)
         } else {
+            let extension = suggested_capture_extension(candidate);
+
             Ok(FormatsResponse {
                 capture_id: candidate.id(),
                 formats,
@@ -997,18 +998,11 @@ impl Daemon {
                     .clone()
                     .or_else(default_download_directory)
                     .and_then(|directory| directory.to_str().map(str::to_owned)),
-                filename: candidate
-                    .page_title()
-                    .and_then(|title| {
-                        let extension = suggested_capture_extension(candidate);
-                        title_filename(title, Some(&extension))
-                    })
-                    .or_else(|| {
-                        Some(format!(
-                            "download.{}",
-                            suggested_capture_extension(candidate)
-                        ))
-                    }),
+                filename: preferred_capture_filename(
+                    candidate.filename(),
+                    candidate.page_title(),
+                    Some(&extension),
+                ),
             })
         }
     }
@@ -1172,14 +1166,41 @@ struct Captured {
     kind: ResourceKind,
     content_type: Option<String>,
     page_title: Option<String>,
+    filename: Option<String>,
     variants: Vec<MediaVariant>,
+}
+
+fn filename_extension(filename: &str) -> Option<String> {
+    Path::new(filename)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_owned)
+}
+
+fn preferred_capture_filename(
+    filename: Option<&str>,
+    page_title: Option<&str>,
+    extension: Option<&str>,
+) -> Option<String> {
+    filename
+        .and_then(|filename| title_filename(filename, None))
+        .map(|filename| {
+            if Path::new(&filename).extension().is_some() {
+                filename
+            } else if let Some(extension) = extension {
+                format!("{filename}.{extension}")
+            } else {
+                filename
+            }
+        })
+        .or_else(|| page_title.and_then(|title| title_filename(title, extension)))
+        .or_else(|| extension.map(|extension| format!("download.{extension}")))
 }
 
 fn capture_extension(captured: &Captured, track_filename: Option<&str>) -> Option<String> {
     track_filename
-        .and_then(|filename| Path::new(filename).extension())
-        .and_then(|extension| extension.to_str())
-        .map(str::to_owned)
+        .and_then(filename_extension)
+        .or_else(|| captured.filename.as_deref().and_then(filename_extension))
         .or_else(|| {
             captured
                 .content_type
@@ -1190,12 +1211,7 @@ fn capture_extension(captured: &Captured, track_filename: Option<&str>) -> Optio
         .or_else(|| match captured.kind {
             ResourceKind::Hls | ResourceKind::Dash => Some("mp4".into()),
             ResourceKind::File | ResourceKind::Unknown => {
-                url_filename(&captured.url).and_then(|filename| {
-                    Path::new(&filename)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                        .map(str::to_owned)
-                })
+                url_filename(&captured.url).and_then(|filename| filename_extension(&filename))
             }
         })
 }
@@ -1225,6 +1241,30 @@ fn content_type_extension(content_type: &str) -> Option<&'static str> {
         "audio/opus" => Some("opus"),
         "audio/flac" => Some("flac"),
         "audio/wav" | "audio/x-wav" => Some("wav"),
+        "application/pdf" => Some("pdf"),
+        "application/zip" | "application/x-zip-compressed" => Some("zip"),
+        "application/x-7z-compressed" => Some("7z"),
+        "application/x-rar-compressed" | "application/vnd.rar" => Some("rar"),
+        "application/gzip" | "application/x-gzip" => Some("gz"),
+        "application/x-tar" => Some("tar"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "application/vnd.ms-powerpoint" => Some("ppt"),
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => Some("pptx"),
+        "application/epub+zip" => Some("epub"),
+        "application/vnd.android.package-archive" => Some("apk"),
+        "application/x-iso9660-image" => Some("iso"),
+        "text/plain" => Some("txt"),
+        "text/csv" => Some("csv"),
+        "application/json" => Some("json"),
+        "application/xml" | "text/xml" => Some("xml"),
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
         _ => None,
     }
 }
@@ -1250,6 +1290,7 @@ fn capture_view(candidate: &Candidate) -> CaptureView {
         kind: capture_kind_name(candidate.kind()).to_owned(),
         content_type: candidate.content_type().map(str::to_owned),
         page_title: candidate.page_title().map(str::to_owned),
+        filename: candidate.filename().map(str::to_owned),
         seen: candidate.seen(),
         segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
         selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)
@@ -1334,16 +1375,16 @@ fn suggested_capture_extension(candidate: &Candidate) -> String {
         return String::from("mp4");
     }
     candidate
-        .content_type()
-        .and_then(content_type_extension)
-        .map(str::to_owned)
+        .filename()
+        .and_then(filename_extension)
         .or_else(|| {
-            url_filename(candidate.url()).and_then(|filename| {
-                Path::new(&filename)
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    .map(str::to_owned)
-            })
+            candidate
+                .content_type()
+                .and_then(content_type_extension)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            url_filename(candidate.url()).and_then(|filename| filename_extension(&filename))
         })
         .unwrap_or_else(|| String::from("bin"))
 }
@@ -1520,5 +1561,39 @@ fn failure_kind_name(kind: FailureKind) -> &'static str {
         FailureKind::Integrity => "integrity",
         FailureKind::Storage => "storage",
         FailureKind::Internal => "internal",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{content_type_extension, filename_extension, preferred_capture_filename};
+
+    #[test]
+    fn maps_common_download_types_to_extensions() {
+        assert_eq!(
+            content_type_extension("application/pdf; charset=binary"),
+            Some("pdf")
+        );
+        assert_eq!(content_type_extension("application/zip"), Some("zip"));
+        assert_eq!(
+            content_type_extension(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            ),
+            Some("docx")
+        );
+    }
+
+    #[test]
+    fn a_suggested_filename_wins_over_the_page_title() {
+        assert_eq!(
+            preferred_capture_filename(Some("Quarterly report.pdf"), Some("Files"), Some("pdf"))
+                .as_deref(),
+            Some("Quarterly report.pdf")
+        );
+        assert_eq!(
+            preferred_capture_filename(None, None, Some("pdf")).as_deref(),
+            Some("download.pdf")
+        );
+        assert_eq!(filename_extension("report.pdf").as_deref(), Some("pdf"));
     }
 }

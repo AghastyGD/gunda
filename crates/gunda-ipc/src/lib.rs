@@ -191,7 +191,7 @@ impl fmt::Debug for CaptureStatus {
     }
 }
 
-/// A media resource reported by the browser.
+/// A resource reported by the browser.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureView {
     pub id: u64,
@@ -199,6 +199,8 @@ pub struct CaptureView {
     pub kind: String,
     pub content_type: Option<String>,
     pub page_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
     pub seen: u32,
     pub segmented: bool,
     pub selectable: bool,
@@ -552,6 +554,7 @@ mod tests {
                     kind: "HLS".into(),
                     content_type: Some("application/vnd.apple.mpegurl".into()),
                     page_title: Some("A presentation".into()),
+                    filename: Some("presentation.m3u8".into()),
                     seen: 2,
                     segmented: true,
                     selectable: true,

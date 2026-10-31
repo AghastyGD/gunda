@@ -66,7 +66,7 @@ pub struct Snapshot {
     pub notice: Option<String>,
 }
 
-/// A media resource the browser reported.
+/// A resource the browser reported.
 #[derive(Clone)]
 pub struct CaptureView {
     pub id: CandidateId,
@@ -74,6 +74,7 @@ pub struct CaptureView {
     pub kind: &'static str,
     pub content_type: Option<String>,
     pub page_title: Option<String>,
+    pub filename: Option<String>,
     pub seen: u32,
     /// Whether the resource is a presentation whose tracks can be listed.
     pub segmented: bool,
@@ -1135,6 +1136,7 @@ impl CaptureView {
             kind: kind_label(candidate.kind()),
             content_type: candidate.content_type().map(str::to_owned),
             page_title: candidate.page_title().map(str::to_owned),
+            filename: candidate.filename().map(str::to_owned),
             seen: candidate.seen(),
             segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
             selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)

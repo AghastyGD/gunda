@@ -3,9 +3,13 @@ const AGENT = 'gunda-capture/0.1.0';
 const NATIVE_HOST_NAME = 'com.gunda.capture';
 const NATIVE_HOST_PROTOCOL_VERSION = 1;
 const MAX_PENDING = 32;
+const PENDING_KEY = 'pending';
 const MAX_SOURCE_MESSAGE_BYTES = 1792 * 1024;
 const DEDUP_WINDOW_MS = 10 * 60 * 1000;
 const DEDUP_LIMIT = 2048;
+const BROWSER_DOWNLOAD_FEATURE = 'browser_download';
+const BROWSER_DOWNLOAD_TIMEOUT_MS = 6000;
+const HANDLED_DOWNLOAD_TTL_MS = 60 * 1000;
 
 const MEDIA_TYPES = /^(video|audio)\//i;
 const PLAYLIST_TYPES =
@@ -20,9 +24,16 @@ let greeted = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let attempt = 0;
 let automaticPairing: PairingSettings | null = null;
+let pendingLoad: Promise<void> | null = null;
+let pendingWrite: Promise<void> = Promise.resolve();
+let pendingEpoch = 0;
+let flushing: Promise<void> | null = null;
+let serverFeatures = new Set<string>();
 
 const pending: string[] = [];
 const seen = new Map<string, number>();
+const handledDownloads = new Map<number, number>();
+const reportedDownloads = new Map<number, number>();
 const downloadRequests: {
   resolve: (response: DownloadResponse) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -122,6 +133,48 @@ async function count(kind: string, amount = 1): Promise<void> {
   await chrome.storage.session.set({ stats });
 }
 
+function loadPending(): Promise<void> {
+  const epoch = pendingEpoch;
+  pendingLoad ??= chrome.storage.session
+    .get(PENDING_KEY)
+    .then((stored) => {
+      if (epoch !== pendingEpoch) {
+        return;
+      }
+      const value = stored[PENDING_KEY];
+      if (!Array.isArray(value)) {
+        return;
+      }
+      for (const entry of value) {
+        if (typeof entry === 'string' && pending.length < MAX_PENDING) {
+          pending.push(entry);
+        }
+      }
+    })
+    .catch(() => {});
+  return pendingLoad;
+}
+
+function savePending(): void {
+  const snapshot = [...pending];
+  pendingWrite = pendingWrite
+    .then(() => chrome.storage.session.set({ [PENDING_KEY]: snapshot }))
+    .catch(() => {});
+}
+
+function enqueue(message: string): void {
+  void loadPending().then(() => {
+    if (pending.length >= MAX_PENDING) {
+      pending.shift();
+    }
+    pending.push(message);
+    savePending();
+    connect();
+    flush();
+    setTimeout(() => flush(), 0);
+  });
+}
+
 function connect(): void {
   if (
     connection &&
@@ -170,6 +223,7 @@ function connect(): void {
       }
       automaticPairing = null;
       greeted = false;
+      serverFeatures = new Set<string>();
       for (const request of downloadRequests.splice(0)) {
         clearTimeout(request.timer);
         request.resolve({ kind: 'unavailable', reason: 'connection_closed' });
@@ -213,6 +267,7 @@ function disconnect(): void {
   connection = null;
   automaticPairing = null;
   greeted = false;
+  serverFeatures = new Set<string>();
 
   if (socket) {
     socket.close();
@@ -228,6 +283,7 @@ function handle(message: unknown): void {
   switch (server.kind) {
     case 'ready':
       greeted = true;
+      serverFeatures = new Set(server.features ?? []);
       void setStatus({ state: 'connected', protocol: server.version });
       flush();
       break;
@@ -277,12 +333,23 @@ function handle(message: unknown): void {
 }
 
 function flush(): void {
-  while (pending.length > 0 && greeted && connection?.readyState === WebSocket.OPEN) {
-    const message = pending.shift();
-    if (message) {
-      connection.send(message);
-    }
+  if (flushing) {
+    return;
   }
+
+  flushing = loadPending()
+    .then(() => {
+      while (pending.length > 0 && greeted && connection?.readyState === WebSocket.OPEN) {
+        const message = pending.shift();
+        if (message) {
+          connection.send(message);
+        }
+      }
+    })
+    .finally(() => {
+      savePending();
+      flushing = null;
+    });
 }
 
 function reportCandidate(candidate: CandidateReport): void {
@@ -291,16 +358,17 @@ function reportCandidate(candidate: CandidateReport): void {
   }
 
   const now = Date.now();
-  const last = seen.get(candidate.url);
+  const key = `${candidate.url}\u0000${candidate.filename ?? ''}`;
+  const last = seen.get(key);
   if (last !== undefined && now - last < DEDUP_WINDOW_MS) {
     return;
   }
 
-  seen.set(candidate.url, now);
+  seen.set(key, now);
   if (seen.size > DEDUP_LIMIT) {
-    for (const [url, at] of seen) {
+    for (const [seenKey, at] of seen) {
       if (now - at >= DEDUP_WINDOW_MS) {
-        seen.delete(url);
+        seen.delete(seenKey);
       }
     }
   }
@@ -311,11 +379,7 @@ function reportCandidate(candidate: CandidateReport): void {
     return;
   }
 
-  if (pending.length >= MAX_PENDING) {
-    pending.shift();
-  }
-  pending.push(message);
-  connect();
+  enqueue(message);
 }
 
 function reportSource(
@@ -332,11 +396,7 @@ function reportSource(
     return;
   }
 
-  if (pending.length >= MAX_PENDING) {
-    pending.shift();
-  }
-  pending.push(message);
-  connect();
+  enqueue(message);
 }
 
 function finishDownloadRequest(response: DownloadResponse): void {
@@ -530,6 +590,195 @@ function isSegment(url: string, contentType: string): boolean {
   );
 }
 
+function downloadFilename(filename: string | undefined): string | null {
+  const name = filename?.split(/[\\/]/).pop()?.trim();
+  return name ? [...name].slice(0, 200).join('') : null;
+}
+
+function schemeHost(url: string): { scheme: string; host: string } {
+  try {
+    const parsed = new URL(url);
+    return { scheme: parsed.protocol, host: parsed.host };
+  } catch {
+    return { scheme: '', host: '' };
+  }
+}
+
+async function rememberDownload(
+  item: chrome.downloads.DownloadItem,
+  outcome: BrowserDownloadOutcome,
+  reason: string | null = null,
+): Promise<void> {
+  const { scheme, host } = schemeHost(item.url);
+  const diagnostic: BrowserDownloadDiagnostic = {
+    at: Date.now(),
+    scheme,
+    host,
+    mime: item.mime || '',
+    filename: downloadFilename(item.filename),
+    by_extension: Boolean(item.byExtensionId),
+    outcome,
+    reason,
+  };
+  await chrome.storage.session.set({ last_download: diagnostic });
+}
+
+function rememberFor(map: Map<number, number>, id: number): void {
+  const now = Date.now();
+  map.set(id, now);
+  for (const [key, at] of map) {
+    if (now - at >= HANDLED_DOWNLOAD_TTL_MS) {
+      map.delete(key);
+    }
+  }
+}
+
+function reportBrowserDownload(
+  item: chrome.downloads.DownloadItem,
+  outcome: BrowserDownloadOutcome = 'kept',
+  reason: string | null = null,
+): void {
+  if (reportedDownloads.has(item.id)) {
+    return;
+  }
+  rememberFor(reportedDownloads, item.id);
+
+  if (item.byExtensionId) {
+    void count('ignored_by_extension');
+    void rememberDownload(item, 'ignored_extension');
+    return;
+  }
+  if (!/^https?:/i.test(item.url)) {
+    void count('ignored_non_http');
+    void rememberDownload(item, 'ignored_non_http');
+    return;
+  }
+
+  void count('browser_download');
+  void rememberDownload(item, outcome, reason);
+  reportCandidate({
+    url: item.url,
+    content_type: item.mime || null,
+    page_url: /^https?:/i.test(item.referrer) ? item.referrer : item.url,
+    page_title: null,
+    filename: downloadFilename(item.filename),
+  });
+}
+
+function canInterceptBrowserDownload(item: chrome.downloads.DownloadItem): boolean {
+  return (
+    !item.byExtensionId &&
+    /^https?:/i.test(item.url) &&
+    greeted &&
+    connection?.readyState === WebSocket.OPEN &&
+    serverFeatures.has(BROWSER_DOWNLOAD_FEATURE)
+  );
+}
+
+function requestBrowserDownload(
+  item: chrome.downloads.DownloadItem,
+): Promise<DownloadResponse> {
+  if (!connection || connection.readyState !== WebSocket.OPEN || !greeted) {
+    return Promise.resolve({ kind: 'unavailable', reason: 'connection_unavailable' });
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      const index = downloadRequests.findIndex((request) => request.resolve === resolve);
+      if (index >= 0) {
+        downloadRequests.splice(index, 1);
+      }
+      resolve({ kind: 'unavailable', reason: 'timeout' });
+    }, BROWSER_DOWNLOAD_TIMEOUT_MS);
+    downloadRequests.push({ resolve, timer });
+    connection?.send(
+      JSON.stringify({
+        kind: 'download_browser',
+        url: item.url,
+        content_type: item.mime || null,
+        page_url: /^https?:/i.test(item.referrer) ? item.referrer : item.url,
+        page_title: null,
+        filename: downloadFilename(item.filename),
+      }),
+    );
+  });
+}
+
+function cancelBrowserDownload(id: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      chrome.downloads.cancel(id, () => {
+        if (chrome.runtime.lastError) {
+          resolve(false);
+          return;
+        }
+        chrome.downloads.erase({ id }, () => {
+          void chrome.runtime.lastError;
+          resolve(true);
+        });
+      });
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+async function interceptBrowserDownload(
+  item: chrome.downloads.DownloadItem,
+  suggest?: (suggestion?: chrome.downloads.FilenameSuggestion) => void,
+): Promise<void> {
+  let finished = false;
+  const finish = (): void => {
+    if (finished) {
+      return;
+    }
+    finished = true;
+    try {
+      suggest?.();
+    } catch {
+      // The browser may already have removed the item.
+    }
+  };
+
+  try {
+    const response = await requestBrowserDownload(item);
+    if (response.kind !== 'queued') {
+      await count('browser_download_kept');
+      reportBrowserDownload(item, 'kept', response.reason);
+      finish();
+      return;
+    }
+
+    const cancelled = await cancelBrowserDownload(item.id);
+    if (!cancelled) {
+      await count('browser_download_cancel_failed');
+      reportBrowserDownload(item, 'kept', 'cancel_failed');
+      finish();
+      return;
+    }
+
+    await count('browser_download_intercepted');
+    void rememberDownload(item, 'intercepted');
+  } catch {
+    await count('browser_download_kept');
+    reportBrowserDownload(item, 'kept', 'intercept_failed');
+    finish();
+  }
+}
+
+function beginBrowserIntercept(
+  item: chrome.downloads.DownloadItem,
+  suggest?: (suggestion?: chrome.downloads.FilenameSuggestion) => void,
+): boolean {
+  if (handledDownloads.has(item.id) || !canInterceptBrowserDownload(item)) {
+    return false;
+  }
+
+  rememberFor(handledDownloads, item.id);
+  void interceptBrowserDownload(item, suggest);
+  return true;
+}
+
 async function attribute(tabId: number): Promise<{ url: string; title: string | null } | null> {
   try {
     const tab = await chrome.tabs.get(tabId);
@@ -560,6 +809,7 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
     return message;
   }
   return message.kind === 'reconnect' ||
+    message.kind === 'forget' ||
     message.kind === 'list-formats' ||
     message.kind === 'download-status' ||
     message.kind === 'open-download' ||
@@ -603,6 +853,32 @@ chrome.webRequest.onResponseStarted.addListener(
   ['responseHeaders'],
 );
 
+if (chrome.downloads.onDeterminingFilename) {
+  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
+    if (handledDownloads.has(item.id)) {
+      suggest();
+      return false;
+    }
+    if (beginBrowserIntercept(item, suggest)) {
+      return true;
+    }
+
+    suggest();
+    reportBrowserDownload(item);
+    return false;
+  });
+}
+
+chrome.downloads.onCreated.addListener((item) => {
+  if (handledDownloads.has(item.id)) {
+    return;
+  }
+  if (beginBrowserIntercept(item)) {
+    return;
+  }
+  reportBrowserDownload(item);
+});
+
 chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
   const message = runtimeMessage(value);
   if (!message) {
@@ -610,6 +886,16 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
   }
 
   if (message.kind === 'reconnect') {
+    disconnect();
+    connect();
+    return;
+  }
+
+  if (message.kind === 'forget') {
+    pendingEpoch += 1;
+    pendingLoad = Promise.resolve();
+    pending.length = 0;
+    savePending();
     disconnect();
     connect();
     return;
@@ -672,6 +958,12 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
       page_url: sender.tab.url,
       page_title: sender.tab.title ?? null,
     });
+  }
+});
+
+void loadPending().then(() => {
+  if (pending.length > 0) {
+    connect();
   }
 });
 

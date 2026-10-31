@@ -1,7 +1,9 @@
 # Gunda Capture (browser extension)
 
 Download files with Gunda over a loopback WebSocket. The current build detects
-media resources; capturing arbitrary file downloads is tracked in
+media resources and takes over user-initiated HTTP(S) downloads. When the daemon
+accepts a download, the extension cancels the browser's own copy so the file is
+written once. Authenticated downloads and `blob:` or `data:` URLs are tracked in
 [#39](https://github.com/AghastyGD/gunda/issues/39).
 
 This is the browser half of the capture channel documented in
@@ -13,16 +15,18 @@ generated under `dist`.
 
 ## What it reports
 
-Three sources, because none is enough on its own:
+Several sources, because none is enough on its own:
 
 | Source | File | Sees |
 | --- | --- | --- |
 | Response sniffing | `background.js` | every response the browser fetches, including the manifests and media files that Media Source Extensions hide from the page |
+| Browser downloads | `background.js` | downloads the user starts in the browser, including files that are not media; the browser copy is cancelled after Gunda queues it |
 | DOM scanning | `content.js` | `<video>`, `<audio>`, and `<source>` elements the page declares, including ones a page builds from data it already had |
 | Page source capture | `page.js` | bounded JSON responses from any site, with dedicated Instagram, Facebook, and YouTube handling |
 | Player control | `content.js` | a Shadow DOM download button over visible video elements |
 
-A direct media report is `{ url, content_type, page_url, page_title }`. A source
+A direct report is `{ url, content_type, page_url, page_title, filename? }`. The
+optional filename is the name the browser suggested for a download. A source
 report adds a bounded JSON document and its response URL. The daemon interprets
 the document, keeps normalized media URLs, and drops the original source. Gunda
 does not send cookies or request headers with a download, so a captured
@@ -30,6 +34,21 @@ download carries none of the browser's session with it.
 
 Stream segments (`video/mp2t`, `.ts`, `.m4s`, partial responses, and URLs with
 range parameters) are deliberately **not** reported as complete files.
+
+For a user-initiated download, the extension sends `download_browser` and waits
+for `download_queued`. Only then does it call `downloads.cancel` and
+`downloads.erase`. If the daemon does not advertise the `browser_download`
+capability, refuses the request, times out, or cannot cancel the browser item,
+the browser keeps its download. Downloads started by another extension are left
+alone.
+
+The options page counts browser downloads seen (`browser_download`), downloads
+Gunda took over (`browser_download_intercepted`), downloads left to the browser
+(`browser_download_kept`), and cancel failures
+(`browser_download_cancel_failed`). It also shows the last download's scheme,
+host, MIME type, filename, outcome, and reason without printing the full URL.
+Downloads started by another extension (`ignored_by_extension`) and downloads
+with a non-HTTP(S) URL (`ignored_non_http`) are counted separately.
 
 The player control asks the page agent to refresh media detection before it
 lists the formats of the newest capture for that exact page. Choosing a format
@@ -68,7 +87,8 @@ pnpm test
 ```
 
 `pnpm check` type-checks every source file. `pnpm test` rebuilds `dist` and runs
-the dependency-free Node tests for the page-world agent.
+the dependency-free Node tests for the service worker, page-world agent, and
+manifest.
 
 ## Pairing
 
@@ -99,6 +119,7 @@ removing the token would still not make a web page able to report.
 | Permission | Why |
 | --- | --- |
 | `webRequest` | to observe responses, status, ranges, and content type |
+| `downloads` | to see downloads the user starts in the browser, read the suggested filename, and cancel the browser copy after Gunda queues it |
 | `nativeMessaging` | to request endpoint and token pairing from the local Gunda bridge |
 | `host_permissions: <all_urls>` | a capture can be on any site; response headers are not readable without it |
 | `tabs` | to name the page a capture came from. Only the URL and title of the tab that made the request are read, and only to attribute the capture |
@@ -107,13 +128,22 @@ removing the token would still not make a web page able to report.
 
 ## Limits, stated plainly
 
-- A report made while the desktop app is not running is held in the worker's
-  memory and sent when the channel connects. If the worker is torn down first,
-  the report is lost; the page can be played again.
-- Only `http` and `https` pages are attributed. A capture from a page with no
-  such URL is dropped rather than attributed to the wrong place.
+- A report made while the desktop app is not running is held in session storage
+  and sent when the channel connects. Session storage survives a service worker
+  restart, but it is cleared when the browser closes.
+- The browser copy is cancelled only after the daemon queues the download. A
+  daemon that is unreachable, refuses the URL, or cannot create the job leaves
+  the browser download running. The candidate stays in Gunda's capture list
+  when the daemon accepted the report but could not queue it.
+- Gunda does not send cookies or request headers, so a download that requires a
+  browser session may fail after the browser copy is cancelled. The capture
+  remains in the list for a retry.
+- Only `http` and `https` pages and downloads are attributed. A capture from a
+  page with no such URL is dropped rather than attributed to the wrong place.
+  Downloads with `blob:`, `data:`, or other non-HTTP(S) URLs are ignored, so a
+  site that builds a blob before downloading is left to the browser.
 - The daemon decides what is downloadable. A refusal comes back as a stable
   reason (`unsupported_url`, `unsupported_media`, `segment_stream`,
   `unsupported_source`, `unsupported_version`) and is counted in the options page.
-- Paired to two browsers at once, both connect; the daemon deduplicates by media
-  URL.
+- Paired to two browsers at once, both connect; the daemon deduplicates by
+  resource URL.

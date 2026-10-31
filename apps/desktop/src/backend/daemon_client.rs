@@ -248,6 +248,7 @@ fn to_capture_view(capture: gunda_ipc::CaptureView) -> CaptureView {
         },
         content_type: capture.content_type,
         page_title: capture.page_title,
+        filename: capture.filename,
         seen: capture.seen,
         segmented: capture.segmented,
         selectable: capture.selectable,

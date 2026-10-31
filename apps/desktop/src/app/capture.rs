@@ -53,7 +53,7 @@ impl Desktop {
 
         if self.snapshot.captures.is_empty() {
             ui.label(
-                RichText::new("Nothing yet. Play a video in the browser.")
+                RichText::new("Nothing yet. Download a file or play a video in the browser.")
                     .size(11.0)
                     .color(colors.muted),
             );
@@ -158,7 +158,8 @@ fn row(
     colors: Palette,
     actions: &mut Actions,
 ) {
-    ui.add(egui::Label::new(RichText::new(&capture.url).size(12.0)).truncate())
+    let label = capture.filename.as_deref().unwrap_or(&capture.url);
+    ui.add(egui::Label::new(RichText::new(label).size(12.0)).truncate())
         .on_hover_text(&capture.url);
 
     let mut details = format!("{} | seen {}x", capture.kind, capture.seen);

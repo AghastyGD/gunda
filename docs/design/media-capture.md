@@ -28,6 +28,7 @@ Capture design constraints:
 [ page world ]        [ isolated world ]      [ service worker ]      [ native ]
 request instrumentation <-> DOM observation <-> response sniffing --> local service
 patch XHR/fetch/MSE        geometry + events    MIME classification
+                                             browser download events
                                         |
                           ws://127.0.0.1:PORT or native messaging
 ```
@@ -46,6 +47,14 @@ The pipeline has these responsibilities:
   image, XHR, media and other request types, and a MIME-to-extension table maps
   the manifest and segment types a site may serve (`M3U8`, `MPD`, `F4M`, `M4S`,
   `TS`, `UMP`, `DFXP`/`TTML`, `WEBM`, `MP4`).
+- **Browser download events.** `chrome.downloads` reports downloads the user
+  starts, including files that are not media. The event supplies an HTTP(S)
+  URL, MIME type, and suggested filename. When the daemon advertises the
+  `browser_download` capability, the extension asks it to record and queue the
+  download in one message, then cancels and erases the browser's copy. A
+  refusal, timeout, missing capability, or failed cancellation leaves the
+  browser download running. `blob:`, `data:`, and other non-HTTP(S) downloads
+  are ignored because the daemon cannot fetch them without the page's session.
 - **A local transport.** An extension cannot open a raw socket, so candidates
   reach the Gunda daemon either over a loopback WebSocket or through the
   browser's native-messaging bridge, which needs an installed host manifest and
@@ -103,7 +112,7 @@ them in-process without an external tool or subprocess.
 ## 2. Design decisions
 
 1. **The browser side pushes to a local listener.** `gundad` listens on
-   loopback and the extension delivers detected media candidates to it. The
+   loopback and the extension delivers detected candidates to it. The
    daemon decides what a candidate becomes.
 2. **Generic detection keys off MIME type, not URL shape.** The manifest types
    Gunda recognises (`application/vnd.apple.mpegurl`, `application/dash+xml`,
@@ -208,12 +217,14 @@ the published byte count when the transfer completes.
 
 Naming and size rules:
 
-- **The output is named after the presentation, not the manifest.** Captured
-  downloads use the page title when it contains usable text. A shared sanitizer
-  replaces unsafe filename characters, removes common browser annotations, and
-  applies the media extension. Manifest and variant URLs frequently end in
-  `index.m3u8`, so `output_filename` remains only a fallback. A filename the
-  caller chose still wins, and `plan_destination` remains the only validator.
+- **The output prefers the browser's suggested name, then the presentation
+  title.** A filename chosen in the start window wins, followed by the name the
+  browser suggested for a download, then the page title when it contains usable
+  text. A shared sanitizer replaces unsafe filename characters, removes common
+  browser annotations, and applies an extension from the filename, content
+  type, or URL. Manifest and variant URLs frequently end in `index.m3u8`, so
+  `output_filename` remains only a fallback, and `plan_destination` remains the
+  only validator.
 - **Reported sizes are measured or unknown.** A declared length is used
   directly. Otherwise every planned resource is probed with one bounded metadata
   request. The probe tries `HEAD`, then `Range: bytes=0-0` to read the total
@@ -301,7 +312,7 @@ the greeting, limited to `MAX_MESSAGE_BYTES` (2 MiB).
 | Extension to desktop | Payload |
 | --- | --- |
 | `hello` | `version`, `token`, `agent`; the first message on every connection |
-| `candidate` | `url`, `content_type?`, `page_url`, `page_title?` |
+| `candidate` | `url`, `content_type?`, `page_url`, `page_title?`, `filename?` |
 | `source` | `source_url`, `page_url`, `page_title?`, `document`; a bounded JSON response for daemon extraction |
 | `list_formats` | `page_url`; list formats for the player control |
 | `download_page` | `page_url`, `capture_id?`, `format?`, `directory?`, `filename?`; queue the selected format |
@@ -331,7 +342,7 @@ Refusal reasons, as sent on the wire:
 | Reason | Meaning |
 | --- | --- |
 | `unsupported_url` | not an absolute `http`/`https` URL, or a page URL that cannot be a base |
-| `unsupported_media` | not media this build recognises |
+| `unsupported_media` | the source document contains no media this build recognises |
 | `segment_stream` | one segment of a segmented stream (`video/mp2t`, `.ts`, `.m4s`), not a stream |
 | `unsupported_source` | no extractor is available for the page that supplied a source |
 | `no_capture` | no captured presentation matches the requested page or capture |
@@ -344,21 +355,23 @@ Refusal reasons, as sent on the wire:
 A report is validated *before* it can become a candidate, so an unexecutable
 resource is refused at the boundary instead of failing later in the engine:
 
-- the media URL must be absolute `http`/`https`;
+- the resource URL must be absolute `http`/`https`;
 - the page URL must be an absolute URL (it becomes `DownloadOrigin::Browser`);
 - the resource is classified by content type first, then by path extension
-  (`hls`, `dash`, `file`, else refused);
+  (`hls`, `dash`, or a complete file);
 - `video/mp2t` and `.ts`/`.m4s` paths are refused as segments: the manifest is
   the resource worth downloading, and reporting every segment would bury it;
 - extracted progressive qualities are attached to one candidate, with the best
   variant used as its default URL;
-- page titles are stripped of control characters and bounded.
+- page titles and suggested filenames are stripped of control characters and
+  bounded. A suggested filename keeps only its final path component.
 
 The catalog holds the newest 256 candidates, newest first, and evicts the oldest
 when full rather than refusing the newest: a capture list is a list of recent
 discoveries, and the entry a user is most likely to want is the one that just
-appeared. Deduplication is by media URL; a repeat updates the content type,
-the last-seen time, and the report count instead of creating a second entry.
+appeared. Deduplication is by resource URL; a repeat updates the content type,
+suggested filename, last-seen time, and report count instead of creating a
+second entry.
 
 ### Pairing and origin policy
 
@@ -493,9 +506,9 @@ Implemented:
 3. `crates/gunda-capture`: the loopback listener, the RFC 6455 subset, the
    versioned JSON protocol, the pairing token, the bounded source extractor, and
    the candidate catalog with deduplication.
-4. `apps/extension`: an MV3 build that sniffs responses, scans the DOM, forwards
-   bounded Instagram, Facebook, and YouTube source JSON, and reports direct
-   media candidates, with an options page for pairing.
+4. `apps/extension`: an MV3 build that sniffs responses, observes browser
+   downloads, scans the DOM, forwards bounded Instagram, Facebook, and YouTube
+   source JSON, and reports direct candidates, with an options page for pairing.
 5. Daemon and desktop wiring: `gundad` owns capture and quality inspection, and
    the desktop panel shows pairing, candidates, per-candidate download and
    dismiss actions, and the quality picker.

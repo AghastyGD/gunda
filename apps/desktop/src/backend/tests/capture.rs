@@ -616,7 +616,10 @@ impl Extension {
         ))
         .await;
 
-        assert_eq!(self.receive().await, r#"{"kind":"ready","version":3}"#);
+        assert_eq!(
+            self.receive().await,
+            r#"{"kind":"ready","version":3,"features":["browser_download"]}"#
+        );
     }
 
     /// Reports one media resource and checks the identifier it was given.

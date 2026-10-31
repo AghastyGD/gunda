@@ -10,6 +10,10 @@
 //! would move them into Gunda's process, its logs, and its job database. A
 //! download that needs a session cookie is out of scope until there is a
 //! deliberate place to keep one.
+//!
+//! A browser download can be recorded and queued in one message. The extension
+//! uses that confirmation to cancel the browser's own copy, so a daemon that
+//! does not advertise the capability is left to finish the download itself.
 
 use std::fmt;
 
@@ -20,6 +24,9 @@ use crate::error::CaptureError;
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u32 = 3;
+
+/// Capability name for recording and queueing a browser download in one step.
+pub const FEATURE_BROWSER_DOWNLOAD: &str = "browser_download";
 
 /// Largest message accepted, in bytes.
 pub use crate::websocket::MAX_MESSAGE_BYTES;
@@ -53,9 +60,9 @@ pub struct CaptureDownloadStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Refusal {
-    /// The media URL is not an absolute `http` or `https` URL.
+    /// The resource URL is not an absolute `http` or `https` URL.
     UnsupportedUrl,
-    /// The resource is not something this build can download.
+    /// The source document contains no media this build can download.
     UnsupportedMedia,
     /// The report is one segment of a segmented stream, not the stream itself.
     SegmentStream,
@@ -74,8 +81,8 @@ pub enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let reason = match self {
-            Self::UnsupportedUrl => "the media URL is not an absolute HTTP URL",
-            Self::UnsupportedMedia => "the resource is not downloadable media",
+            Self::UnsupportedUrl => "the resource URL is not an absolute HTTP URL",
+            Self::UnsupportedMedia => "the source document contains no downloadable media",
             Self::SegmentStream => "the report is a stream segment, not a stream",
             Self::UnsupportedSource => "the page source is not supported",
             Self::NoCapture => "the page has no captured media",
@@ -102,9 +109,9 @@ pub enum ClientMessage {
         agent: String,
     },
 
-    /// A media resource the extension detected.
+    /// A resource the extension detected.
     Candidate {
-        /// The media URL, absolute and `http` or `https`.
+        /// The resource URL, absolute and `http` or `https`.
         url: String,
         /// The response content type, when the extension saw one.
         #[serde(default)]
@@ -114,6 +121,32 @@ pub enum ClientMessage {
         /// The page title, when the extension has one.
         #[serde(default)]
         page_title: Option<String>,
+        /// The filename the browser suggested, when it has one.
+        #[serde(default)]
+        filename: Option<String>,
+    },
+
+    /// A browser download the extension wants Gunda to take over.
+    ///
+    /// The daemon records the report and queues a download before answering, so
+    /// the extension only cancels the browser's copy after the daemon owns it.
+    DownloadBrowser {
+        /// The resource URL, absolute and `http` or `https`.
+        url: String,
+        /// The response content type, when the extension saw one.
+        #[serde(default)]
+        content_type: Option<String>,
+        /// The page the resource was found on.
+        page_url: String,
+        /// The page title, when the extension has one.
+        #[serde(default)]
+        page_title: Option<String>,
+        /// The filename the browser suggested, when it has one.
+        #[serde(default)]
+        filename: Option<String>,
+        /// A destination chosen by the extension, when it has one.
+        #[serde(default)]
+        directory: Option<String>,
     },
 
     /// A bounded page response for daemon-side extraction.
@@ -168,6 +201,9 @@ pub enum ServerMessage {
     Ready {
         /// The protocol version the desktop speaks.
         version: u32,
+        /// Optional capabilities this daemon offers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        features: Vec<String>,
     },
     /// The report is now a candidate.
     Accepted {
@@ -275,8 +311,23 @@ mod tests {
                 content_type: None,
                 page_url: "https://example/watch".to_owned(),
                 page_title: None,
+                filename: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_a_suggested_filename() {
+        let message = parse_client_message(
+            r#"{"kind":"candidate","url":"https://cdn.example/report","content_type":"application/pdf","page_url":"https://example/files","filename":"Quarterly report.pdf"}"#,
+        )
+        .expect("the report is valid");
+
+        let ClientMessage::Candidate { filename, .. } = message else {
+            panic!("the message is a candidate");
+        };
+
+        assert_eq!(filename.as_deref(), Some("Quarterly report.pdf"));
     }
 
     #[test]
@@ -313,6 +364,26 @@ mod tests {
         assert_eq!(
             document["media"]["video_url"],
             "https://cdn.example/movie.mp4"
+        );
+    }
+
+    #[test]
+    fn parses_a_browser_download_request() {
+        let message = parse_client_message(
+            r#"{"kind":"download_browser","url":"https://cdn.example/report","content_type":"application/pdf","page_url":"https://example/files","filename":"report.pdf"}"#,
+        )
+        .expect("the request is valid");
+
+        assert_eq!(
+            message,
+            ClientMessage::DownloadBrowser {
+                url: "https://cdn.example/report".into(),
+                content_type: Some("application/pdf".into()),
+                page_url: "https://example/files".into(),
+                page_title: None,
+                filename: Some("report.pdf".into()),
+                directory: None,
+            }
         );
     }
 
@@ -403,8 +474,18 @@ mod tests {
     #[test]
     fn encodes_server_messages_as_stable_json() {
         assert_eq!(
-            encode_server_message(&ServerMessage::Ready { version: 3 }),
+            encode_server_message(&ServerMessage::Ready {
+                version: 3,
+                features: Vec::new(),
+            }),
             r#"{"kind":"ready","version":3}"#
+        );
+        assert_eq!(
+            encode_server_message(&ServerMessage::Ready {
+                version: 3,
+                features: vec![String::from("browser_download")],
+            }),
+            r#"{"kind":"ready","version":3,"features":["browser_download"]}"#
         );
         assert_eq!(
             encode_server_message(&ServerMessage::Accepted { id: 3 }),

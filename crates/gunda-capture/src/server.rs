@@ -32,8 +32,8 @@ use crate::error::CaptureError;
 use crate::extractor;
 use crate::pairing::PairingToken;
 use crate::protocol::{
-    CaptureDownloadStatus, ClientMessage, MediaFormat, PROTOCOL_VERSION, Refusal, ServerMessage,
-    encode_server_message, parse_client_message,
+    CaptureDownloadStatus, ClientMessage, FEATURE_BROWSER_DOWNLOAD, MediaFormat, PROTOCOL_VERSION,
+    Refusal, ServerMessage, encode_server_message, parse_client_message,
 };
 use crate::websocket::WebSocket;
 
@@ -523,6 +523,7 @@ async fn converse(
             debug!("a capture client connected");
         }
         ClientMessage::Candidate { .. }
+        | ClientMessage::DownloadBrowser { .. }
         | ClientMessage::Source { .. }
         | ClientMessage::DownloadPage { .. }
         | ClientMessage::ListFormats { .. }
@@ -544,6 +545,7 @@ async fn converse(
         &mut socket,
         ServerMessage::Ready {
             version: PROTOCOL_VERSION,
+            features: vec![String::from(FEATURE_BROWSER_DOWNLOAD)],
         },
     )
     .await?;
@@ -559,12 +561,15 @@ async fn converse(
                 content_type,
                 page_url,
                 page_title,
+                filename,
             }) => match Report::new(
                 &url,
                 content_type.as_deref(),
                 &page_url,
                 page_title.as_deref(),
-            ) {
+            )
+            .map(|report| report.with_filename(filename.as_deref()))
+            {
                 Ok(report) => match submit(submissions, report).await? {
                     Recorded {
                         duplicate: true,
@@ -575,6 +580,46 @@ async fn converse(
                 },
                 Err(reason) => ServerMessage::Refused { reason },
             },
+            Ok(ClientMessage::DownloadBrowser {
+                url,
+                content_type,
+                page_url,
+                page_title,
+                filename,
+                directory,
+            }) => {
+                let report = Report::new(
+                    &url,
+                    content_type.as_deref(),
+                    &page_url,
+                    page_title.as_deref(),
+                )
+                .map(|report| report.with_filename(filename.as_deref()));
+
+                match report {
+                    Ok(report) => {
+                        let recorded = submit(submissions, report).await?;
+                        let page_url = Url::parse(&page_url).map_err(|_| {
+                            CaptureError::Protocol("the page URL could not be read")
+                        })?;
+
+                        match request_download(
+                            download_commands,
+                            page_url,
+                            Some(recorded.id),
+                            None,
+                            directory,
+                            None,
+                        )
+                        .await?
+                        {
+                            Ok(id) => ServerMessage::DownloadQueued { id },
+                            Err(reason) => ServerMessage::DownloadUnavailable { reason },
+                        }
+                    }
+                    Err(reason) => ServerMessage::DownloadUnavailable { reason },
+                }
+            }
             Ok(ClientMessage::Source {
                 source_url,
                 page_url,
@@ -924,7 +969,7 @@ mod tests {
 
         assert_eq!(
             within(client.receive()).await.as_deref(),
-            Some(r#"{"kind":"ready","version":3}"#)
+            Some(r#"{"kind":"ready","version":3,"features":["browser_download"]}"#)
         );
 
         client
@@ -1096,6 +1141,66 @@ mod tests {
             within(client.receive()).await.as_deref(),
             Some(r#"{"kind":"download_queued","id":0}"#)
         );
+    }
+
+    #[tokio::test]
+    async fn records_and_queues_a_browser_download() {
+        let (server, mut handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+
+        within(client.send(
+            r#"{"kind":"download_browser","url":"https://cdn.example.com/report.pdf","content_type":"application/pdf","page_url":"https://example.com/files","page_title":"Files","filename":"Quarterly report.pdf","directory":"/tmp/gunda"}"#,
+        ))
+        .await;
+
+        let (candidate, directory, reply) = within(async {
+            loop {
+                if let super::CaptureEvent::DownloadRequested {
+                    candidate,
+                    directory,
+                    reply,
+                    ..
+                } = handle.next_event().await.expect("the listener runs")
+                {
+                    break (candidate, directory, reply);
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(candidate.id(), 0);
+        assert_eq!(candidate.filename(), Some("Quarterly report.pdf"));
+        assert_eq!(directory.as_deref(), Some("/tmp/gunda"));
+        reply
+            .send(Ok(candidate.id()))
+            .expect("the connection waits for the result");
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"download_queued","id":0}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_browser_download_it_cannot_fetch() {
+        let (server, handle) = listener().await;
+        tokio::spawn(server.run());
+
+        let mut client = connected(&handle).await;
+
+        within(client.send(
+            r#"{"kind":"download_browser","url":"https://cdn.example.com/segment-3.ts","content_type":"video/mp2t","page_url":"https://example.com/watch"}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            within(client.receive()).await.as_deref(),
+            Some(r#"{"kind":"download_unavailable","reason":"segment_stream"}"#)
+        );
+
+        assert!(handle.view().is_empty());
     }
 
     #[tokio::test]
