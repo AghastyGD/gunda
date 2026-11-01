@@ -177,7 +177,7 @@ async function refreshDownload(): Promise<void> {
     return;
   }
   if (response.kind !== 'status') {
-    stateField.textContent = 'Waiting for Gunda...';
+    stateField.textContent = 'Waiting for Gunda…';
     return;
   }
 

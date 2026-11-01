@@ -22,6 +22,7 @@ fn desktop(snapshot: Snapshot) -> Desktop {
         error: None,
         measurement: None,
         rate: 0,
+        titlebar_sent: std::cell::Cell::new(true),
     }
 }
 
@@ -314,11 +315,7 @@ fn keyboard_shortcut_opens_add_dialog_and_escape_hides_transfer_details() {
 fn empty_loading_and_error_views_render_in_both_themes() {
     for dark in [false, true] {
         for (ready, notice, title) in [
-            (
-                true,
-                None,
-                "No downloads. Use File > Add download or Ctrl+N.",
-            ),
+            (true, None, "No downloads yet. Add one with Ctrl+N."),
             (false, None, "Loading downloads…"),
             (
                 false,
@@ -346,7 +343,7 @@ fn empty_loading_and_error_views_render_in_both_themes() {
                     matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == title)
                 }), "missing empty-state heading: {title}");
                 assert!(desktop.snapshot.jobs.is_empty());
-                for heading in ["File name", "Status", "Progress", "Size", "Rate", "Origin"] {
+                for heading in ["File name", "Status", "Progress", "Size", "Speed", "Origin"] {
                     assert!(output.shapes.iter().any(|shape| {
                         matches!(&shape.shape, egui::Shape::Text(text) if text.galley.job.text == heading)
                     }), "missing table heading: {heading}");
@@ -468,8 +465,9 @@ fn selected_rows_and_progress_keep_readable_text_in_both_themes() {
             .selection
             .stroke
             .color;
-        assert_ne!(selection_text, ACCENT);
-        for (text, expected) in [(name.as_str(), selection_text), ("100.0%", Color32::WHITE)] {
+        let colors = Palette::new(dark);
+        assert_ne!(selection_text, colors.accent);
+        for (text, expected) in [(name.as_str(), selection_text), ("100%", colors.muted)] {
             assert!(output.shapes.iter().any(|shape| {
                 matches!(&shape.shape, egui::Shape::Text(shape)
                     if shape.galley.job.text == text
@@ -510,7 +508,7 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
     let labels = capture_labels(&ctx, &mut desktop);
     let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
 
-    assert!(has("BROWSER CAPTURE"), "missing panel heading: {labels:?}");
+    assert!(has("Browser capture"), "missing panel heading: {labels:?}");
     assert!(has("Endpoint"), "missing endpoint label: {labels:?}");
     assert!(has("Token"), "missing token label: {labels:?}");
     assert!(has("Copy endpoint"), "missing endpoint copy: {labels:?}");
@@ -656,11 +654,8 @@ fn capture_download_dialog_confirms_start_folder_and_size() {
     let labels = dialog_labels(&ctx, &mut desktop);
     let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
 
-    assert!(
-        has("Start a captured download"),
-        "missing heading: {labels:?}"
-    );
     assert!(has("A movie.mp4"), "missing file name: {labels:?}");
+    assert!(has("Video · A movie page"), "missing details: {labels:?}");
     assert!(has("File size"), "missing size label: {labels:?}");
     assert!(has("1.2 MiB"), "missing file size: {labels:?}");
     assert!(has("Save to"), "missing folder label: {labels:?}");
@@ -668,7 +663,7 @@ fn capture_download_dialog_confirms_start_folder_and_size() {
         has(r"C:\Users\Augusto\Downloads"),
         "missing destination folder: {labels:?}"
     );
-    assert!(has("Start Download"), "missing start action: {labels:?}");
+    assert!(has("Start download"), "missing start action: {labels:?}");
     assert!(has("Cancel"), "missing cancel action: {labels:?}");
     assert!(
         desktop.capture_start.is_some(),

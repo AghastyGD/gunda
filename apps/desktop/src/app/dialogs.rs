@@ -1,6 +1,6 @@
 use std::sync::mpsc;
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use gunda_core::download::DownloadState;
 
 use crate::{
@@ -10,8 +10,8 @@ use crate::{
 
 use super::{
     Desktop,
-    theme::{ACCENT, Palette},
-    widgets::{Icon, dialog_heading, display_total, notice, stat},
+    theme::Palette,
+    widgets::{dialog_heading, display_total, notice, stat},
 };
 
 impl Desktop {
@@ -47,19 +47,15 @@ impl Desktop {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(540.0)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                dialog_heading(
-                    ui,
-                    Icon::Add,
-                    "Start a captured download",
-                    "Confirm the file and choose where to save it.",
-                    colors,
-                );
-                ui.add_space(14.0);
-                ui.label(RichText::new(&start.label).size(14.0).strong());
-                ui.label(RichText::new(&start.details).size(11.0).color(colors.muted));
-                ui.add_space(12.0);
+                ui.add(
+                    egui::Label::new(RichText::new(&start.label).size(15.0).strong()).truncate(),
+                )
+                .on_hover_text(&start.label);
+                ui.label(RichText::new(&start.details).size(12.0).color(colors.muted));
+                ui.add_space(18.0);
                 ui.horizontal(|ui| {
                     stat(
                         ui,
@@ -67,27 +63,34 @@ impl Desktop {
                         &start
                             .size_bytes
                             .map(bytes)
-                            .unwrap_or_else(|| "Calculated when the download starts".into()),
+                            .unwrap_or_else(|| "Unknown".into()),
                         colors,
                     );
                 });
-                ui.add_space(14.0);
-                ui.label(RichText::new("Save to").strong());
+                ui.add_space(18.0);
+                ui.label(RichText::new("Save to").size(12.0).strong());
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let label = self
                         .destination
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Choose a folder".into());
-                    let width = (ui.available_width() - 106.0).max(100.0);
+                    let width = (ui.available_width() - 108.0).max(100.0);
                     egui::Frame::new()
                         .fill(colors.background)
                         .stroke(egui::Stroke::new(1.0, colors.border))
-                        .corner_radius(3)
-                        .inner_margin(egui::Margin::symmetric(9, 8))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            ui.add_sized([width - 18.0, 18.0], egui::Label::new(&label).truncate())
-                                .on_hover_text(&label);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(width - 20.0, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Label::new(&label).truncate())
+                                        .on_hover_text(&label);
+                                },
+                            );
                         });
                     if ui
                         .add_enabled(
@@ -97,7 +100,7 @@ impl Desktop {
                             } else {
                                 "Browse…"
                             })
-                            .min_size(egui::vec2(94.0, 36.0)),
+                            .min_size(egui::vec2(96.0, 36.0)),
                         )
                         .clicked()
                     {
@@ -105,30 +108,30 @@ impl Desktop {
                     }
                 });
                 if let Some(error) = &self.error {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     notice(ui, error, self.error_color());
                 }
-                ui.add_space(16.0);
+                ui.add_space(18.0);
                 ui.separator();
-                ui.add_space(5.0);
+                ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             !self.busy() && self.snapshot.ready && self.picker.is_none(),
                             egui::Button::new(
-                                RichText::new("Start Download")
-                                    .color(Color32::WHITE)
+                                RichText::new("Start download")
+                                    .color(colors.accent_ink)
                                     .strong(),
                             )
-                            .fill(ACCENT)
-                            .min_size(egui::vec2(132.0, 34.0)),
+                            .fill(colors.accent)
+                            .min_size(egui::vec2(132.0, 36.0)),
                         )
                         .clicked()
                     {
                         start_now = true;
                     }
                     if ui
-                        .add(egui::Button::new("Cancel").min_size(egui::vec2(86.0, 34.0)))
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(88.0, 36.0)))
                         .clicked()
                     {
                         cancel = true;
@@ -165,40 +168,47 @@ impl Desktop {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(550.0)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                dialog_heading(
-                    ui,
-                    Icon::Add,
-                    "Add a new download",
-                    "Paste a file link and choose where to save it.",
-                    colors,
+                ui.label(
+                    RichText::new("Paste a link and choose where to save it.")
+                        .size(12.0)
+                        .color(colors.muted),
                 );
-                ui.add_space(16.0);
-                ui.label(RichText::new("Download link").strong());
+                ui.add_space(18.0);
+                ui.label(RichText::new("Link").size(12.0).strong());
+                ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.url)
                         .hint_text("https://example.com/file.zip")
                         .desired_width(f32::INFINITY)
-                        .margin(egui::vec2(10.0, 9.0)),
+                        .margin(egui::vec2(10.0, 8.0)),
                 );
-                ui.add_space(14.0);
-                ui.label(RichText::new("Save to").strong());
+                ui.add_space(18.0);
+                ui.label(RichText::new("Save to").size(12.0).strong());
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let label = self
                         .destination
                         .as_ref()
                         .map(|path| path.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Choose a folder".into());
-                    let width = (ui.available_width() - 106.0).max(100.0);
+                    let width = (ui.available_width() - 108.0).max(100.0);
                     egui::Frame::new()
                         .fill(colors.background)
                         .stroke(egui::Stroke::new(1.0, colors.border))
-                        .corner_radius(3)
-                        .inner_margin(egui::Margin::symmetric(9, 8))
+                        .corner_radius(6)
+                        .inner_margin(egui::Margin::symmetric(10, 8))
                         .show(ui, |ui| {
-                            ui.add_sized([width - 18.0, 18.0], egui::Label::new(&label).truncate())
-                                .on_hover_text(&label);
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(width - 20.0, 18.0),
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(egui::Label::new(&label).truncate())
+                                        .on_hover_text(&label);
+                                },
+                            );
                         });
                     if ui
                         .add_enabled(
@@ -208,35 +218,37 @@ impl Desktop {
                             } else {
                                 "Browse…"
                             })
-                            .min_size(egui::vec2(94.0, 36.0)),
+                            .min_size(egui::vec2(96.0, 36.0)),
                         )
                         .clicked()
                     {
                         self.browse(ctx);
                     }
                 });
-                ui.add_space(8.0);
+                ui.add_space(10.0);
                 ui.label(
-                    RichText::new("If the file already exists, Gunda saves a new copy.")
+                    RichText::new("If the file already exists, Gunda keeps both.")
                         .size(12.0)
                         .color(colors.muted),
                 );
                 if let Some(error) = &self.error {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     notice(ui, error, self.error_color());
                 }
-                ui.add_space(16.0);
+                ui.add_space(18.0);
                 ui.separator();
-                ui.add_space(5.0);
+                ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             !self.busy() && self.snapshot.ready && self.picker.is_none(),
                             egui::Button::new(
-                                RichText::new("Download").color(Color32::WHITE).strong(),
+                                RichText::new("Start download")
+                                    .color(colors.accent_ink)
+                                    .strong(),
                             )
-                            .fill(ACCENT)
-                            .min_size(egui::vec2(112.0, 34.0)),
+                            .fill(colors.accent)
+                            .min_size(egui::vec2(132.0, 36.0)),
                         )
                         .clicked()
                     {
@@ -253,7 +265,7 @@ impl Desktop {
                         }
                     }
                     if ui
-                        .add(egui::Button::new("Cancel").min_size(egui::vec2(86.0, 34.0)))
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(88.0, 36.0)))
                         .clicked()
                     {
                         self.add_open = false;
@@ -277,22 +289,23 @@ impl Desktop {
         let colors = Palette::new(self.dark);
         let color = self.state_color(&view, active);
         let mut open = true;
-        egui::Window::new("Transfer details")
+        egui::Window::new("Download details")
             .id(egui::Id::new("transfer"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(550.0)
+            .default_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                dialog_heading(ui, Icon::Inspect, &view.name, &view.source, colors);
-                ui.add_space(14.0);
+                dialog_heading(ui, &view.name, &view.source, colors);
+                ui.add_space(16.0);
                 egui::Frame::new()
                     .fill(colors.background)
                     .stroke(egui::Stroke::new(1.0, colors.border))
-                    .corner_radius(4)
-                    .inner_margin(12)
+                    .corner_radius(8)
+                    .inner_margin(16)
                     .show(ui, |ui| {
-                        ui.set_min_width(510.0);
+                        ui.set_min_width(496.0);
                         ui.horizontal(|ui| {
                             ui.colored_label(color, RichText::new(view.label(active)).strong());
                             if active && view.state == DownloadState::Inspecting {
@@ -303,35 +316,54 @@ impl Desktop {
                                 |ui| {
                                     if let Some(fraction) = view.progress() {
                                         ui.label(
-                                            RichText::new(format!("{:.1}%", fraction * 100.0))
-                                                .strong(),
+                                            RichText::new(format!("{:.0}%", fraction * 100.0))
+                                                .size(13.0)
+                                                .monospace(),
                                         );
                                     } else {
-                                        ui.label(RichText::new("Size unknown").color(colors.muted));
+                                        ui.label(
+                                            RichText::new("Size unknown")
+                                                .size(12.0)
+                                                .color(colors.muted),
+                                        );
                                     }
                                 },
                             );
                         });
-                        ui.add_space(10.0);
+                        ui.add_space(12.0);
                         if let Some(fraction) = view.progress() {
-                            ui.add(
-                                egui::ProgressBar::new(fraction)
-                                    .corner_radius(0)
-                                    .desired_width(ui.available_width())
-                                    .desired_height(20.0)
-                                    .fill(if view.state == DownloadState::Completed {
-                                        color
-                                    } else {
-                                        ACCENT
-                                    }),
+                            let width = ui.available_width();
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(width, 8.0),
+                                egui::Sense::hover(),
                             );
+                            ui.painter().rect_filled(rect, 4.0, colors.track);
+                            if fraction > 0.0 {
+                                let mut filled = rect;
+                                filled.set_width(rect.width() * fraction);
+                                ui.painter().rect_filled(
+                                    filled,
+                                    4.0,
+                                    if view.state == DownloadState::Completed {
+                                        colors.success
+                                    } else {
+                                        colors.accent
+                                    },
+                                );
+                            }
                         } else if active {
                             ui.horizontal(|ui| {
                                 ui.spinner();
-                                ui.label("The final size will appear when the download finishes.");
+                                ui.label(
+                                    RichText::new(
+                                        "The final size will appear when the download finishes.",
+                                    )
+                                    .size(12.0)
+                                    .color(colors.muted),
+                                );
                             });
                         }
-                        ui.add_space(14.0);
+                        ui.add_space(16.0);
                         ui.columns(2, |columns| {
                             stat(&mut columns[0], "Downloaded", &bytes(view.written), colors);
                             stat(&mut columns[1], "File size", &display_total(&view), colors);
@@ -340,7 +372,7 @@ impl Desktop {
                         ui.columns(2, |columns| {
                             stat(
                                 &mut columns[0],
-                                "Transfer rate",
+                                "Speed",
                                 &if active && self.rate > 0 {
                                     format!("{}/s", bytes(self.rate))
                                 } else {
@@ -351,15 +383,17 @@ impl Desktop {
                             stat(&mut columns[1], "Time left", &self.remaining(&view), colors);
                         });
                     });
-                ui.add_space(14.0);
+                ui.add_space(16.0);
                 ui.label(
                     RichText::new(if view.output.is_some() {
                         "Saved file"
                     } else {
-                        "Destination folder"
+                        "Folder"
                     })
+                    .size(12.0)
                     .strong(),
                 );
+                ui.add_space(4.0);
                 let destination = view
                     .output
                     .as_ref()
@@ -368,7 +402,7 @@ impl Desktop {
                 ui.add(egui::Label::new(destination.as_ref()).truncate())
                     .on_hover_text(destination.as_ref());
                 if let Some(error) = &view.error {
-                    ui.add_space(10.0);
+                    ui.add_space(12.0);
                     notice(ui, error, self.error_color());
                 }
                 if active && !view.pause_supported {
@@ -381,21 +415,20 @@ impl Desktop {
                         .color(colors.muted),
                     );
                 }
-                ui.add_space(14.0);
+                ui.add_space(16.0);
                 ui.separator();
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(if active {
-                            "Hide keeps the download running."
-                        } else {
-                            "Return to your downloads with Hide."
-                        })
-                        .size(11.0)
-                        .color(colors.muted),
-                    );
+                    if active {
+                        ui.label(
+                            RichText::new("Hide keeps the download running.")
+                                .size(11.0)
+                                .color(colors.muted),
+                        );
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add(egui::Button::new("Hide").min_size(egui::vec2(74.0, 32.0)))
+                            .add(egui::Button::new("Hide").min_size(egui::vec2(80.0, 36.0)))
                             .clicked()
                         {
                             self.transfer = None;
@@ -404,7 +437,7 @@ impl Desktop {
                             if ui
                                 .add(
                                     egui::Button::new("Cancel download")
-                                        .min_size(egui::vec2(116.0, 32.0)),
+                                        .min_size(egui::vec2(124.0, 36.0)),
                                 )
                                 .clicked()
                             {
@@ -414,7 +447,7 @@ impl Desktop {
                                 .add_enabled(
                                     view.pause_supported,
                                     egui::Button::new("Pause")
-                                        .min_size(egui::vec2(88.0, 32.0)),
+                                        .min_size(egui::vec2(92.0, 36.0)),
                                 )
                                 .on_disabled_hover_text(
                                     "This server does not support resuming this download.",
@@ -427,7 +460,7 @@ impl Desktop {
                         } else {
                             if view.can_restart()
                                 && ui.add_enabled(!self.busy(), egui::Button::new("Restart")
-                                    .min_size(egui::vec2(88.0, 32.0)))
+                                    .min_size(egui::vec2(92.0, 36.0)))
                                     .on_hover_text("Discard saved progress and download again from zero. Existing files are kept.")
                                     .clicked()
                             {
@@ -442,9 +475,9 @@ impl Desktop {
                                         "Retry"
                                     } else {
                                         "Resume"
-                                    }).color(Color32::WHITE))
-                                        .fill(ACCENT)
-                                        .min_size(egui::vec2(88.0, 32.0)),
+                                    }).color(colors.accent_ink))
+                                        .fill(colors.accent)
+                                        .min_size(egui::vec2(92.0, 36.0)),
                                 ).clicked()
                             {
                                 self.send(if view.completion_pending {

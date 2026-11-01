@@ -22,18 +22,50 @@ async function load(): Promise<void> {
   tokenField.value = String(stored.token ?? '');
 }
 
+function channelLabel(state: string): string {
+  switch (state) {
+    case 'connected':
+      return 'Connected';
+    case 'unpaired':
+      return 'Not paired';
+    case 'unreachable':
+      return 'Gunda is not running';
+    case 'closed':
+      return 'Connection closed';
+    case 'malformed':
+      return 'Unexpected reply';
+    default:
+      return state;
+  }
+}
+
 function describe(value: unknown): string {
   if (!value || typeof value !== 'object') {
-    return 'Status: the channel has not been started yet.';
+    return 'Not started yet.';
   }
 
   const status = value as Partial<ChannelStatus>;
-  const state = status.state ?? 'unknown';
-  const detail = status.detail ? ` (${status.detail})` : '';
-  const refused = status.refused ? `\nLast refusal: ${status.refused}` : '';
+  const state = channelLabel(status.state ?? 'unknown');
+  const detail = status.detail ? ` · ${status.detail}` : '';
+  const refused = status.refused ? `\nLast rejected attempt: ${status.refused}` : '';
   const changed = status.at ? new Date(status.at).toLocaleTimeString() : 'unknown';
-  return `Status: ${state}${detail}${refused}\nLast change: ${changed}`;
+  return `${state}${detail}${refused}\nLast change: ${changed}`;
 }
+
+const STAT_LABELS: Record<string, string> = {
+  accepted: 'Captured',
+  duplicate: 'Duplicates',
+  refused: 'Refused',
+  malformed: 'Unreadable',
+  source_too_large: 'Pages too large',
+  ignored_by_extension: 'Ignored (extension)',
+  ignored_non_http: 'Ignored (not web)',
+  browser_download: 'Browser downloads',
+  browser_download_prompted: 'Prompts shown',
+  browser_download_intercepted: 'Taken over',
+  browser_download_kept: 'Left in browser',
+  browser_download_cancel_failed: 'Cancel failed',
+};
 
 function describeStats(value: unknown): string {
   if (!value || typeof value !== 'object') {
@@ -41,30 +73,37 @@ function describeStats(value: unknown): string {
   }
   const entries = Object.entries(value);
   return entries.length
-    ? entries.map(([kind, count]) => `${kind}: ${String(count)}`).join('\n')
+    ? entries
+        .map(([kind, count]) => `${STAT_LABELS[kind] ?? kind}: ${String(count)}`)
+        .join('\n')
     : 'Nothing reported yet.';
 }
 
+const OUTCOME_LABELS: Record<string, string> = {
+  intercepted: 'Taken over by Gunda',
+  kept: 'Left in the browser',
+  ignored_extension: 'Started by another extension',
+  ignored_non_http: 'Not a web address',
+};
+
 function describeLastDownload(value: unknown): string {
   if (!value || typeof value !== 'object') {
-    return 'Last browser download: none seen yet.';
+    return 'None seen yet.';
   }
 
   const download = value as Partial<BrowserDownloadDiagnostic>;
-  const address = `${download.scheme ?? ''}${download.host ?? ''}`.trim() || 'unknown address';
-  const parts = [
-    `Last browser download: ${download.outcome ?? 'unknown'}`,
-    address,
-    download.mime || 'unknown type',
-    download.filename || 'no filename',
-  ];
-  if (download.reason) {
-    parts.push(`reason: ${download.reason}`);
+  const parts = [download.filename || 'Unnamed file'];
+  const outcome = download.outcome ? OUTCOME_LABELS[download.outcome] : null;
+  if (outcome) {
+    parts.push(outcome);
+  }
+  if (download.host) {
+    parts.push(download.host);
   }
   if (download.at) {
     parts.push(new Date(download.at).toLocaleTimeString());
   }
-  return parts.join(' | ');
+  return parts.join(' · ');
 }
 
 async function refresh(): Promise<void> {
@@ -89,7 +128,7 @@ async function save(): Promise<void> {
 
   await chrome.storage.local.set({ endpoint, token });
   await chrome.runtime.sendMessage({ kind: 'reconnect' });
-  statusField.textContent = 'Saved. Connecting...';
+  statusField.textContent = 'Saved. Connecting…';
 }
 
 async function forget(): Promise<void> {
@@ -98,7 +137,7 @@ async function forget(): Promise<void> {
   await chrome.runtime.sendMessage({ kind: 'forget' });
   endpointField.value = '';
   tokenField.value = '';
-  statusField.textContent = 'Forgotten. Nothing will be reported until a pairing is saved.';
+  statusField.textContent = 'Forgotten. Nothing is reported until you pair again.';
 }
 
 saveButton.addEventListener('click', () => void save());

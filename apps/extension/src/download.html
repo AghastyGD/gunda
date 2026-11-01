@@ -5,37 +5,71 @@
     <title>Gunda Download</title>
     <style>
       :root {
-        color-scheme: light dark;
-        font-family: system-ui, sans-serif;
+        color-scheme: light;
+        --bg: #f7f3eb;
+        --surface: #efeae0;
+        --line: #d8d0c0;
+        --text: #241f18;
+        --muted: #6b6355;
+        --accent: #8c5314;
+        --accent-ink: #fff7e8;
+        --danger: #a23a2c;
+        --track: #ddd5c4;
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          color-scheme: dark;
+          --bg: #16140f;
+          --surface: #1d1a14;
+          --line: #342f25;
+          --text: #efe9de;
+          --muted: #a69d8c;
+          --accent: #e2a855;
+          --accent-ink: #1b1710;
+          --danger: #e1998c;
+          --track: #2e2a22;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
       }
 
       body {
+        background: var(--bg);
+        color: var(--text);
         margin: 0;
-        padding: 18px;
+        padding: 18px 20px 20px;
       }
 
       h1 {
-        font-size: 16px;
-        margin: 0 0 8px;
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0 0 2px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
 
       .state {
+        color: var(--muted);
         font-size: 12px;
-        opacity: 0.72;
       }
 
       .setup {
         display: grid;
-        gap: 10px;
+        gap: 14px;
       }
 
       .format {
-        background: rgba(127, 127, 127, 0.12);
-        border-radius: 7px;
-        padding: 9px 11px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 10px 12px;
       }
 
       .format strong,
@@ -43,31 +77,55 @@
         display: block;
       }
 
+      .format strong {
+        font-size: 13px;
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .format span {
-        font-size: 11px;
-        margin-top: 3px;
-        opacity: 0.68;
+        color: var(--muted);
+        font-size: 12px;
+        margin-top: 2px;
       }
 
       .field {
         display: grid;
-        gap: 4px;
+        gap: 6px;
       }
 
       .field label {
-        font-size: 12px;
-        font-weight: 600;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 500;
       }
 
       input {
-        box-sizing: border-box;
-        padding: 7px 9px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--text);
+        font: inherit;
+        min-width: 0;
+        padding: 7px 10px;
         width: 100%;
+      }
+
+      input:focus {
+        border-color: var(--accent);
+        outline: 2px solid color-mix(in srgb, var(--accent) 22%, transparent);
+        outline-offset: 0;
       }
 
       .directory {
         display: flex;
-        gap: 7px;
+        gap: 8px;
+      }
+
+      .directory input {
+        flex: 1;
       }
 
       .progress {
@@ -75,42 +133,76 @@
       }
 
       .track {
-        background: rgba(127, 127, 127, 0.2);
-        border-radius: 999px;
-        height: 8px;
+        background: var(--track);
+        border-radius: 3px;
+        height: 6px;
         margin: 16px 0 8px;
         overflow: hidden;
       }
 
       .bar {
-        background: #4f8cff;
+        background: var(--accent);
         height: 100%;
         transition: width 180ms ease;
         width: 0;
       }
 
       .sizes {
+        color: var(--muted);
         display: flex;
-        font-size: 12px;
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
         justify-content: space-between;
-        opacity: 0.72;
       }
 
       .failure {
-        color: #d9534f;
+        color: var(--danger);
         font-size: 12px;
-        margin-top: 10px;
-        min-height: 16px;
+        margin-top: -4px;
+      }
+
+      .failure:empty {
+        display: none;
       }
 
       .actions {
         display: flex;
+        gap: 8px;
         justify-content: flex-end;
-        margin-top: 14px;
+        margin-top: 2px;
       }
 
       button {
-        padding: 6px 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        color: var(--text);
+        cursor: pointer;
+        font: inherit;
+        font-weight: 500;
+        height: 34px;
+        padding: 0 14px;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--track);
+      }
+
+      button:disabled {
+        cursor: default;
+        opacity: 0.55;
+      }
+
+      #start {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: var(--accent-ink);
+        font-weight: 600;
+      }
+
+      #start:hover:not(:disabled) {
+        filter: brightness(1.06);
       }
     </style>
   </head>
@@ -128,19 +220,19 @@
         <label for="directory">Save to</label>
         <div class="directory">
           <input id="directory" type="text" spellcheck="false" />
-          <button id="choose" type="button">Choose...</button>
+          <button id="choose" type="button">Choose…</button>
         </div>
       </div>
+      <div class="failure" id="setup-failure"></div>
       <div class="actions">
         <button id="cancel" type="button">Cancel</button>
-        <button id="start" type="button">Start Download</button>
+        <button id="start" type="button">Start download</button>
       </div>
-      <div class="failure" id="setup-failure"></div>
     </div>
 
     <div class="progress" id="progress">
       <h1 id="name">Preparing download</h1>
-      <div class="state" id="state">Connecting to Gunda...</div>
+      <div class="state" id="state">Connecting to Gunda…</div>
       <div class="track"><div class="bar" id="bar"></div></div>
       <div class="sizes">
         <span id="written">0 B</span>

@@ -9,7 +9,7 @@ mod tests;
 
 use std::{path::PathBuf, sync::mpsc, time::Instant};
 
-use eframe::egui::{self, Color32, RichText};
+use eframe::egui::{self, RichText};
 use gunda_core::download::{DownloadId, DownloadState};
 
 use crate::{
@@ -18,8 +18,8 @@ use crate::{
 };
 
 use downloads::Filter;
-use theme::{ACCENT, Palette};
-use widgets::{Icon, action_button};
+use theme::Palette;
+use widgets::{Icon, action_button, primary_action};
 
 /// A capture the user asked to download, waiting for confirmation.
 #[derive(Clone)]
@@ -49,6 +49,7 @@ pub struct Desktop {
     error: Option<String>,
     measurement: Option<(DownloadId, u64, Instant)>,
     rate: u64,
+    titlebar_sent: std::cell::Cell<bool>,
 }
 
 impl Desktop {
@@ -77,6 +78,7 @@ impl Desktop {
             error: None,
             measurement: None,
             rate: 0,
+            titlebar_sent: std::cell::Cell::new(false),
         };
         desktop.theme(&cc.egui_ctx);
         desktop
@@ -178,10 +180,7 @@ impl Desktop {
             });
             ui.menu_button("Downloads", |ui| {
                 if ui
-                    .add_enabled(
-                        self.selected.is_some(),
-                        egui::Button::new("Transfer details"),
-                    )
+                    .add_enabled(self.selected.is_some(), egui::Button::new("Details"))
                     .clicked()
                 {
                     self.transfer = self.selected;
@@ -189,7 +188,7 @@ impl Desktop {
                 }
             });
             ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.capture_open, "Browser capture panel");
+                ui.checkbox(&mut self.capture_open, "Browser capture");
                 ui.separator();
                 let previous = self.dark;
                 ui.selectable_value(&mut self.dark, false, "Light mode");
@@ -203,13 +202,14 @@ impl Desktop {
     }
 
     fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let colors = Palette::new(self.dark);
         ui.horizontal(|ui| {
-            if action_button(
+            if primary_action(
                 ui,
                 Icon::Add,
                 "Add download",
                 self.snapshot.ready && !self.busy(),
-                ACCENT,
+                colors,
             )
             .on_hover_text("Add a download · Ctrl+N")
             .clicked()
@@ -239,7 +239,6 @@ impl Desktop {
                     "Resume"
                 },
                 !self.busy() && (save_status || can_resume || can_retry),
-                Color32::from_rgb(52, 170, 111),
             );
             if resume_action.clicked() {
                 let id = selected.as_ref().unwrap().id;
@@ -256,7 +255,6 @@ impl Desktop {
                 Icon::Resume,
                 "Restart",
                 !self.busy() && !active_selected && can_restart,
-                ACCENT,
             )
             .on_hover_text(
                 "Discard saved progress and download again from zero. Existing files are kept.",
@@ -269,13 +267,8 @@ impl Desktop {
             let pause_supported = self
                 .selected_view()
                 .is_some_and(|view| view.pause_supported);
-            let mut pause = action_button(
-                ui,
-                Icon::Pause,
-                "Pause",
-                active_selected && pause_supported,
-                Color32::from_rgb(218, 156, 55),
-            );
+            let mut pause =
+                action_button(ui, Icon::Pause, "Pause", active_selected && pause_supported);
             if active_selected && !pause_supported {
                 pause = pause
                     .on_disabled_hover_text("This server does not support resuming this download.");
@@ -292,7 +285,6 @@ impl Desktop {
                 "Cancel",
                 self.selected
                     .is_some_and(|id| self.snapshot.active.contains(&id)),
-                self.error_color(),
             )
             .clicked()
                 && let Some(id) = self.selected
@@ -301,7 +293,7 @@ impl Desktop {
                 self.error = Some("This download is no longer running.".into());
             }
             ui.separator();
-            if action_button(ui, Icon::Inspect, "Details", selected.is_some(), ACCENT).clicked() {
+            if action_button(ui, Icon::Inspect, "Details", selected.is_some()).clicked() {
                 self.transfer = self.selected;
             }
             if self.busy() {
@@ -310,8 +302,9 @@ impl Desktop {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Filter downloads…")
-                        .desired_width(200.0),
+                        .hint_text("Search")
+                        .desired_width(220.0)
+                        .margin(egui::vec2(9.0, 6.0)),
                 );
             });
         });
@@ -334,6 +327,9 @@ impl Desktop {
     fn render(&mut self, ui: &mut egui::Ui) {
         self.update();
         let ctx = ui.ctx().clone();
+        if !self.titlebar_sent.replace(true) {
+            self.apply_titlebar_theme(&ctx);
+        }
         if self.snapshot.ready
             && !self.busy()
             && ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N))
@@ -388,7 +384,7 @@ impl Desktop {
             .frame(
                 egui::Frame::new()
                     .fill(colors.surface)
-                    .inner_margin(egui::Margin::symmetric(8, 3)),
+                    .inner_margin(egui::Margin::symmetric(12, 4)),
             )
             .show(ui, |ui| self.menu(ui));
         egui::Panel::top("toolbar")
@@ -396,7 +392,7 @@ impl Desktop {
                 egui::Frame::new()
                     .fill(colors.surface)
                     .stroke(border)
-                    .inner_margin(egui::Margin::symmetric(8, 5)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status")
@@ -404,64 +400,69 @@ impl Desktop {
                 egui::Frame::new()
                     .fill(colors.surface)
                     .stroke(border)
-                    .inner_margin(egui::Margin::symmetric(10, 5)),
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("{} downloads", self.snapshot.jobs.len()));
-                    ui.separator();
-                    ui.label(if self.rate > 0 {
-                        format!("Download speed: {}/s", bytes(self.rate))
+                    ui.label(
+                        RichText::new(format!("{} downloads", self.snapshot.jobs.len()))
+                            .size(11.0)
+                            .color(colors.muted),
+                    );
+                    ui.add_space(4.0);
+                    let speed = if self.rate > 0 {
+                        format!("{}/s", bytes(self.rate))
                     } else if self.busy() {
-                        "Running".into()
+                        "Working".into()
                     } else {
                         "Idle".into()
-                    });
+                    };
+                    ui.label(
+                        RichText::new(speed)
+                            .size(11.0)
+                            .monospace()
+                            .color(colors.muted),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("HTTP / HTTPS").small().weak());
-                        ui.separator();
-                        if let Some(status) = &self.snapshot.capture {
+                        if self.snapshot.capture.is_some() {
                             let found = self.snapshot.captures.len();
                             let text = if found == 0 {
-                                "Browser capture: ready".to_owned()
+                                "Browser capture".to_owned()
                             } else {
-                                format!("Browser capture: {found} found")
+                                format!("Browser capture · {found}")
                             };
-                            ui.label(RichText::new(text).small().weak())
-                                .on_hover_text(format!(
-                                    "Listening at {}. Open View > Browser capture panel.",
-                                    status.endpoint
-                                ));
+                            ui.label(RichText::new(text).size(11.0).color(colors.muted));
                         } else if self.snapshot.capture_problem.is_some() {
-                            ui.label(RichText::new("Browser capture: unavailable").small().weak())
-                                .on_hover_text(
-                                    self.snapshot.capture_problem.as_deref().unwrap_or_default(),
-                                );
+                            ui.label(
+                                RichText::new("Browser capture unavailable")
+                                    .size(11.0)
+                                    .color(colors.muted),
+                            );
                         }
                     });
                 });
             });
         egui::Panel::left("library")
             .resizable(true)
-            .default_size(180.0)
-            .size_range(150.0..=260.0)
+            .default_size(200.0)
+            .size_range(168.0..=280.0)
             .frame(
                 egui::Frame::new()
                     .fill(colors.surface)
                     .stroke(border)
-                    .inner_margin(8),
+                    .inner_margin(12),
             )
             .show(ui, |ui| self.sidebar(ui));
         if self.capture_open {
             egui::Panel::right("capture")
                 .resizable(true)
-                .default_size(280.0)
-                .size_range(220.0..=460.0)
+                .default_size(300.0)
+                .size_range(240.0..=460.0)
                 .frame(
                     egui::Frame::new()
                         .fill(colors.surface)
                         .stroke(border)
-                        .inner_margin(8),
+                        .inner_margin(12),
                 )
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().show(ui, |ui| self.capture(ui));
@@ -469,17 +470,17 @@ impl Desktop {
         }
         egui::Panel::bottom("inspector")
             .resizable(true)
-            .default_size(160.0)
-            .size_range(80.0..=260.0)
+            .default_size(150.0)
+            .size_range(100.0..=240.0)
             .frame(
                 egui::Frame::new()
                     .fill(colors.surface)
                     .stroke(border)
-                    .inner_margin(6),
+                    .inner_margin(12),
             )
             .show(ui, |ui| self.inspector(ui));
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(colors.background).inner_margin(3))
+            .frame(egui::Frame::new().fill(colors.background).inner_margin(8))
             .show(ui, |ui| self.table(ui));
         self.add_dialog(&ctx);
         self.transfer_dialog(&ctx);

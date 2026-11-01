@@ -3,7 +3,7 @@ use gunda_core::download::DownloadState;
 
 use crate::view::{DownloadView, bytes};
 
-use super::theme::{ACCENT, Palette};
+use super::theme::Palette;
 
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
@@ -14,25 +14,66 @@ pub(super) enum Icon {
     Inspect,
 }
 
+/// A neutral action: the icon takes the text role, never its own color.
 pub(super) fn action_button(
     ui: &mut egui::Ui,
     icon: Icon,
     label: &str,
     enabled: bool,
-    color: Color32,
+) -> egui::Response {
+    let ink = if enabled {
+        ui.visuals().text_color().gamma_multiply(0.82)
+    } else {
+        ui.visuals().weak_text_color().gamma_multiply(0.72)
+    };
+    button(ui, icon, label, enabled, None, Some(ink), ink)
+}
+
+/// The one accent-filled action on a screen.
+pub(super) fn primary_action(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+    colors: Palette,
+) -> egui::Response {
+    let fill = if enabled {
+        colors.accent
+    } else {
+        colors.elevated
+    };
+    let ink = if enabled {
+        colors.accent_ink
+    } else {
+        colors.muted
+    };
+    button(ui, icon, label, enabled, Some(fill), Some(ink), ink)
+}
+
+fn button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    enabled: bool,
+    fill: Option<Color32>,
+    text: Option<Color32>,
+    icon_color: Color32,
 ) -> egui::Response {
     let id = ui.make_persistent_id(("action_icon", label));
-    let button = ui
-        .add_enabled_ui(enabled, |ui| {
-            egui::Button::new((egui::Atom::custom(id, egui::vec2(22.0, 22.0)), label))
-                .frame(true)
-                .min_size(egui::vec2(88.0, 30.0))
-                .atom_ui(ui)
-        })
-        .inner;
+    let text = match text {
+        Some(color) => RichText::new(label).color(color),
+        None => RichText::new(label),
+    };
+    let mut widget = egui::Button::new((egui::Atom::custom(id, egui::vec2(18.0, 18.0)), text))
+        .frame(true)
+        .min_size(egui::vec2(96.0, 32.0));
+    if let Some(fill) = fill {
+        widget = widget.fill(fill);
+    }
+    let button = ui.add_enabled_ui(enabled, |ui| widget.atom_ui(ui)).inner;
     if let Some(rect) = button.rect(id) {
         let color = if enabled {
-            color
+            icon_color
         } else {
             ui.visuals().weak_text_color()
         };
@@ -43,120 +84,78 @@ pub(super) fn action_button(
 
 fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Color32) {
     let center = rect.center();
-    let stroke = egui::Stroke::new(2.2, color);
+    let scale = (rect.width() / 22.0).max(0.5);
+    let stroke = egui::Stroke::new(1.6, color);
+    let at = |x: f32, y: f32| center + egui::vec2(x * scale, y * scale);
     match icon {
         Icon::Add => {
-            painter.line_segment(
-                [
-                    center + egui::vec2(-8.0, 0.0),
-                    center + egui::vec2(8.0, 0.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + egui::vec2(0.0, -8.0),
-                    center + egui::vec2(0.0, 8.0),
-                ],
-                stroke,
-            );
+            painter.line_segment([at(-7.0, 0.0), at(7.0, 0.0)], stroke);
+            painter.line_segment([at(0.0, -7.0), at(0.0, 7.0)], stroke);
         }
         Icon::Resume => {
             painter.add(egui::Shape::convex_polygon(
-                vec![
-                    center + egui::vec2(-5.0, -8.0),
-                    center + egui::vec2(8.0, 0.0),
-                    center + egui::vec2(-5.0, 8.0),
-                ],
+                vec![at(-5.0, -7.0), at(7.0, 0.0), at(-5.0, 7.0)],
                 color,
                 egui::Stroke::NONE,
             ));
         }
         Icon::Pause => {
-            for offset in [-4.0, 4.0] {
-                painter.line_segment(
-                    [
-                        center + egui::vec2(offset, -7.0),
-                        center + egui::vec2(offset, 7.0),
-                    ],
-                    stroke,
-                );
+            for offset in [-3.5, 3.5] {
+                painter.line_segment([at(offset, -7.0), at(offset, 7.0)], stroke);
             }
         }
         Icon::Cancel => {
-            painter.line_segment(
-                [
-                    center + egui::vec2(-7.0, -7.0),
-                    center + egui::vec2(7.0, 7.0),
-                ],
-                stroke,
-            );
-            painter.line_segment(
-                [
-                    center + egui::vec2(-7.0, 7.0),
-                    center + egui::vec2(7.0, -7.0),
-                ],
-                stroke,
-            );
+            painter.line_segment([at(-6.0, -6.0), at(6.0, 6.0)], stroke);
+            painter.line_segment([at(-6.0, 6.0), at(6.0, -6.0)], stroke);
         }
         Icon::Inspect => {
             painter.rect_stroke(
-                rect.shrink2(egui::vec2(4.0, 1.0)),
-                1,
+                rect.shrink2(egui::vec2(3.0 * scale, 1.0)),
+                2,
                 stroke,
                 egui::StrokeKind::Inside,
             );
             for offset in [-4.0, 0.0, 4.0] {
-                painter.line_segment(
-                    [
-                        center + egui::vec2(-3.0, offset),
-                        center + egui::vec2(3.0, offset),
-                    ],
-                    stroke,
-                );
+                painter.line_segment([at(-4.0, offset), at(4.0, offset)], stroke);
             }
         }
     }
 }
 
-pub(super) fn dialog_heading(
-    ui: &mut egui::Ui,
-    icon: Icon,
-    title: &str,
-    subtitle: &str,
-    colors: Palette,
-) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(32.0, 36.0), egui::Sense::hover());
-        paint_icon(ui.painter(), rect.shrink(5.0), icon, ACCENT);
-        ui.vertical(|ui| {
-            ui.add(egui::Label::new(RichText::new(title).size(13.0).strong()).truncate())
-                .on_hover_text(title);
-            ui.label(RichText::new(subtitle).size(12.0).color(colors.muted));
-        });
-    });
+pub(super) fn dialog_heading(ui: &mut egui::Ui, title: &str, subtitle: &str, colors: Palette) {
+    ui.add(egui::Label::new(RichText::new(title).size(15.0).strong()).truncate())
+        .on_hover_text(title);
+    ui.label(RichText::new(subtitle).size(12.0).color(colors.muted));
 }
 
 pub(super) fn stat(ui: &mut egui::Ui, label: &str, value: &str, colors: Palette) {
-    ui.label(RichText::new(label).size(12.0).color(colors.muted));
-    ui.label(RichText::new(value).size(12.0));
+    ui.label(RichText::new(label).size(11.0).color(colors.muted));
+    ui.label(RichText::new(value).size(13.0).monospace());
 }
 
 pub(super) fn notice(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
-        .fill(color.gamma_multiply(0.08))
-        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.35)))
-        .inner_margin(8)
-        .corner_radius(0)
+        .fill(color.gamma_multiply(0.10))
+        .stroke(egui::Stroke::new(1.0, color.gamma_multiply(0.38)))
+        .inner_margin(10)
+        .corner_radius(6)
         .show(ui, |ui| {
             ui.colored_label(color, text);
         });
 }
 
-pub(super) fn metric(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.label(RichText::new(label).weak());
-    ui.add_sized([195.0, 20.0], egui::Label::new(value).truncate())
-        .on_hover_text(value);
+pub(super) fn metric(ui: &mut egui::Ui, label: &str, value: &str, colors: Palette) {
+    ui.label(RichText::new(label).size(11.0).color(colors.muted));
+    ui.allocate_ui_with_layout(
+        egui::vec2(220.0, 18.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.add(
+                egui::Label::new(RichText::new(value).size(12.0).monospace()).truncate(),
+            )
+            .on_hover_text(value);
+        },
+    );
     ui.end_row();
 }
 
@@ -167,27 +166,38 @@ pub(super) fn display_total(view: &DownloadView) -> String {
         .unwrap_or_else(|| "Unknown".into())
 }
 
-pub(super) fn progress(ui: &mut egui::Ui, view: &DownloadView, width: f32) {
-    if let Some(fraction) = view.progress() {
-        ui.scope(|ui| {
-            // Keep the percentage readable on both the filled and empty parts,
-            // independently of the table's selection and light/dark theme.
-            ui.visuals_mut().extreme_bg_color = Color32::from_rgb(48, 55, 61);
-            ui.visuals_mut().override_text_color = Some(Color32::WHITE);
-            ui.add(
-                egui::ProgressBar::new(fraction)
-                    .corner_radius(0)
-                    .desired_width(width)
-                    .desired_height(16.0)
-                    .fill(if view.state == DownloadState::Completed {
-                        Color32::from_rgb(24, 111, 70)
-                    } else {
-                        ACCENT
-                    })
-                    .text(RichText::new(format!("{:.1}%", fraction * 100.0)).color(Color32::WHITE)),
-            );
-        });
-    } else {
-        ui.label(format!("{} · size unknown", bytes(view.written)));
-    }
+/// A thin rule with its figure in mono, so progress reads like an instrument.
+pub(super) fn progress(ui: &mut egui::Ui, view: &DownloadView, width: f32, colors: Palette) {
+    let Some(fraction) = view.progress() else {
+        ui.label(
+            RichText::new(bytes(view.written))
+                .size(11.0)
+                .monospace()
+                .color(colors.muted),
+        );
+        return;
+    };
+
+    ui.horizontal(|ui| {
+        let bar_width = (width - 46.0).max(40.0);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_width, 6.0), egui::Sense::hover());
+        let fill = if view.state == DownloadState::Completed {
+            colors.success
+        } else {
+            colors.accent
+        };
+        let painter = ui.painter();
+        painter.rect_filled(rect, 3.0, colors.track);
+        if fraction > 0.0 {
+            let mut filled = rect;
+            filled.set_width(rect.width() * fraction);
+            painter.rect_filled(filled, 3.0, fill);
+        }
+        ui.label(
+            RichText::new(format!("{:.0}%", fraction * 100.0))
+                .size(11.0)
+                .monospace()
+                .color(colors.muted),
+        );
+    });
 }

@@ -25,10 +25,12 @@ impl Desktop {
         let colors = Palette::new(self.dark);
 
         ui.label(
-            RichText::new("BROWSER CAPTURE")
+            RichText::new("Browser capture")
+                .size(11.0)
                 .strong()
                 .color(colors.muted),
         );
+        ui.add_space(4.0);
         ui.separator();
 
         if let Some(problem) = self.snapshot.capture_problem.as_deref() {
@@ -46,8 +48,14 @@ impl Desktop {
             ),
         }
 
-        ui.add_space(6.0);
-        ui.label(RichText::new("CAPTURED").strong().color(colors.muted));
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new("Captured")
+                .size(11.0)
+                .strong()
+                .color(colors.muted),
+        );
+        ui.add_space(4.0);
         ui.separator();
 
         if self.snapshot.captures.is_empty() {
