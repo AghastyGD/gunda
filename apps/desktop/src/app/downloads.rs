@@ -308,12 +308,12 @@ impl Desktop {
                 notice(ui, error, self.error_color());
             }
         });
-            if let Some(error) = &view.error {
-                ui.add_space(8.0);
-                notice(ui, error, self.error_color());
-            }
+        if let Some(error) = &view.error {
+            ui.add_space(8.0);
+            notice(ui, error, self.error_color());
         }
     }
+}
 
 const COLUMNS: [&str; 6] = ["File name", "Status", "Progress", "Size", "Speed", "Origin"];
 

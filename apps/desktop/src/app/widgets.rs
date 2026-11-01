@@ -150,10 +150,8 @@ pub(super) fn metric(ui: &mut egui::Ui, label: &str, value: &str, colors: Palett
         egui::vec2(220.0, 18.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            ui.add(
-                egui::Label::new(RichText::new(value).size(12.0).monospace()).truncate(),
-            )
-            .on_hover_text(value);
+            ui.add(egui::Label::new(RichText::new(value).size(12.0).monospace()).truncate())
+                .on_hover_text(value);
         },
     );
     ui.end_row();
