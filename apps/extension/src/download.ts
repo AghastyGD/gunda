@@ -2,6 +2,21 @@ const parameters = new URLSearchParams(location.search);
 let downloadId = Number(parameters.get('id'));
 const captureParameter = parameters.get('capture_id');
 const captureId = captureParameter === null ? Number.NaN : Number(captureParameter);
+const browserPrompt = parameters.get('browser_prompt') === '1';
+const browserDownloadValue = Number(parameters.get('download_id'));
+const browserDownload =
+  Number.isSafeInteger(browserDownloadValue) && browserDownloadValue >= 0
+    ? browserDownloadValue
+    : null;
+const browserUrl = parameters.get('url') ?? '';
+const browserContentType = parameters.get('content_type') ?? '';
+const browserSizeValue = Number(parameters.get('size_bytes'));
+const browserSize =
+  Number.isSafeInteger(browserSizeValue) && browserSizeValue > 0
+    ? browserSizeValue
+    : null;
+const browserPageUrl = parameters.get('page_url') ?? '';
+const browserPageTitle = parameters.get('page_title') ?? '';
 
 function downloadElement<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -43,6 +58,41 @@ function downloadFormatBytes(value: number): string {
   return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
+function downloadTypeLabel(contentType: string): string {
+  const essence = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
+  if (!essence) {
+    return 'File';
+  }
+  if (essence.startsWith('video/')) {
+    return 'Video';
+  }
+  if (essence.startsWith('audio/')) {
+    return 'Audio';
+  }
+  if (essence.startsWith('image/')) {
+    return 'Image';
+  }
+  if (essence === 'application/pdf') {
+    return 'PDF document';
+  }
+  if (essence.startsWith('text/')) {
+    return 'Text file';
+  }
+  if (/zip|compressed|tar|rar|7z/i.test(essence)) {
+    return 'Archive';
+  }
+  if (/(word|document|opendocument\.text)/i.test(essence)) {
+    return 'Document';
+  }
+  if (/(sheet|excel|spreadsheet)/i.test(essence)) {
+    return 'Spreadsheet';
+  }
+  if (/(presentation|powerpoint)/i.test(essence)) {
+    return 'Presentation';
+  }
+  return 'File';
+}
+
 function downloadStateLabel(state: string): string {
   switch (state) {
     case 'queued':
@@ -73,21 +123,37 @@ function downloadFailureLabel(failure: string): string {
     case 'network':
       return 'Connection problem.';
     case 'authentication':
-      return 'The server requires authorization.';
+      return 'This file needs a sign-in.';
     case 'remote_rejected':
-      return 'The server refused the download.';
+      return 'The site refused the download.';
     case 'invalid_response':
-      return 'The server returned an unexpected response.';
+      return 'The site sent an unexpected response.';
     case 'unsupported_resource':
-      return 'This media type is not supported.';
+      return 'Gunda cannot download this file type.';
     case 'permission_denied':
       return 'Gunda cannot save the file in the selected folder.';
     case 'disk_full':
       return 'There is not enough disk space.';
     case 'integrity':
-      return 'The downloaded media could not be verified.';
+      return 'The downloaded file could not be verified.';
     default:
       return 'The download stopped unexpectedly.';
+  }
+}
+
+function browserStartFailureLabel(reason: string | undefined): string {
+  if (!reason) {
+    return 'Gunda is not available.';
+  }
+  switch (reason) {
+    case 'connection_unavailable':
+      return 'Gunda is not connected. The browser download was restored.';
+    case 'invalid_download':
+      return 'This download is no longer available. Close this window and try again.';
+    case 'invalid_destination':
+      return 'Choose a folder and enter a file name.';
+    default:
+      return 'Gunda could not start this download. The browser download was restored.';
   }
 }
 
@@ -111,7 +177,7 @@ async function refreshDownload(): Promise<void> {
     return;
   }
   if (response.kind !== 'status') {
-    stateField.textContent = 'Waiting for Gunda daemon...';
+    stateField.textContent = 'Waiting for Gunda...';
     return;
   }
 
@@ -152,7 +218,47 @@ function beginProgress(id: number): void {
 }
 
 closeButton.addEventListener('click', () => window.close());
-cancelButton.addEventListener('click', () => window.close());
+cancelButton.addEventListener('click', () => {
+  if (!browserPrompt) {
+    window.close();
+    return;
+  }
+  void restoreInBrowser();
+});
+
+async function restoreInBrowser(): Promise<void> {
+  if (browserDownload === null) {
+    window.close();
+    return;
+  }
+
+  cancelButton.disabled = true;
+  startButton.disabled = true;
+  setupFailure.textContent = '';
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      kind: 'cancel-browser-download',
+      download_id: browserDownload,
+      url: browserUrl,
+      content_type: browserContentType || null,
+      size_bytes: browserSize,
+      page_url: browserPageUrl,
+      page_title: browserPageTitle || null,
+      filename: filenameInput.value.trim() || parameters.get('filename') || 'download',
+      directory: directoryInput.value.trim(),
+    })) as { restored?: boolean } | undefined;
+    if (response?.restored === false) {
+      setupFailure.textContent =
+        'Chrome could not restart this download. Try again from the page.';
+      cancelButton.disabled = false;
+      startButton.disabled = false;
+      return;
+    }
+  } catch {
+    // Nothing else can be done; the browser item stays cancelled.
+  }
+  window.close();
+}
 
 chooseButton.addEventListener('click', async () => {
   chooseButton.disabled = true;
@@ -177,6 +283,44 @@ startButton.addEventListener('click', async () => {
   const format = parameters.get('format') ?? '';
   const directory = directoryInput.value.trim();
   const filename = filenameInput.value.trim();
+
+  if (browserPrompt) {
+    if (!browserUrl || !browserPageUrl || browserDownload === null) {
+      setupFailure.textContent = 'This download is no longer available.';
+      return;
+    }
+    if (!directory || !filename) {
+      setupFailure.textContent = 'Choose a folder and enter a file name.';
+      return;
+    }
+
+    startButton.disabled = true;
+    setupFailure.textContent = '';
+    try {
+      const response = (await chrome.runtime.sendMessage({
+        kind: 'start-browser-download',
+        download_id: browserDownload,
+        url: browserUrl,
+        content_type: browserContentType || null,
+        size_bytes: browserSize,
+        page_url: browserPageUrl,
+        page_title: browserPageTitle || null,
+        directory,
+        filename,
+      })) as DownloadResponse | undefined;
+      if (response?.kind === 'queued') {
+        beginProgress(response.id);
+      } else {
+        setupFailure.textContent = browserStartFailureLabel(response?.reason);
+        startButton.disabled = response?.reason === 'invalid_download';
+      }
+    } catch {
+      setupFailure.textContent = 'Gunda is not available.';
+      startButton.disabled = false;
+    }
+    return;
+  }
+
   if (!pageUrl || !Number.isSafeInteger(captureId) || captureId < 0) {
     setupFailure.textContent = 'This format is no longer available. Choose it again.';
     return;
@@ -211,6 +355,19 @@ startButton.addEventListener('click', async () => {
 
 if (Number.isSafeInteger(downloadId) && downloadId > 0) {
   beginProgress(downloadId);
+} else if (browserPrompt) {
+  const filename = parameters.get('filename') ?? 'download';
+  formatLabel.textContent = filename;
+  formatDetails.textContent = [
+    downloadTypeLabel(browserContentType),
+    browserSize === null ? 'Size unknown' : downloadFormatBytes(browserSize),
+  ].join(' · ');
+  filenameInput.value = filename;
+  directoryInput.value = parameters.get('directory') ?? '';
+  if (!browserUrl || !browserPageUrl || browserDownload === null) {
+    setupFailure.textContent = 'This download is no longer available.';
+    startButton.disabled = true;
+  }
 } else {
   formatLabel.textContent = parameters.get('label') ?? 'Selected format';
   formatDetails.textContent = parameters.get('details') ?? '';

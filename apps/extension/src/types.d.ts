@@ -1,6 +1,7 @@
 type CandidateReport = {
   url: string;
   content_type: string | null;
+  size_bytes: number | null;
   page_url: string;
   page_title: string | null;
   filename?: string | null;
@@ -27,7 +28,12 @@ type PageRefresh = {
 type PageMessage = PageSource | PageMedia | PageRefresh;
 
 type RuntimeMessage =
-  | { kind: 'candidate'; url: string; content_type: string | null }
+  | {
+      kind: 'candidate';
+      url: string;
+      content_type: string | null;
+      size_bytes: number | null;
+    }
   | {
       kind: 'source';
       source_url: string;
@@ -54,6 +60,28 @@ type RuntimeMessage =
       format: string;
       directory: string;
       filename: string;
+    }
+  | {
+      kind: 'start-browser-download';
+      download_id: number;
+      url: string;
+      content_type: string | null;
+      size_bytes: number | null;
+      page_url: string;
+      page_title: string | null;
+      directory: string;
+      filename: string;
+    }
+  | {
+      kind: 'cancel-browser-download';
+      download_id: number;
+      url: string;
+      content_type: string | null;
+      size_bytes: number | null;
+      page_url: string;
+      page_title: string | null;
+      filename: string;
+      directory: string;
     };
 
 type ServerMessage =

@@ -144,7 +144,6 @@ async fn a_reported_resource_reaches_the_interface_and_downloads_as_a_browser_jo
     assert_eq!(view.kind, "File");
     assert_eq!(view.content_type.as_deref(), Some("video/mp4"));
     assert_eq!(view.page_title.as_deref(), Some("A movie"));
-    assert_eq!(view.seen, 1);
 
     backend
         .send(Command::Capture {
@@ -254,7 +253,7 @@ async fn a_chosen_quality_downloads_and_is_named_after_the_presentation() {
     let track = &tracks.tracks[0];
 
     assert_eq!(track.label, "640x360 (1.0 Mbps)");
-    assert_eq!(track.details, "video | size unknown");
+    assert_eq!(track.details, "Video · Size unknown");
     assert_eq!(track.filename, None);
     assert_eq!(track.url, master);
     assert!(track.selection.is_some());

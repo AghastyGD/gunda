@@ -295,7 +295,7 @@ low.m3u8\n";
     assert_eq!(tracks.problem, None);
     assert_eq!(tracks.tracks.len(), 1);
     assert!(tracks.tracks[0].label.contains("640x360"));
-    assert!(tracks.tracks[0].details.starts_with("video | "));
+    assert!(tracks.tracks[0].details.starts_with("Video · "));
 
     server.await.unwrap();
     daemon.abort();

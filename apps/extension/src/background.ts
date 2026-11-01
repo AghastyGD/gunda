@@ -34,6 +34,7 @@ const pending: string[] = [];
 const seen = new Map<string, number>();
 const handledDownloads = new Map<number, number>();
 const reportedDownloads = new Map<number, number>();
+const restoredDownloads = new Map<string, number>();
 const downloadRequests: {
   resolve: (response: DownloadResponse) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -93,7 +94,12 @@ async function nativePairing(): Promise<PairingSettings | null> {
         finish({ endpoint: response.endpoint, token: response.token });
       }
     });
-    port.onDisconnect.addListener(() => finish(null));
+    port.onDisconnect.addListener(() => {
+      // Consume the disconnect error. Without this, Chrome logs an
+      // "Unchecked runtime.lastError" when the native host is not installed.
+      void chrome.runtime.lastError;
+      finish(null);
+    });
     try {
       port.postMessage({
         kind: 'pairing',
@@ -358,7 +364,7 @@ function reportCandidate(candidate: CandidateReport): void {
   }
 
   const now = Date.now();
-  const key = `${candidate.url}\u0000${candidate.filename ?? ''}`;
+  const key = `${candidate.url}\u0000${candidate.filename ?? ''}\u0000${candidate.size_bytes ?? ''}`;
   const last = seen.get(key);
   if (last !== undefined && now - last < DEDUP_WINDOW_MS) {
     return;
@@ -503,7 +509,7 @@ async function chooseDownloadFolder(): Promise<{ path?: string; error?: string }
       error: response.message || 'The folder picker did not return a folder.',
     };
   } catch {
-    return { error: 'The native folder picker is unavailable.' };
+    return { error: 'Gunda could not open the folder picker.' };
   }
 }
 
@@ -536,7 +542,8 @@ function openDownloadWindow(
 function titleFilename(title: string, extension: string): string {
   const cleaned = title
     .replace(/\s*-\s*YouTube\s*$/i, '')
-    .replace(/\s*\|\s*(Instagram|Facebook)\s*$/i, '')
+    .replace(/\s*-\s*Google Drive\s*$/i, '')
+    .replace(/\s*\|\s*(Instagram|Facebook|Google Drive)\s*$/i, '')
     .replace(/[~/\\?%*:|"<>\u0000-\u001f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
@@ -568,6 +575,37 @@ function headerValue(headers: chrome.webRequest.HttpHeader[] | undefined, name: 
   return found?.value ?? null;
 }
 
+function dispositionFilename(header: string | null): string | null {
+  if (!header) {
+    return null;
+  }
+  const extended = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(header)?.[1];
+  const quoted = /filename\s*=\s*"([^"]*)"/i.exec(header)?.[1];
+  const bare = /filename\s*=\s*([^;]+)/i.exec(header)?.[1];
+  const raw = extended ?? quoted ?? bare;
+  if (!raw) {
+    return null;
+  }
+  let value = raw.trim();
+  if (extended) {
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // Keep the raw value when the header is not valid percent-encoding.
+    }
+  }
+  const name = downloadFilename(value);
+  return name && name.length > 0 ? name : null;
+}
+
+function declaredSize(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+  const bytes = Number(value);
+  return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : null;
+}
+
 function essence(contentType: string | null): string {
   return (contentType ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
 }
@@ -593,6 +631,39 @@ function isSegment(url: string, contentType: string): boolean {
 function downloadFilename(filename: string | undefined): string | null {
   const name = filename?.split(/[\\/]/).pop()?.trim();
   return name ? [...name].slice(0, 200).join('') : null;
+}
+
+const declaredFilenames = new Map<string, { name: string; at: number }>();
+const DECLARED_FILENAME_TTL_MS = 5 * 60 * 1000;
+
+function rememberDeclaredFilename(url: string, name: string): void {
+  const now = Date.now();
+  declaredFilenames.set(url, { name, at: now });
+  for (const [key, entry] of declaredFilenames) {
+    if (now - entry.at >= DECLARED_FILENAME_TTL_MS) {
+      declaredFilenames.delete(key);
+    }
+  }
+}
+
+function declaredFilename(url: string): string | null {
+  const entry = declaredFilenames.get(url);
+  return entry && Date.now() - entry.at < DECLARED_FILENAME_TTL_MS ? entry.name : null;
+}
+
+function urlBasename(url: string): string | null {
+  try {
+    const last = new URL(url).pathname.split('/').pop() ?? '';
+    let decoded = last;
+    try {
+      decoded = decodeURIComponent(last);
+    } catch {
+      // Keep the raw path segment when it is not valid percent-encoding.
+    }
+    return downloadFilename(decoded);
+  } catch {
+    return null;
+  }
 }
 
 function schemeHost(url: string): { scheme: string; host: string } {
@@ -633,6 +704,38 @@ function rememberFor(map: Map<number, number>, id: number): void {
   }
 }
 
+// Chrome does not always expose byExtensionId on download creation, so a
+// restored download is recognised by the URL it was started with.
+function downloadKey(url: string): string {
+  try {
+    const parsed = new URL(url);
+    parsed.hash = '';
+    return parsed.href;
+  } catch {
+    return url;
+  }
+}
+
+function rememberRestoredDownload(url: string): void {
+  const now = Date.now();
+  restoredDownloads.set(downloadKey(url), now + HANDLED_DOWNLOAD_TTL_MS);
+  for (const [key, expires] of restoredDownloads) {
+    if (expires <= now) {
+      restoredDownloads.delete(key);
+    }
+  }
+}
+
+function takeRestoredDownload(url: string): boolean {
+  const key = downloadKey(url);
+  const expires = restoredDownloads.get(key);
+  if (expires === undefined) {
+    return false;
+  }
+  restoredDownloads.delete(key);
+  return expires > Date.now();
+}
+
 function reportBrowserDownload(
   item: chrome.downloads.DownloadItem,
   outcome: BrowserDownloadOutcome = 'kept',
@@ -659,6 +762,7 @@ function reportBrowserDownload(
   reportCandidate({
     url: item.url,
     content_type: item.mime || null,
+    size_bytes: declaredSize(item.fileSize) ?? declaredSize(item.totalBytes),
     page_url: /^https?:/i.test(item.referrer) ? item.referrer : item.url,
     page_title: null,
     filename: downloadFilename(item.filename),
@@ -675,11 +779,24 @@ function canInterceptBrowserDownload(item: chrome.downloads.DownloadItem): boole
   );
 }
 
-function requestBrowserDownload(
-  item: chrome.downloads.DownloadItem,
+type BrowserDownloadPrompt = {
+  download_id: number;
+  url: string;
+  content_type: string | null;
+  size_bytes: number | null;
+  page_url: string;
+  page_title: string | null;
+  filename: string;
+  directory: string;
+};
+
+async function requestBrowserDownload(
+  prompt: BrowserDownloadPrompt,
+  directory: string,
+  filename: string,
 ): Promise<DownloadResponse> {
-  if (!connection || connection.readyState !== WebSocket.OPEN || !greeted) {
-    return Promise.resolve({ kind: 'unavailable', reason: 'connection_unavailable' });
+  if (!(await waitForCaptureConnection())) {
+    return { kind: 'unavailable', reason: 'connection_unavailable' };
   }
 
   return new Promise((resolve) => {
@@ -694,11 +811,13 @@ function requestBrowserDownload(
     connection?.send(
       JSON.stringify({
         kind: 'download_browser',
-        url: item.url,
-        content_type: item.mime || null,
-        page_url: /^https?:/i.test(item.referrer) ? item.referrer : item.url,
-        page_title: null,
-        filename: downloadFilename(item.filename),
+        url: prompt.url,
+        content_type: prompt.content_type,
+        size_bytes: prompt.size_bytes,
+        page_url: prompt.page_url,
+        page_title: prompt.page_title,
+        filename,
+        directory,
       }),
     );
   });
@@ -709,13 +828,11 @@ function cancelBrowserDownload(id: number): Promise<boolean> {
     try {
       chrome.downloads.cancel(id, () => {
         if (chrome.runtime.lastError) {
-          resolve(false);
+          // The browser may have finished the file before Start was pressed.
+          removeBrowserDownloadFile(id, resolve);
           return;
         }
-        chrome.downloads.erase({ id }, () => {
-          void chrome.runtime.lastError;
-          resolve(true);
-        });
+        eraseBrowserDownload(id, resolve);
       });
     } catch {
       resolve(false);
@@ -723,59 +840,470 @@ function cancelBrowserDownload(id: number): Promise<boolean> {
   });
 }
 
-async function interceptBrowserDownload(
-  item: chrome.downloads.DownloadItem,
-  suggest?: (suggestion?: chrome.downloads.FilenameSuggestion) => void,
-): Promise<void> {
-  let finished = false;
-  const finish = (): void => {
-    if (finished) {
-      return;
-    }
-    finished = true;
-    try {
-      suggest?.();
-    } catch {
-      // The browser may already have removed the item.
-    }
-  };
-
+function eraseBrowserDownload(id: number, resolve: (value: boolean) => void): void {
   try {
-    const response = await requestBrowserDownload(item);
-    if (response.kind !== 'queued') {
-      await count('browser_download_kept');
-      reportBrowserDownload(item, 'kept', response.reason);
-      finish();
-      return;
-    }
-
-    const cancelled = await cancelBrowserDownload(item.id);
-    if (!cancelled) {
-      await count('browser_download_cancel_failed');
-      reportBrowserDownload(item, 'kept', 'cancel_failed');
-      finish();
-      return;
-    }
-
-    await count('browser_download_intercepted');
-    void rememberDownload(item, 'intercepted');
+    chrome.downloads.erase({ id }, () => {
+      void chrome.runtime.lastError;
+      resolve(true);
+    });
   } catch {
-    await count('browser_download_kept');
-    reportBrowserDownload(item, 'kept', 'intercept_failed');
-    finish();
+    resolve(true);
   }
 }
 
-function beginBrowserIntercept(
+function removeBrowserDownloadFile(
+  id: number,
+  resolve: (value: boolean) => void,
+): void {
+  try {
+    chrome.downloads.removeFile(id, () => {
+      if (chrome.runtime.lastError) {
+        resolve(false);
+        return;
+      }
+      eraseBrowserDownload(id, resolve);
+    });
+  } catch {
+    resolve(false);
+  }
+}
+
+function filenameExtension(filename: string | null): string | null {
+  if (!filename) {
+    return null;
+  }
+  const match = /\.([a-z0-9]{1,10})$/i.exec(filename);
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function mimeExtension(mime: string | null): string | null {
+  const known: Record<string, string> = {
+    'application/pdf': 'pdf',
+    'application/zip': 'zip',
+    'audio/mpeg': 'mp3',
+    'audio/mp4': 'm4a',
+    'video/mp4': 'mp4',
+    'video/quicktime': 'mov',
+    'video/webm': 'webm',
+    'video/x-flv': 'flv',
+    'video/x-matroska': 'mkv',
+  };
+  return known[essence(mime)] ?? null;
+}
+
+function urlExtension(url: string): string | null {
+  try {
+    return filenameExtension(new URL(url).pathname.split('/').pop() ?? null);
+  } catch {
+    return null;
+  }
+}
+
+const GENERIC_FILENAME_STEMS = new Set([
+  'attachment',
+  'blob',
+  'document',
+  'download',
+  'file',
+  'get',
+  'index',
+  'media',
+  'play',
+  'stream',
+  'uc',
+  'video',
+]);
+
+function isGenericDownloadName(name: string): boolean {
+  const stem = name
+    .replace(/\.[a-z0-9]{1,10}$/i, '')
+    .replace(/\s*\(\d+\)$/, '')
+    .trim()
+    .toLowerCase();
+  return GENERIC_FILENAME_STEMS.has(stem);
+}
+
+function isGenericPageTitle(title: string): boolean {
+  const lower = title.trim().toLowerCase();
+  return (
+    lower === 'drive' ||
+    lower === 'google drive' ||
+    lower.startsWith('google drive - ') ||
+    lower.startsWith('google drive:')
+  );
+}
+
+function browserFilename(
   item: chrome.downloads.DownloadItem,
-  suggest?: (suggestion?: chrome.downloads.FilenameSuggestion) => void,
-): boolean {
+  pageTitle: string | null,
+  declaredName: string | null,
+): string {
+  const browserName = downloadFilename(item.filename);
+  const extension =
+    filenameExtension(browserName) ??
+    filenameExtension(declaredName) ??
+    mimeExtension(item.mime) ??
+    urlExtension(item.finalUrl || item.url) ??
+    'bin';
+
+  if (browserName && !isGenericDownloadName(browserName)) {
+    return browserName;
+  }
+  if (declaredName && !isGenericDownloadName(declaredName)) {
+    return declaredName;
+  }
+
+  const fromUrl = urlBasename(item.finalUrl || item.url);
+  if (fromUrl && filenameExtension(fromUrl) && !isGenericDownloadName(fromUrl)) {
+    return fromUrl;
+  }
+
+  if (pageTitle && !isGenericPageTitle(pageTitle)) {
+    const fromTitle = titleFilename(pageTitle, extension);
+    if (!isGenericDownloadName(fromTitle)) {
+      return fromTitle;
+    }
+  }
+  for (const candidate of [browserName, declaredName]) {
+    if (candidate && filenameExtension(candidate)) {
+      return candidate;
+    }
+  }
+  return `download.${extension}`;
+}
+
+function driveFileId(url: string): string | null {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host.endsWith('drive.google.com')) {
+      const match = /^\/file\/d\/([A-Za-z0-9_-]{10,})/.exec(parsed.pathname);
+      return match?.[1] ?? null;
+    }
+    if (
+      host.endsWith('googleusercontent.com') ||
+      host.endsWith('usercontent.google.com')
+    ) {
+      const id = parsed.searchParams.get('id');
+      return id && /^[A-Za-z0-9_-]{10,}$/.test(id) ? id : null;
+    }
+  } catch {
+    // Fall through to the other page resolution steps.
+  }
+  return null;
+}
+
+async function pageForReferrer(
+  referrer: string,
+  downloadUrl: string,
+): Promise<{ url: string; title: string | null } | null> {
+  try {
+    const tabs = await chrome.tabs.query({});
+    const fileId = driveFileId(downloadUrl);
+    if (fileId) {
+      const drive = tabs.find(
+        (candidate) => candidate.url && driveFileId(candidate.url) === fileId,
+      );
+      if (drive?.url && /^https?:/i.test(drive.url)) {
+        return { url: drive.url, title: drive.title ?? null };
+      }
+    }
+    if (/^https?:/i.test(referrer)) {
+      let wanted: URL | null = null;
+      try {
+        wanted = new URL(referrer);
+      } catch {
+        // Keep the active tab fallback below.
+      }
+      const tab =
+        tabs.find((candidate) => candidate.url === referrer) ??
+        tabs.find((candidate) => {
+          if (!candidate.url || !wanted) {
+            return false;
+          }
+          try {
+            const current = new URL(candidate.url);
+            return (
+              current.origin === wanted.origin &&
+              current.pathname === wanted.pathname
+            );
+          } catch {
+            return false;
+          }
+        });
+      if (tab?.url && /^https?:/i.test(tab.url)) {
+        return { url: referrer, title: tab.title ?? null };
+      }
+    }
+
+    const active = tabs.find(
+      (candidate) => candidate.active && candidate.url && /^https?:/i.test(candidate.url),
+    );
+    if (active?.url) {
+      return { url: active.url, title: active.title ?? null };
+    }
+  } catch {
+    // The tabs permission may be unavailable in an incognito split.
+  }
+  return null;
+}
+
+function parentDirectory(filename: string | undefined): string {
+  const value = filename?.trim();
+  if (!value) {
+    return '';
+  }
+  const index = Math.max(value.lastIndexOf('\\'), value.lastIndexOf('/'));
+  return index > 0 ? value.slice(0, index) : '';
+}
+
+async function browserDirectory(item: chrome.downloads.DownloadItem): Promise<string> {
+  try {
+    const stored = await chrome.storage.local.get('browser_directory');
+    const last =
+      typeof stored.browser_directory === 'string'
+        ? stored.browser_directory.trim()
+        : '';
+    if (last) {
+      return last;
+    }
+  } catch {
+    // Fall back to the folder Chrome is using.
+  }
+  return parentDirectory(item.filename);
+}
+
+async function browserDownloadPrompt(
+  item: chrome.downloads.DownloadItem,
+): Promise<BrowserDownloadPrompt> {
+  const downloadUrl = /^https?:/i.test(item.finalUrl) ? item.finalUrl : item.url;
+  const page = await pageForReferrer(item.referrer, downloadUrl);
+  const pageUrl =
+    page?.url ??
+    (/^https?:/i.test(item.referrer) ? item.referrer : item.finalUrl || item.url);
+  const pageTitle = page?.title ?? null;
+
+  return {
+    download_id: item.id,
+    url: downloadUrl,
+    content_type: item.mime || null,
+    size_bytes: declaredSize(item.fileSize) ?? declaredSize(item.totalBytes),
+    page_url: pageUrl,
+    page_title: pageTitle,
+    filename: browserFilename(
+      item,
+      pageTitle,
+      declaredFilename(downloadUrl) ?? declaredFilename(item.url),
+    ),
+    directory: await browserDirectory(item),
+  };
+}
+
+function openBrowserDownloadWindow(prompt: BrowserDownloadPrompt): Promise<boolean> {
+  const url = new URL(chrome.runtime.getURL('download.html'));
+  url.searchParams.set('browser_prompt', '1');
+  url.searchParams.set('download_id', String(prompt.download_id));
+  url.searchParams.set('url', prompt.url);
+  if (prompt.content_type) {
+    url.searchParams.set('content_type', prompt.content_type);
+  }
+  if (prompt.size_bytes !== null) {
+    url.searchParams.set('size_bytes', String(prompt.size_bytes));
+  }
+  url.searchParams.set('page_url', prompt.page_url);
+  if (prompt.page_title) {
+    url.searchParams.set('page_title', prompt.page_title);
+  }
+  url.searchParams.set('filename', prompt.filename);
+  url.searchParams.set('directory', prompt.directory);
+  return new Promise((resolve) => {
+    try {
+      chrome.windows.create(
+        {
+          url: url.href,
+          type: 'popup',
+          width: 520,
+          height: 340,
+        },
+        (created) => {
+          resolve(!chrome.runtime.lastError && created !== undefined);
+        },
+      );
+    } catch {
+      resolve(false);
+    }
+  });
+}
+
+function restoreBrowserDownload(prompt: BrowserDownloadPrompt): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      rememberRestoredDownload(prompt.url);
+      chrome.downloads.download(
+        {
+          url: prompt.url,
+          filename: prompt.filename,
+          conflictAction: 'uniquify',
+          saveAs: false,
+        },
+        (id) => {
+          const error = chrome.runtime.lastError;
+          const restored = typeof id === 'number' && !error;
+          if (!restored) {
+            restoredDownloads.delete(downloadKey(prompt.url));
+          }
+          resolve(restored);
+        },
+      );
+    } catch {
+      restoredDownloads.delete(downloadKey(prompt.url));
+      resolve(false);
+    }
+  });
+}
+
+async function rememberBrowserPrompt(
+  prompt: BrowserDownloadPrompt,
+  outcome: BrowserDownloadOutcome,
+  reason: string | null,
+): Promise<void> {
+  const { scheme, host } = schemeHost(prompt.url);
+  await chrome.storage.session.set({
+    last_download: {
+      at: Date.now(),
+      scheme,
+      host,
+      mime: prompt.content_type ?? '',
+      filename: downloadFilename(prompt.filename),
+      by_extension: false,
+      outcome,
+      reason,
+    },
+  });
+}
+
+async function promptBrowserDownload(
+  item: chrome.downloads.DownloadItem,
+): Promise<void> {
+  const cancelled = await cancelBrowserDownload(item.id);
+  if (!cancelled) {
+    await count('browser_download_cancel_failed');
+    await count('browser_download_kept');
+    reportBrowserDownload(item, 'kept', 'cancel_failed');
+    return;
+  }
+
+  let prompt: BrowserDownloadPrompt;
+  try {
+    prompt = await browserDownloadPrompt(item);
+  } catch {
+    await restoreBrowserDownload({
+      download_id: item.id,
+      url: /^https?:/i.test(item.finalUrl) ? item.finalUrl : item.url,
+      content_type: item.mime || null,
+      size_bytes: declaredSize(item.fileSize) ?? declaredSize(item.totalBytes),
+      page_url: item.url,
+      page_title: null,
+      filename: browserFilename(item, null, null),
+      directory: '',
+    });
+    await count('browser_download_kept');
+    reportBrowserDownload(item, 'kept', 'prompt_failed');
+    return;
+  }
+
+  const opened = await openBrowserDownloadWindow(prompt);
+  if (!opened) {
+    await restoreBrowserDownload(prompt);
+    await count('browser_download_kept');
+    reportBrowserDownload(item, 'kept', 'prompt_failed');
+    return;
+  }
+
+  await count('browser_download_prompted');
+}
+
+type BrowserPromptMessage = Extract<
+  RuntimeMessage,
+  { kind: 'start-browser-download' | 'cancel-browser-download' }
+>;
+
+function browserPromptFromMessage(
+  message: BrowserPromptMessage,
+): BrowserDownloadPrompt {
+  return {
+    download_id: message.download_id,
+    url: message.url,
+    content_type: message.content_type,
+    size_bytes: message.size_bytes,
+    page_url: message.page_url,
+    page_title: message.page_title,
+    filename: message.filename.trim(),
+    directory: message.directory.trim(),
+  };
+}
+
+async function startBrowserDownload(
+  message: Extract<RuntimeMessage, { kind: 'start-browser-download' }>,
+): Promise<DownloadResponse> {
+  const prompt = browserPromptFromMessage(message);
+  if (!prompt.directory || !prompt.filename) {
+    return { kind: 'unavailable', reason: 'invalid_destination' };
+  }
+  if (!Number.isSafeInteger(prompt.download_id) || prompt.download_id < 0) {
+    return { kind: 'unavailable', reason: 'invalid_download' };
+  }
+
+  if (!(await waitForCaptureConnection())) {
+    await count('browser_download_kept');
+    await rememberBrowserPrompt(prompt, 'kept', 'connection_unavailable');
+    await restoreBrowserDownload(prompt);
+    return { kind: 'unavailable', reason: 'connection_unavailable' };
+  }
+
+  const response = await requestBrowserDownload(
+    prompt,
+    prompt.directory,
+    prompt.filename,
+  );
+  if (response.kind === 'queued') {
+    await chrome.storage.local.set({ browser_directory: prompt.directory });
+    await count('browser_download_intercepted');
+    await rememberBrowserPrompt(prompt, 'intercepted', null);
+    return response;
+  }
+
+  await count('browser_download_kept');
+  await restoreBrowserDownload(prompt);
+  await rememberBrowserPrompt(prompt, 'kept', response.reason);
+  return response;
+}
+
+async function keepBrowserDownload(
+  message: Extract<RuntimeMessage, { kind: 'cancel-browser-download' }>,
+): Promise<{ restored: boolean }> {
+  const prompt = browserPromptFromMessage(message);
+  if (!prompt.url || !Number.isSafeInteger(prompt.download_id)) {
+    return { restored: false };
+  }
+
+  const restored = await restoreBrowserDownload(prompt);
+  if (restored) {
+    await count('browser_download_kept');
+    await rememberBrowserPrompt(prompt, 'kept', 'prompt_cancelled');
+  } else {
+    await rememberBrowserPrompt(prompt, 'kept', 'restore_failed');
+  }
+  return { restored };
+}
+
+function beginBrowserIntercept(item: chrome.downloads.DownloadItem): boolean {
   if (handledDownloads.has(item.id) || !canInterceptBrowserDownload(item)) {
     return false;
   }
 
   rememberFor(handledDownloads, item.id);
-  void interceptBrowserDownload(item, suggest);
+  void promptBrowserDownload(item);
   return true;
 }
 
@@ -805,6 +1333,16 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
     typeof message.source_url === 'string' &&
     message.document !== null &&
     typeof message.document === 'object'
+  ) {
+    return message;
+  }
+  if (
+    (message.kind === 'start-browser-download' ||
+      message.kind === 'cancel-browser-download') &&
+    typeof message.url === 'string' &&
+    typeof message.page_url === 'string' &&
+    typeof message.filename === 'string' &&
+    typeof message.directory === 'string'
   ) {
     return message;
   }
@@ -840,6 +1378,10 @@ chrome.webRequest.onResponseStarted.addListener(
         reportCandidate({
           url: details.url,
           content_type: contentType || null,
+          size_bytes:
+            details.statusCode === 200
+              ? declaredSize(headerValue(details.responseHeaders, 'content-length'))
+              : null,
           page_url: page.url,
           page_title: page.title,
         });
@@ -853,24 +1395,29 @@ chrome.webRequest.onResponseStarted.addListener(
   ['responseHeaders'],
 );
 
-if (chrome.downloads.onDeterminingFilename) {
-  chrome.downloads.onDeterminingFilename.addListener((item, suggest) => {
-    if (handledDownloads.has(item.id)) {
-      suggest();
-      return false;
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    const name = dispositionFilename(
+      headerValue(details.responseHeaders, 'content-disposition'),
+    );
+    if (name) {
+      rememberDeclaredFilename(details.url, name);
     }
-    if (beginBrowserIntercept(item, suggest)) {
-      return true;
-    }
-
-    suggest();
-    reportBrowserDownload(item);
-    return false;
-  });
-}
+    return undefined;
+  },
+  {
+    urls: ['<all_urls>'],
+    types: ['main_frame', 'object', 'other', 'sub_frame'],
+  },
+  ['responseHeaders'],
+);
 
 chrome.downloads.onCreated.addListener((item) => {
   if (handledDownloads.has(item.id)) {
+    return;
+  }
+  if (takeRestoredDownload(item.url)) {
+    rememberFor(handledDownloads, item.id);
     return;
   }
   if (beginBrowserIntercept(item)) {
@@ -911,6 +1458,16 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
 
   if (message.kind === 'download-status') {
     void requestDownloadStatus(message.id).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'start-browser-download') {
+    void startBrowserDownload(message).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'cancel-browser-download') {
+    void keepBrowserDownload(message).then(sendResponse);
     return true;
   }
 
@@ -955,6 +1512,7 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
     reportCandidate({
       url: message.url,
       content_type: message.content_type ?? null,
+      size_bytes: message.size_bytes ?? null,
       page_url: sender.tab.url,
       page_title: sender.tab.title ?? null,
     });

@@ -201,6 +201,9 @@ pub struct CaptureView {
     pub page_title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
+    /// The complete file size the browser declared, when it knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
     pub seen: u32,
     pub segmented: bool,
     pub selectable: bool,
@@ -214,6 +217,9 @@ pub struct CaptureTrackView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     pub details: String,
+    /// Declared or estimated track size, when the presentation exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
     pub url: String,
     pub filename: Option<String>,
     pub selection: Option<String>,
@@ -555,6 +561,7 @@ mod tests {
                     content_type: Some("application/vnd.apple.mpegurl".into()),
                     page_title: Some("A presentation".into()),
                     filename: Some("presentation.m3u8".into()),
+                    size_bytes: None,
                     seen: 2,
                     segmented: true,
                     selectable: true,
@@ -565,6 +572,7 @@ mod tests {
                         label: "640x360".into(),
                         group: Some("English (en)".into()),
                         details: "video | 1.0 MiB".into(),
+                        size_bytes: None,
                         url: "https://cdn.example.test/master.m3u8".into(),
                         filename: Some("presentation.mp4".into()),
                         selection: Some("hls:v1".into()),

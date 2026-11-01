@@ -75,7 +75,8 @@ pub struct CaptureView {
     pub content_type: Option<String>,
     pub page_title: Option<String>,
     pub filename: Option<String>,
-    pub seen: u32,
+    /// The complete file size the browser declared, when it knew it.
+    pub size_bytes: Option<u64>,
     /// Whether the resource is a presentation whose tracks can be listed.
     pub segmented: bool,
     /// Whether more than one quality or track can be selected.
@@ -97,6 +98,8 @@ pub struct TrackView {
     /// Heading that groups qualities sharing the same audio rendition.
     pub group: Option<String>,
     pub details: String,
+    /// Declared or estimated track size, when the presentation exposes one.
+    pub size_bytes: Option<u64>,
     pub url: Url,
     pub filename: Option<String>,
     pub selection: Option<ExecutionSelection>,
@@ -1080,7 +1083,8 @@ impl TrackView {
         Self {
             label: track.label().to_owned(),
             group: track.group().map(str::to_owned),
-            details: format!("{} | {}", kind_name(track.kind()), size_hint(track.size())),
+            details: format!("{} · {}", kind_name(track.kind()), size_hint(track.size())),
+            size_bytes: track.size().bytes(),
             url: track.url().clone(),
             filename: track.filename().map(str::to_owned),
             selection: track.selection().cloned(),
@@ -1092,10 +1096,10 @@ impl TrackView {
 #[cfg(test)]
 fn kind_name(kind: TrackKind) -> &'static str {
     match kind {
-        TrackKind::Video => "video",
-        TrackKind::Audio => "audio",
-        TrackKind::Text => "text",
-        TrackKind::Unknown => "media",
+        TrackKind::Video => "Video",
+        TrackKind::Audio => "Audio",
+        TrackKind::Text => "Subtitles",
+        TrackKind::Unknown => "Media",
     }
 }
 
@@ -1108,7 +1112,7 @@ fn size_hint(size: TrackSize) -> String {
     match size {
         TrackSize::Exact(total) => bytes(total),
         TrackSize::Estimated(total) => format!("~{}", bytes(total)),
-        TrackSize::Unknown => "size unknown".to_owned(),
+        TrackSize::Unknown => "Size unknown".to_owned(),
     }
 }
 
@@ -1137,7 +1141,17 @@ impl CaptureView {
             content_type: candidate.content_type().map(str::to_owned),
             page_title: candidate.page_title().map(str::to_owned),
             filename: candidate.filename().map(str::to_owned),
-            seen: candidate.seen(),
+            size_bytes: if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+                None
+            } else {
+                candidate.size_bytes().or_else(|| {
+                    candidate
+                        .variants()
+                        .iter()
+                        .filter_map(|variant| variant.size())
+                        .max()
+                })
+            },
             segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
             selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)
                 || candidate.variants().len() > 1,

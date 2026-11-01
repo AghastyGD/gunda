@@ -71,6 +71,7 @@ window.addEventListener('message', (event: MessageEvent<unknown>) => {
       kind: 'candidate',
       url: message.url,
       content_type: null,
+      size_bytes: null,
     });
   }
 });
@@ -408,6 +409,7 @@ function reportElement(element: HTMLMediaElement | HTMLSourceElement): void {
     kind: 'candidate',
     url: absolute,
     content_type: element instanceof HTMLSourceElement ? element.type || null : null,
+    size_bytes: null,
   });
 }
 

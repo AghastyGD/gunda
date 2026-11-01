@@ -49,12 +49,21 @@ The pipeline has these responsibilities:
   `TS`, `UMP`, `DFXP`/`TTML`, `WEBM`, `MP4`).
 - **Browser download events.** `chrome.downloads` reports downloads the user
   starts, including files that are not media. The event supplies an HTTP(S)
-  URL, MIME type, and suggested filename. When the daemon advertises the
-  `browser_download` capability, the extension asks it to record and queue the
-  download in one message, then cancels and erases the browser's copy. A
-  refusal, timeout, missing capability, or failed cancellation leaves the
-  browser download running. `blob:`, `data:`, and other non-HTTP(S) downloads
-  are ignored because the daemon cannot fetch them without the page's session.
+  URL, MIME type, suggested filename, and often the total size. When the daemon
+  advertises the `browser_download` capability, the extension cancels and
+  erases the browser's copy (or removes the finished file if Chrome had already
+  completed it) and opens an extension-hosted start window, so nothing keeps
+  transferring in the background. Nothing is sent to the daemon until **Start
+  Download** is pressed; that window shows the filename, known size, and
+  destination folder, and can hand the download back to the browser. **Cancel**
+  asks the browser to download the URL again. If the window cannot open, or
+  Chrome can neither cancel nor remove its copy, the browser keeps its download
+  and nothing is queued. If the daemon refuses or times out on Start, the
+  extension restores the browser download. A restored download is recognised by
+  its URL for a short window, because Chrome does not reliably expose
+  `byExtensionId` when the item is created, so it is not prompted again. `blob:`, `data:`, and other
+  non-HTTP(S) downloads are ignored because the daemon cannot fetch them
+  without the page's session.
 - **A local transport.** An extension cannot open a raw socket, so candidates
   reach the Gunda daemon either over a loopback WebSocket or through the
   browser's native-messaging bridge, which needs an installed host manifest and
@@ -217,14 +226,17 @@ the published byte count when the transfer completes.
 
 Naming and size rules:
 
-- **The output prefers the browser's suggested name, then the presentation
-  title.** A filename chosen in the start window wins, followed by the name the
-  browser suggested for a download, then the page title when it contains usable
-  text. A shared sanitizer replaces unsafe filename characters, removes common
-  browser annotations, and applies an extension from the filename, content
-  type, or URL. Manifest and variant URLs frequently end in `index.m3u8`, so
-  `output_filename` remains only a fallback, and `plan_destination` remains the
-  only validator.
+- **The output prefers the most specific name available.** A filename chosen
+  in the start window wins. For a browser download the order is the browser's
+  suggested name, the response's `Content-Disposition`, the URL's last segment,
+  and only then the page title, which is cleaned of site annotations such as
+  `- Google Drive`. A generic name such as `download.mp4` never outranks a
+  specific one, and a Google Drive download is matched to its Drive file tab by
+  file id so the file's real name beats the warning page's title. A
+  shared sanitizer replaces unsafe filename characters and applies an extension
+  from the filename, content type, or URL. Manifest and variant URLs frequently
+  end in `index.m3u8`, so `output_filename` remains only a fallback, and
+  `plan_destination` remains the only validator.
 - **Reported sizes are measured or unknown.** A declared length is used
   directly. Otherwise every planned resource is probed with one bounded metadata
   request. The probe tries `HEAD`, then `Range: bytes=0-0` to read the total
@@ -312,10 +324,11 @@ the greeting, limited to `MAX_MESSAGE_BYTES` (2 MiB).
 | Extension to desktop | Payload |
 | --- | --- |
 | `hello` | `version`, `token`, `agent`; the first message on every connection |
-| `candidate` | `url`, `content_type?`, `page_url`, `page_title?`, `filename?` |
+| `candidate` | `url`, `content_type?`, `size_bytes?`, `page_url`, `page_title?`, `filename?` |
 | `source` | `source_url`, `page_url`, `page_title?`, `document`; a bounded JSON response for daemon extraction |
 | `list_formats` | `page_url`; list formats for the player control |
 | `download_page` | `page_url`, `capture_id?`, `format?`, `directory?`, `filename?`; queue the selected format |
+| `download_browser` | `url`, `content_type?`, `size_bytes?`, `page_url`, `page_title?`, `filename?`, `directory?`; record and queue a browser download |
 | `download_status` | `id`; read progress of a browser-created download |
 
 | Desktop to extension | Meaning |
@@ -363,6 +376,9 @@ resource is refused at the boundary instead of failing later in the engine:
   the resource worth downloading, and reporting every segment would bury it;
 - extracted progressive qualities are attached to one candidate, with the best
   variant used as its default URL;
+- a complete response's declared length is kept as a display hint when the
+  browser knew it. Manifests, partial responses, and range-addressed media do not
+  provide a complete size;
 - page titles and suggested filenames are stripped of control characters and
   bounded. A suggested filename keeps only its final path component.
 
@@ -511,7 +527,8 @@ Implemented:
    source JSON, and reports direct candidates, with an options page for pairing.
 5. Daemon and desktop wiring: `gundad` owns capture and quality inspection, and
    the desktop panel shows pairing, candidates, per-candidate download and
-   dismiss actions, and the quality picker.
+   dismiss actions, the quality picker, and a confirmation dialog with the known
+   size and destination folder before a capture starts.
 6. Storage: browser-origin jobs persist, carrying `source_page_url` and
    `source_title`.
 7. **Muxing:** `gunda-stream::mux` combines the two tracks of a split
@@ -538,13 +555,28 @@ Implemented:
     presentation, and opens the start window for the selected format without
     requiring the desktop window. The last desktop-selected folder is reused;
     the OS Downloads folder is the fallback.
-12. **Browser download window:** selecting a format opens an extension-hosted
-    setup window with filename, destination folder, format summary, Start, and
-    Cancel. The window reuses the exact capture whose formats were listed, so a
-    newer capture on the same page cannot replace that choice. The folder picker
-    uses the native-messaging host. Starting switches the same window to a
-    progress view with current state, bytes written, total size, failures, and
-    progress without opening the desktop.
+12. **Capture start window:** selecting a format opens an extension-hosted
+    setup window with filename, destination folder, format summary (including
+    the size when the daemon knew it), Start, and Cancel. The window reuses the
+    exact capture whose formats were listed, so a newer capture on the same page
+    cannot replace that choice. The folder picker uses the native-messaging host.
+    Starting switches the same window to a progress view with current state,
+    bytes written, total size, failures, and progress without opening the
+    desktop.
+13. **Browser download prompt:** an eligible Chrome download is cancelled and
+    erased immediately (or its finished file removed), so it never keeps
+    transferring behind the window, then a setup window shows its filename,
+    known size, and destination folder. The folder defaults to the last browser
+    download folder or Chrome's current download folder. Nothing is sent to the
+    daemon until Start Download; then the job is queued. Cancel restores the
+    download through `chrome.downloads.download`, as does a daemon refusal or
+    timeout after Start. If the window cannot open, or Chrome can neither cancel
+    nor remove its copy, the browser keeps the download and no job is queued.
+14. **Desktop start confirmation:** Download and quality rows open a dialog with
+    the chosen format, the known file size, the destination folder and its
+    picker, Start Download, and Cancel. Nothing is queued until Start Download is
+    pressed; choosing a folder updates the destination shared with the add
+    dialog.
 
 Planned:
 

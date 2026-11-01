@@ -13,13 +13,23 @@ use eframe::egui::{self, Color32, RichText};
 use gunda_core::download::{DownloadId, DownloadState};
 
 use crate::{
-    backend::{Backend, Command, Snapshot},
+    backend::{Backend, Command, Snapshot, TrackChoice},
     view::{DownloadView, bytes},
 };
 
 use downloads::Filter;
 use theme::{ACCENT, Palette};
 use widgets::{Icon, action_button};
+
+/// A capture the user asked to download, waiting for confirmation.
+#[derive(Clone)]
+struct CaptureStart {
+    id: gunda_capture::CandidateId,
+    track: Option<TrackChoice>,
+    label: String,
+    details: String,
+    size_bytes: Option<u64>,
+}
 
 pub struct Desktop {
     backend: Backend,
@@ -30,6 +40,7 @@ pub struct Desktop {
     search: String,
     dark: bool,
     capture_open: bool,
+    capture_start: Option<CaptureStart>,
     add_open: bool,
     url: String,
     destination: Option<PathBuf>,
@@ -56,6 +67,7 @@ impl Desktop {
             search: String::new(),
             dark,
             capture_open: false,
+            capture_start: None,
             add_open: false,
             url: String::new(),
             destination: directories::UserDirs::new()
@@ -335,8 +347,13 @@ impl Desktop {
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.add_open = false;
             self.transfer = None;
+            self.capture_start = None;
         }
-        if !self.add_open && self.transfer.is_none() && !ctx.egui_wants_keyboard_input() {
+        if !self.add_open
+            && self.transfer.is_none()
+            && self.capture_start.is_none()
+            && !ctx.egui_wants_keyboard_input()
+        {
             let down = ctx.input(|input| input.key_pressed(egui::Key::ArrowDown));
             let up = ctx.input(|input| input.key_pressed(egui::Key::ArrowUp));
             if down || up {
@@ -466,6 +483,7 @@ impl Desktop {
             .show(ui, |ui| self.table(ui));
         self.add_dialog(&ctx);
         self.transfer_dialog(&ctx);
+        self.capture_dialog(&ctx);
     }
 }
 

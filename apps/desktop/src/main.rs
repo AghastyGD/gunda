@@ -87,7 +87,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Launch::Desktop(directory) => directory,
     };
-    let _ = native_host::install(&directory);
+    if let Err(error) = native_host::install(&directory) {
+        eprintln!("Could not register the browser capture host: {error}");
+    }
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 780.0])

@@ -249,7 +249,7 @@ fn to_capture_view(capture: gunda_ipc::CaptureView) -> CaptureView {
         content_type: capture.content_type,
         page_title: capture.page_title,
         filename: capture.filename,
-        seen: capture.seen,
+        size_bytes: capture.size_bytes,
         segmented: capture.segmented,
         selectable: capture.selectable,
     }
@@ -273,6 +273,7 @@ fn to_capture_tracks(tracks: gunda_ipc::CaptureTracks) -> Option<CaptureTracks> 
                     label: track.label,
                     group: track.group,
                     details: track.details,
+                    size_bytes: track.size_bytes,
                     url,
                     filename: track.filename,
                     selection,

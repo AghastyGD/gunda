@@ -2,20 +2,19 @@ use eframe::egui::{self, RichText};
 use gunda_capture::CandidateId;
 
 use crate::backend::{CaptureStatus, CaptureTracks, CaptureView, Command, TrackChoice, TrackView};
+use crate::view::bytes;
 
-use super::Desktop;
 use super::theme::Palette;
 use super::widgets::notice;
+use super::{CaptureStart, Desktop};
 
 /// What the panel asks the backend to do once the frame is built.
 #[derive(Default)]
 struct Actions {
-    /// A captured presentation downloaded whole, in the quality the plan picks.
-    download: Option<CandidateId>,
+    /// A download the user asked to start; it waits for confirmation.
+    start: Option<CaptureStart>,
     /// A capture whose qualities the user asked to see.
     inspect: Option<CandidateId>,
-    /// One chosen quality or track of a capture.
-    choose: Option<(CandidateId, TrackChoice)>,
     dismiss: Option<CandidateId>,
     clear: bool,
 }
@@ -98,24 +97,9 @@ impl Desktop {
         if actions.clear {
             self.send(Command::ClearCaptures);
         }
-
-        let chosen = actions
-            .choose
-            .map(|(id, track)| (id, Some(track)))
-            .or_else(|| actions.download.map(|id| (id, None)));
-
-        if let Some((id, track)) = chosen {
-            match self.destination.clone() {
-                Some(directory) => self.send(Command::Capture {
-                    id,
-                    directory,
-                    track,
-                }),
-                None => {
-                    self.error =
-                        Some("Choose a download folder before downloading a capture.".into());
-                }
-            }
+        if let Some(start) = actions.start {
+            self.error = None;
+            self.capture_start = Some(start);
         }
     }
 }
@@ -150,6 +134,66 @@ fn field(ui: &mut egui::Ui, label: &str, value: &str, colors: Palette) {
     });
 }
 
+/// A short, plain description of what was captured: its type and page.
+fn capture_summary(capture: &CaptureView) -> String {
+    let mut parts = vec![capture_type_label(capture).to_owned()];
+
+    if let Some(title) = capture
+        .page_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        parts.push(title.to_owned());
+    }
+
+    parts.join(" · ")
+}
+
+/// Names for captured content types, never raw MIME types.
+fn capture_type_label(capture: &CaptureView) -> &'static str {
+    if capture.segmented || matches!(capture.kind, "HLS" | "DASH") {
+        return "Stream";
+    }
+
+    let essence = capture
+        .content_type
+        .as_deref()
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if essence.starts_with("video/") {
+        "Video"
+    } else if essence.starts_with("audio/") {
+        "Audio"
+    } else if essence.starts_with("image/") {
+        "Image"
+    } else if essence == "application/pdf" {
+        "PDF document"
+    } else if essence.starts_with("text/") {
+        "Text file"
+    } else if essence.contains("zip")
+        || essence.contains("compressed")
+        || essence.contains("tar")
+        || essence.contains("rar")
+        || essence.contains("7z")
+    {
+        "Archive"
+    } else if essence.contains("word") || essence.contains("document") {
+        "Document"
+    } else if essence.contains("sheet") || essence.contains("excel") {
+        "Spreadsheet"
+    } else if essence.contains("presentation") || essence.contains("powerpoint") {
+        "Presentation"
+    } else {
+        "File"
+    }
+}
+
 /// One captured resource: what it is, and what can be done with it.
 fn row(
     ui: &mut egui::Ui,
@@ -162,33 +206,36 @@ fn row(
     ui.add(egui::Label::new(RichText::new(label).size(12.0)).truncate())
         .on_hover_text(&capture.url);
 
-    let mut details = format!("{} | seen {}x", capture.kind, capture.seen);
-
-    if let Some(content_type) = &capture.content_type {
-        details = format!("{content_type} | {details}");
-    }
-
-    if let Some(title) = &capture.page_title {
-        details = format!("{title} | {details}");
-    }
+    let summary = capture_summary(capture);
+    let details = capture
+        .size_bytes
+        .map(|size| format!("{summary} · {}", bytes(size)))
+        .unwrap_or_else(|| summary.clone());
 
     ui.label(
         RichText::new(details.clone())
             .size(11.0)
             .color(colors.muted),
     )
-    .on_hover_text(details);
+    .on_hover_text(&details);
 
     ui.horizontal(|ui| {
         if capture.selectable && ui.button("Qualities").clicked() {
             actions.inspect = Some(capture.id);
         }
-        if capture.segmented {
-            if ui.button("Best quality").clicked() {
-                actions.download = Some(capture.id);
-            }
-        } else if ui.button("Download").clicked() {
-            actions.download = Some(capture.id);
+        let download = if capture.segmented {
+            ui.button("Best quality").clicked()
+        } else {
+            ui.button("Download").clicked()
+        };
+        if download {
+            actions.start = Some(CaptureStart {
+                id: capture.id,
+                track: None,
+                label: label.to_owned(),
+                details: summary.clone(),
+                size_bytes: capture.size_bytes,
+            });
         }
         if ui.button("Dismiss").clicked() {
             actions.dismiss = Some(capture.id);
@@ -236,14 +283,17 @@ fn tracks_of(
             for track in tracks {
                 ui.horizontal(|ui| {
                     if ui.button("Download").clicked() {
-                        actions.choose = Some((
-                            capture.id,
-                            TrackChoice {
+                        actions.start = Some(CaptureStart {
+                            id: capture.id,
+                            track: Some(TrackChoice {
                                 url: track.url.clone(),
                                 filename: track.filename.clone(),
                                 selection: track.selection.clone(),
-                            },
-                        ));
+                            }),
+                            label: track.label.clone(),
+                            details: track.details.clone(),
+                            size_bytes: track.size_bytes.or(capture.size_bytes),
+                        });
                     }
 
                     ui.label(RichText::new(&track.label).size(12.0));

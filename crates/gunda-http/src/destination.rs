@@ -134,6 +134,8 @@ fn strip_page_title_annotations(mut title: &str) -> &str {
         " | youtube music",
         " - youtube",
         " | youtube",
+        " - google drive",
+        " | google drive",
     ] {
         if lowercase.ends_with(suffix) {
             return title[..title.len() - suffix.len()].trim_end();
@@ -258,6 +260,10 @@ mod tests {
         assert_eq!(
             title_filename("(12) Arcane - Remember Me | YouTube", Some("mp4")).as_deref(),
             Some("Arcane - Remember Me.mp4")
+        );
+        assert_eq!(
+            title_filename("Quarterly report - Google Drive", Some("pdf")).as_deref(),
+            Some("Quarterly report.pdf")
         );
         assert_eq!(
             title_filename("  ...  ", Some("mp4")),

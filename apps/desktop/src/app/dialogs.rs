@@ -34,6 +34,127 @@ impl Desktop {
         }
     }
 
+    pub(super) fn capture_dialog(&mut self, ctx: &egui::Context) {
+        let Some(start) = self.capture_start.clone() else {
+            return;
+        };
+        let colors = Palette::new(self.dark);
+        let mut open = true;
+        let mut cancel = false;
+        let mut start_now = false;
+
+        egui::Window::new("Start download")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                dialog_heading(
+                    ui,
+                    Icon::Add,
+                    "Start a captured download",
+                    "Confirm the file and choose where to save it.",
+                    colors,
+                );
+                ui.add_space(14.0);
+                ui.label(RichText::new(&start.label).size(14.0).strong());
+                ui.label(RichText::new(&start.details).size(11.0).color(colors.muted));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    stat(
+                        ui,
+                        "File size",
+                        &start
+                            .size_bytes
+                            .map(bytes)
+                            .unwrap_or_else(|| "Calculated when the download starts".into()),
+                        colors,
+                    );
+                });
+                ui.add_space(14.0);
+                ui.label(RichText::new("Save to").strong());
+                ui.horizontal(|ui| {
+                    let label = self
+                        .destination
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Choose a folder".into());
+                    let width = (ui.available_width() - 106.0).max(100.0);
+                    egui::Frame::new()
+                        .fill(colors.background)
+                        .stroke(egui::Stroke::new(1.0, colors.border))
+                        .corner_radius(3)
+                        .inner_margin(egui::Margin::symmetric(9, 8))
+                        .show(ui, |ui| {
+                            ui.add_sized([width - 18.0, 18.0], egui::Label::new(&label).truncate())
+                                .on_hover_text(&label);
+                        });
+                    if ui
+                        .add_enabled(
+                            self.picker.is_none(),
+                            egui::Button::new(if self.picker.is_some() {
+                                "Opening…"
+                            } else {
+                                "Browse…"
+                            })
+                            .min_size(egui::vec2(94.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.browse(ctx);
+                    }
+                });
+                if let Some(error) = &self.error {
+                    ui.add_space(10.0);
+                    notice(ui, error, self.error_color());
+                }
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(5.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !self.busy() && self.snapshot.ready && self.picker.is_none(),
+                            egui::Button::new(
+                                RichText::new("Start Download")
+                                    .color(Color32::WHITE)
+                                    .strong(),
+                            )
+                            .fill(ACCENT)
+                            .min_size(egui::vec2(132.0, 34.0)),
+                        )
+                        .clicked()
+                    {
+                        start_now = true;
+                    }
+                    if ui
+                        .add(egui::Button::new("Cancel").min_size(egui::vec2(86.0, 34.0)))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+
+        open &= !cancel;
+        if start_now {
+            match self.destination.clone() {
+                Some(directory) => {
+                    self.send(Command::Capture {
+                        id: start.id,
+                        directory,
+                        track: start.track,
+                    });
+                    self.capture_start = None;
+                    self.error = None;
+                }
+                None => self.error = Some("Choose a destination folder.".into()),
+            }
+        } else if !open {
+            self.capture_start = None;
+        }
+    }
+
     pub(super) fn add_dialog(&mut self, ctx: &egui::Context) {
         if !self.add_open {
             return;

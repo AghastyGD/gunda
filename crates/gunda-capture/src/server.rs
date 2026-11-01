@@ -559,6 +559,7 @@ async fn converse(
             Ok(ClientMessage::Candidate {
                 url,
                 content_type,
+                size_bytes,
                 page_url,
                 page_title,
                 filename,
@@ -568,8 +569,11 @@ async fn converse(
                 &page_url,
                 page_title.as_deref(),
             )
-            .map(|report| report.with_filename(filename.as_deref()))
-            {
+            .map(|report| {
+                report
+                    .with_filename(filename.as_deref())
+                    .with_size_bytes(size_bytes)
+            }) {
                 Ok(report) => match submit(submissions, report).await? {
                     Recorded {
                         duplicate: true,
@@ -583,6 +587,7 @@ async fn converse(
             Ok(ClientMessage::DownloadBrowser {
                 url,
                 content_type,
+                size_bytes,
                 page_url,
                 page_title,
                 filename,
@@ -594,7 +599,11 @@ async fn converse(
                     &page_url,
                     page_title.as_deref(),
                 )
-                .map(|report| report.with_filename(filename.as_deref()));
+                .map(|report| {
+                    report
+                        .with_filename(filename.as_deref())
+                        .with_size_bytes(size_bytes)
+                });
 
                 match report {
                     Ok(report) => {
@@ -609,7 +618,7 @@ async fn converse(
                             Some(recorded.id),
                             None,
                             directory,
-                            None,
+                            filename,
                         )
                         .await?
                         {
@@ -1155,16 +1164,17 @@ mod tests {
         ))
         .await;
 
-        let (candidate, directory, reply) = within(async {
+        let (candidate, directory, filename, reply) = within(async {
             loop {
                 if let super::CaptureEvent::DownloadRequested {
                     candidate,
                     directory,
+                    filename,
                     reply,
                     ..
                 } = handle.next_event().await.expect("the listener runs")
                 {
-                    break (candidate, directory, reply);
+                    break (candidate, directory, filename, reply);
                 }
             }
         })
@@ -1173,6 +1183,7 @@ mod tests {
         assert_eq!(candidate.id(), 0);
         assert_eq!(candidate.filename(), Some("Quarterly report.pdf"));
         assert_eq!(directory.as_deref(), Some("/tmp/gunda"));
+        assert_eq!(filename.as_deref(), Some("Quarterly report.pdf"));
         reply
             .send(Ok(candidate.id()))
             .expect("the connection waits for the result");

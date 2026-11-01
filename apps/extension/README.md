@@ -1,9 +1,10 @@
 # Gunda Capture (browser extension)
 
 Download files with Gunda over a loopback WebSocket. The current build detects
-media resources and takes over user-initiated HTTP(S) downloads. When the daemon
-accepts a download, the extension cancels the browser's own copy so the file is
-written once. Authenticated downloads and `blob:` or `data:` URLs are tracked in
+media resources and takes over user-initiated HTTP(S) downloads. When a download
+starts, the extension stops the browser's own copy and opens a start window;
+**Start Download** hands the file to Gunda, and **Cancel** gives it back to the
+browser. Authenticated downloads and `blob:` or `data:` URLs are tracked in
 [#39](https://github.com/AghastyGD/gunda/issues/39).
 
 This is the browser half of the capture channel documented in
@@ -20,40 +21,58 @@ Several sources, because none is enough on its own:
 | Source | File | Sees |
 | --- | --- | --- |
 | Response sniffing | `background.js` | every response the browser fetches, including the manifests and media files that Media Source Extensions hide from the page |
-| Browser downloads | `background.js` | downloads the user starts in the browser, including files that are not media; the browser copy is cancelled after Gunda queues it |
+| Browser downloads | `background.js` | downloads the user starts in the browser, including files that are not media; the browser copy is stopped while a start window asks whether to use Gunda |
 | DOM scanning | `content.js` | `<video>`, `<audio>`, and `<source>` elements the page declares, including ones a page builds from data it already had |
 | Page source capture | `page.js` | bounded JSON responses from any site, with dedicated Instagram, Facebook, and YouTube handling |
 | Player control | `content.js` | a Shadow DOM download button over visible video elements |
 
-A direct report is `{ url, content_type, page_url, page_title, filename? }`. The
-optional filename is the name the browser suggested for a download. A source
-report adds a bounded JSON document and its response URL. The daemon interprets
-the document, keeps normalized media URLs, and drops the original source. Gunda
-does not send cookies or request headers with a download, so a captured
-download carries none of the browser's session with it.
+A direct report is `{ url, content_type, size_bytes?, page_url, page_title, filename? }`.
+The optional filename is the name the browser suggested for a download. The
+optional size is a complete response's declared `Content-Length` (or the
+browser's total size); it is omitted for manifests, partial responses, and
+range-addressed media. A source report adds a bounded JSON document and its
+response URL. The daemon interprets the document, keeps normalized media URLs,
+and drops the original source. Gunda does not send cookies or request headers
+with a download, so a captured download carries none of the browser's session
+with it.
 
 Stream segments (`video/mp2t`, `.ts`, `.m4s`, partial responses, and URLs with
 range parameters) are deliberately **not** reported as complete files.
 
-For a user-initiated download, the extension sends `download_browser` and waits
-for `download_queued`. Only then does it call `downloads.cancel` and
-`downloads.erase`. If the daemon does not advertise the `browser_download`
-capability, refuses the request, times out, or cannot cancel the browser item,
-the browser keeps its download. Downloads started by another extension are left
-alone.
+For a user-initiated download, the extension first cancels and erases the
+browser's copy (or removes the finished file if Chrome had already completed it)
+so nothing keeps downloading in the background, then opens a start window with
+the filename, known size, folder picker, Start Download, and Cancel. Nothing is
+sent to the daemon until Start. **Start Download** queues the job in Gunda;
+**Cancel** asks Chrome to download the URL again. If the window cannot open, or
+Chrome can neither cancel nor remove its copy, the browser keeps its download
+and nothing is queued. If the daemon is unreachable, refuses the URL, or times
+out after Start, the extension restores the browser download. Downloads started
+by another extension are left alone.
 
-The options page counts browser downloads seen (`browser_download`), downloads
-Gunda took over (`browser_download_intercepted`), downloads left to the browser
-(`browser_download_kept`), and cancel failures
-(`browser_download_cancel_failed`). It also shows the last download's scheme,
-host, MIME type, filename, outcome, and reason without printing the full URL.
+The prompt names the file from the most specific source it can find: the
+browser's suggested name, then the name declared in `Content-Disposition`,
+then the URL's last segment, and only then the page title. A Google Drive
+download is matched to its Drive file tab by file id, so it gets the file's
+real name instead of the warning page's title. The
+folder defaults to the last confirmed browser download folder, then Chrome's
+current download folder.
+
+The options page counts browser downloads seen (`browser_download`), prompts
+opened (`browser_download_prompted`), downloads Gunda took over
+(`browser_download_intercepted`), downloads cancelled back to the browser or
+restored after a refusal (`browser_download_kept`), and cancel or removal
+failures (`browser_download_cancel_failed`). It also shows the last download's
+scheme, host, MIME type, filename, outcome, and reason without printing the full
+URL.
 Downloads started by another extension (`ignored_by_extension`) and downloads
 with a non-HTTP(S) URL (`ignored_non_http`) are counted separately.
 
 The player control asks the page agent to refresh media detection before it
 lists the formats of the newest capture for that exact page. Choosing a format
-opens a start window with the filename, folder picker, Start, and Cancel.
-Starting switches the same window to live progress without opening the desktop.
+opens a start window with the filename, folder picker, format summary, known
+file size, Start, and Cancel. Starting switches the same window to live progress
+without opening the desktop.
 
 ## Installing it
 
@@ -119,7 +138,7 @@ removing the token would still not make a web page able to report.
 | Permission | Why |
 | --- | --- |
 | `webRequest` | to observe responses, status, ranges, and content type |
-| `downloads` | to see downloads the user starts in the browser, read the suggested filename, and cancel the browser copy after Gunda queues it |
+| `downloads` | to see downloads the user starts in the browser, read the suggested filename and size, stop the browser copy while the start window is open, and restore it on Cancel |
 | `nativeMessaging` | to request endpoint and token pairing from the local Gunda bridge |
 | `host_permissions: <all_urls>` | a capture can be on any site; response headers are not readable without it |
 | `tabs` | to name the page a capture came from. Only the URL and title of the tab that made the request are read, and only to attribute the capture |
@@ -131,13 +150,16 @@ removing the token would still not make a web page able to report.
 - A report made while the desktop app is not running is held in session storage
   and sent when the channel connects. Session storage survives a service worker
   restart, but it is cleared when the browser closes.
-- The browser copy is cancelled only after the daemon queues the download. A
-  daemon that is unreachable, refuses the URL, or cannot create the job leaves
-  the browser download running. The candidate stays in Gunda's capture list
-  when the daemon accepted the report but could not queue it.
+- The browser copy is cancelled as soon as the download starts, so it never
+  keeps transferring behind the start window; if Chrome had already finished the
+  file, the extension removes it. Nothing is queued until Start Download.
+  Cancel restores the download to Chrome. A daemon that is unreachable at Start,
+  refuses the URL, or times out also restores it. If the window cannot open, or
+  Chrome can neither cancel nor remove its copy, the browser keeps the file and
+  no job is queued.
 - Gunda does not send cookies or request headers, so a download that requires a
-  browser session may fail after the browser copy is cancelled. The capture
-  remains in the list for a retry.
+  browser session may fail after the browser copy is cancelled. Start the
+  download again from the page if the Gunda job fails.
 - Only `http` and `https` pages and downloads are attributed. A capture from a
   page with no such URL is dropped rather than attributed to the wrong place.
   Downloads with `blob:`, `data:`, or other non-HTTP(S) URLs are ignored, so a

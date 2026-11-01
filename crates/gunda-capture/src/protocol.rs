@@ -116,6 +116,9 @@ pub enum ClientMessage {
         /// The response content type, when the extension saw one.
         #[serde(default)]
         content_type: Option<String>,
+        /// The complete response length, when the browser declared one.
+        #[serde(default)]
+        size_bytes: Option<u64>,
         /// The page the resource was found on.
         page_url: String,
         /// The page title, when the extension has one.
@@ -128,14 +131,18 @@ pub enum ClientMessage {
 
     /// A browser download the extension wants Gunda to take over.
     ///
-    /// The daemon records the report and queues a download before answering, so
-    /// the extension only cancels the browser's copy after the daemon owns it.
+    /// The daemon records the report and queues a download before answering.
+    /// The extension sends this only after the user confirms in its start
+    /// window; the browser's own copy has already been cancelled by then.
     DownloadBrowser {
         /// The resource URL, absolute and `http` or `https`.
         url: String,
         /// The response content type, when the extension saw one.
         #[serde(default)]
         content_type: Option<String>,
+        /// The complete response length, when the browser declared one.
+        #[serde(default)]
+        size_bytes: Option<u64>,
         /// The page the resource was found on.
         page_url: String,
         /// The page title, when the extension has one.
@@ -309,6 +316,7 @@ mod tests {
             ClientMessage::Candidate {
                 url: "https://cdn.example/x.m3u8".to_owned(),
                 content_type: None,
+                size_bytes: None,
                 page_url: "https://example/watch".to_owned(),
                 page_title: None,
                 filename: None,
@@ -379,6 +387,7 @@ mod tests {
             ClientMessage::DownloadBrowser {
                 url: "https://cdn.example/report".into(),
                 content_type: Some("application/pdf".into()),
+                size_bytes: None,
                 page_url: "https://example/files".into(),
                 page_title: None,
                 filename: Some("report.pdf".into()),

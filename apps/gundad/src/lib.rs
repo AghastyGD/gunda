@@ -973,6 +973,17 @@ impl Daemon {
                 })
                 .collect()
         } else {
+            let mut details = candidate.content_type().unwrap_or("file").to_owned();
+            if let Some(bytes) = candidate.size_bytes().or_else(|| {
+                candidate
+                    .variants()
+                    .iter()
+                    .filter_map(MediaVariant::size)
+                    .max()
+            }) {
+                details.push_str(" | ");
+                details.push_str(&format_size(bytes));
+            }
             vec![MediaFormat {
                 label: candidate
                     .filename()
@@ -980,7 +991,7 @@ impl Daemon {
                     .unwrap_or("Original file")
                     .to_owned(),
                 group: None,
-                details: candidate.content_type().unwrap_or("file").to_owned(),
+                details,
                 format: String::from("best"),
             }]
         };
@@ -1291,6 +1302,17 @@ fn capture_view(candidate: &Candidate) -> CaptureView {
         content_type: candidate.content_type().map(str::to_owned),
         page_title: candidate.page_title().map(str::to_owned),
         filename: candidate.filename().map(str::to_owned),
+        size_bytes: if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+            None
+        } else {
+            candidate.size_bytes().or_else(|| {
+                candidate
+                    .variants()
+                    .iter()
+                    .filter_map(MediaVariant::size)
+                    .max()
+            })
+        },
         seen: candidate.seen(),
         segmented: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash),
         selectable: matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash)
@@ -1299,23 +1321,16 @@ fn capture_view(candidate: &Candidate) -> CaptureView {
 }
 
 fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
-    let mut details = vec![String::from("video")];
-    if let Some(bitrate) = variant.bitrate() {
-        details.push(format!("{} kbps", bitrate / 1000));
-    }
-    if let Some(codecs) = variant.codecs() {
-        details.push(codecs.to_owned());
-    }
-    if details.len() == 1
-        && let Some(content_type) = variant.content_type()
-    {
-        details.push(content_type.to_owned());
+    let mut details = vec![String::from("Video")];
+    if let Some(bytes) = variant.size() {
+        details.push(format_size(bytes));
     }
 
     CaptureTrackView {
         label: variant.label(),
         group: None,
         details: details.join(" | "),
+        size_bytes: variant.size(),
         url: variant.url().as_str().to_owned(),
         filename: None,
         selection: None,
@@ -1429,10 +1444,11 @@ fn capture_track_view(track: &PresentationTrack) -> CaptureTrackView {
         label: track.label().to_owned(),
         group: track.group().map(str::to_owned),
         details: format!(
-            "{} | {}",
+            "{} · {}",
             track_kind_name(track.kind()),
             size_hint(track.size())
         ),
+        size_bytes: track.size().bytes(),
         url: track.url().as_str().to_owned(),
         filename: track.filename().map(str::to_owned),
         selection: track
@@ -1453,10 +1469,10 @@ fn capture_kind_name(kind: ResourceKind) -> &'static str {
 
 fn track_kind_name(kind: TrackKind) -> &'static str {
     match kind {
-        TrackKind::Video => "video",
-        TrackKind::Audio => "audio",
-        TrackKind::Text => "text",
-        TrackKind::Unknown => "media",
+        TrackKind::Video => "Video",
+        TrackKind::Audio => "Audio",
+        TrackKind::Text => "Subtitles",
+        TrackKind::Unknown => "Media",
     }
 }
 
@@ -1464,7 +1480,7 @@ fn size_hint(size: TrackSize) -> String {
     match size {
         TrackSize::Exact(total) => format_size(total),
         TrackSize::Estimated(total) => format!("~{}", format_size(total)),
-        TrackSize::Unknown => "size unknown".to_owned(),
+        TrackSize::Unknown => "Size unknown".to_owned(),
     }
 }
 

@@ -34,6 +34,7 @@ pub struct Report {
     url: Url,
     kind: ResourceKind,
     content_type: Option<String>,
+    size_bytes: Option<u64>,
     page_url: Url,
     page_title: Option<String>,
     filename: Option<String>,
@@ -78,6 +79,7 @@ impl Report {
             url,
             kind,
             content_type,
+            size_bytes: None,
             page_url,
             page_title,
             filename: None,
@@ -89,6 +91,16 @@ impl Report {
     #[must_use]
     pub fn with_filename(mut self, filename: Option<&str>) -> Self {
         self.filename = filename.and_then(clean_filename);
+        self
+    }
+
+    /// Keeps a complete response's declared length as a display hint.
+    ///
+    /// Manifests and partial responses carry no complete size, and the caller
+    /// is responsible for only reporting a length from a whole-file response.
+    #[must_use]
+    pub fn with_size_bytes(mut self, size_bytes: Option<u64>) -> Self {
+        self.size_bytes = size_bytes.filter(|bytes| *bytes > 0);
         self
     }
 
@@ -106,6 +118,7 @@ impl Report {
         )?;
 
         report.variants = presentation.variants;
+        report.size_bytes = report.variants.iter().filter_map(MediaVariant::size).max();
 
         Ok(report)
     }
@@ -118,6 +131,7 @@ pub struct Candidate {
     url: Url,
     kind: ResourceKind,
     content_type: Option<String>,
+    size_bytes: Option<u64>,
     page_url: Url,
     page_title: Option<String>,
     filename: Option<String>,
@@ -147,6 +161,12 @@ impl Candidate {
     #[must_use]
     pub fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
+    }
+
+    /// The complete file size the browser declared, when it knew it.
+    #[must_use]
+    pub const fn size_bytes(&self) -> Option<u64> {
+        self.size_bytes
     }
 
     #[must_use]
@@ -260,6 +280,9 @@ impl Catalog {
             if report.filename.is_some() {
                 existing.filename = report.filename;
             }
+            if report.size_bytes.is_some() {
+                existing.size_bytes = report.size_bytes;
+            }
             if !report.variants.is_empty() {
                 existing.variants = report.variants;
             }
@@ -280,6 +303,7 @@ impl Catalog {
                 url: report.url,
                 kind: report.kind,
                 content_type: report.content_type,
+                size_bytes: report.size_bytes,
                 page_url: report.page_url,
                 page_title: report.page_title,
                 filename: report.filename,
@@ -642,7 +666,8 @@ mod tests {
                 None,
             )
             .expect("the report is valid")
-            .with_filename(Some("Chosen name.mp4")),
+            .with_filename(Some("Chosen name.mp4"))
+            .with_size_bytes(Some(9_000_000)),
         );
 
         assert_eq!(first.id, second.id);
@@ -655,6 +680,7 @@ mod tests {
         assert!(candidate.last_seen() >= candidate.first_seen());
         assert_eq!(candidate.content_type(), Some("video/mp4"));
         assert_eq!(candidate.filename(), Some("Chosen name.mp4"));
+        assert_eq!(candidate.size_bytes(), Some(9_000_000));
     }
 
     #[test]

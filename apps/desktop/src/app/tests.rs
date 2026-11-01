@@ -13,6 +13,7 @@ fn desktop(snapshot: Snapshot) -> Desktop {
         search: String::new(),
         dark: true,
         capture_open: false,
+        capture_start: None,
         add_open: false,
         url: String::new(),
         destination: None,
@@ -498,7 +499,7 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
             content_type: Some("video/mp4".into()),
             page_title: Some("A movie page".into()),
             filename: Some("A movie.mp4".into()),
-            seen: 2,
+            size_bytes: Some(1_234_567),
             segmented: false,
             selectable: false,
         }],
@@ -513,9 +514,18 @@ fn capture_panel_shows_the_pairing_and_the_captured_resources() {
     assert!(has("Endpoint"), "missing endpoint label: {labels:?}");
     assert!(has("Token"), "missing token label: {labels:?}");
     assert!(has("Copy endpoint"), "missing endpoint copy: {labels:?}");
-    assert!(has("video/mp4"), "missing content type: {labels:?}");
+    assert!(has("Video"), "missing content type label: {labels:?}");
+    assert!(
+        !has("video/mp4"),
+        "raw MIME type should not be shown: {labels:?}"
+    );
+    assert!(
+        !has("seen "),
+        "internal counters should not be shown: {labels:?}"
+    );
     assert!(has("A movie page"), "missing page title: {labels:?}");
     assert!(has("A movie.mp4"), "missing suggested filename: {labels:?}");
+    assert!(has("1.2 MiB"), "missing captured size: {labels:?}");
     assert!(
         has("Download") && has("Dismiss"),
         "missing row actions: {labels:?}"
@@ -544,7 +554,7 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
             content_type: Some("application/vnd.apple.mpegurl".into()),
             page_title: Some("A film".into()),
             filename: None,
-            seen: 1,
+            size_bytes: None,
             segmented: true,
             selectable: true,
         }],
@@ -554,7 +564,8 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                 TrackView {
                     label: "1920x1080 (5.0 Mbps)".into(),
                     group: Some("English (en)".into()),
-                    details: "video | 1.2 GiB".into(),
+                    details: "Video · 1.2 GiB".into(),
+                    size_bytes: Some(1_288_490_188),
                     url: Url::parse("https://cdn.example.com/1080/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -563,7 +574,8 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                 TrackView {
                     label: "1280x720 (2.0 Mbps)".into(),
                     group: Some("Português (pt)".into()),
-                    details: "video | 820.0 MiB".into(),
+                    details: "Video · 820.0 MiB".into(),
+                    size_bytes: Some(859_832_320),
                     url: Url::parse("https://cdn.example.com/720/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -572,7 +584,8 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                 TrackView {
                     label: "854x480 (1.0 Mbps)".into(),
                     group: Some("English (en)".into()),
-                    details: "video | 410.0 MiB".into(),
+                    details: "Video · 410.0 MiB".into(),
+                    size_bytes: Some(429_916_160),
                     url: Url::parse("https://cdn.example.com/480/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -581,7 +594,8 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
                 TrackView {
                     label: "English (en)".into(),
                     group: None,
-                    details: "audio | 128.0 MiB".into(),
+                    details: "Audio · 128.0 MiB".into(),
+                    size_bytes: Some(134_217_728),
                     url: Url::parse("https://cdn.example.com/audio/index.m3u8")
                         .expect("the URL is valid"),
                     filename: Some("master.mp4".into()),
@@ -602,10 +616,10 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
         has("1920x1080 (5.0 Mbps)"),
         "missing video quality: {labels:?}"
     );
-    assert!(has("video | 1.2 GiB"), "missing video details: {labels:?}");
+    assert!(has("Video · 1.2 GiB"), "missing video details: {labels:?}");
     assert!(has("English (en)"), "missing audio track: {labels:?}");
     assert!(
-        has("audio | 128.0 MiB"),
+        has("Audio · 128.0 MiB"),
         "missing audio details: {labels:?}"
     );
 
@@ -620,7 +634,46 @@ fn capture_panel_offers_the_qualities_of_a_presentation() {
     assert!(position("1920x1080 (5.0 Mbps)") < position("854x480 (1.0 Mbps)"));
     assert!(position("854x480 (1.0 Mbps)") < position("Português (pt)"));
     assert!(position("Português (pt)") < position("1280x720 (2.0 Mbps)"));
-    assert!(position("1280x720 (2.0 Mbps)") < position("audio | 128.0 MiB"));
+    assert!(position("1280x720 (2.0 Mbps)") < position("Audio · 128.0 MiB"));
+}
+
+#[test]
+fn capture_download_dialog_confirms_start_folder_and_size() {
+    let ctx = egui::Context::default();
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        ..Default::default()
+    });
+    desktop.destination = Some(std::path::PathBuf::from(r"C:\Users\Augusto\Downloads"));
+    desktop.capture_start = Some(CaptureStart {
+        id: 7,
+        track: None,
+        label: "A movie.mp4".into(),
+        details: "Video · A movie page".into(),
+        size_bytes: Some(1_234_567),
+    });
+
+    let labels = dialog_labels(&ctx, &mut desktop);
+    let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
+
+    assert!(
+        has("Start a captured download"),
+        "missing heading: {labels:?}"
+    );
+    assert!(has("A movie.mp4"), "missing file name: {labels:?}");
+    assert!(has("File size"), "missing size label: {labels:?}");
+    assert!(has("1.2 MiB"), "missing file size: {labels:?}");
+    assert!(has("Save to"), "missing folder label: {labels:?}");
+    assert!(
+        has(r"C:\Users\Augusto\Downloads"),
+        "missing destination folder: {labels:?}"
+    );
+    assert!(has("Start Download"), "missing start action: {labels:?}");
+    assert!(has("Cancel"), "missing cancel action: {labels:?}");
+    assert!(
+        desktop.capture_start.is_some(),
+        "the dialog closed without a decision"
+    );
 }
 
 #[test]
@@ -645,6 +698,35 @@ fn capture_panel_reports_a_channel_that_did_not_start() {
         !labels.iter().any(|label| label.contains("Copy token")),
         "pairing offered without a channel: {labels:?}"
     );
+}
+
+/// Renders the capture download dialog alone and returns every text it drew.
+fn dialog_labels(ctx: &egui::Context, desktop: &mut Desktop) -> Vec<String> {
+    let mut labels = Vec::new();
+    for frame in 0..2 {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(620.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| desktop.capture_dialog(ui.ctx()),
+        );
+        if frame == 1 {
+            labels = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+        output.textures_delta.clear();
+    }
+    labels
 }
 
 /// Renders the capture panel alone and returns every text it drew.
