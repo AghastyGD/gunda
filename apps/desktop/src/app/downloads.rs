@@ -170,7 +170,7 @@ impl Desktop {
                 .resizable(true)
                 .sense(egui::Sense::click())
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .column(Column::remainder().at_least(160.0))
+                .column(Column::remainder().at_least(160.0).resizable(false))
                 .column(Column::initial(96.0))
                 .column(Column::initial(128.0))
                 .column(Column::initial(78.0))
@@ -308,10 +308,6 @@ impl Desktop {
                 notice(ui, error, self.error_color());
             }
         });
-        if let Some(error) = &view.error {
-            ui.add_space(8.0);
-            notice(ui, error, self.error_color());
-        }
     }
 }
 

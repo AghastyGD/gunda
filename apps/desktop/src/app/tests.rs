@@ -429,6 +429,47 @@ fn both_themes_render_table_inspector_and_dialogs_at_supported_sizes() {
 }
 
 #[test]
+fn the_download_table_uses_the_extra_width_of_a_wider_window() {
+    let ctx = egui::Context::default();
+    let view = crate::view::tests::sample(DownloadState::Completed);
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.theme(&ctx);
+
+    let mut origin_x = Vec::new();
+    for width in [900.0, 1400.0] {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 700.0),
+                )),
+                ..Default::default()
+            },
+            |ui| desktop.render(ui),
+        );
+        let x = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "Origin" => Some(text.pos.x),
+                _ => None,
+            })
+            .expect("the table renders its Origin heading");
+        origin_x.push(x);
+        output.textures_delta.clear();
+    }
+
+    assert!(
+        origin_x[1] - origin_x[0] > 300.0,
+        "the table did not grow with the window: {origin_x:?}"
+    );
+}
+
+#[test]
 fn selected_rows_and_progress_keep_readable_text_in_both_themes() {
     for dark in [false, true] {
         let ctx = egui::Context::default();
