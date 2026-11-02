@@ -6,7 +6,7 @@ use crate::view::bytes;
 
 use super::theme::Palette;
 use super::widgets::notice;
-use super::{CaptureStart, Desktop};
+use super::{CaptureStart, Desktop, fonts};
 
 /// What the panel asks the backend to do once the frame is built.
 #[derive(Default)]
@@ -27,7 +27,7 @@ impl Desktop {
         ui.label(
             RichText::new("Browser capture")
                 .size(11.0)
-                .strong()
+                .family(fonts::semibold())
                 .color(colors.muted),
         );
         ui.add_space(4.0);
@@ -52,7 +52,7 @@ impl Desktop {
         ui.label(
             RichText::new("Captured")
                 .size(11.0)
-                .strong()
+                .family(fonts::semibold())
                 .color(colors.muted),
         );
         ui.add_space(4.0);
@@ -284,7 +284,12 @@ fn tracks_of(
     ui.indent(&capture.url, |ui| {
         for (group, tracks) in grouped_tracks(&tracks.tracks) {
             if let Some(group) = group {
-                ui.label(RichText::new(group).size(11.0).strong().color(colors.muted));
+                ui.label(
+                    RichText::new(group)
+                        .size(11.0)
+                        .family(fonts::semibold())
+                        .color(colors.muted),
+                );
                 ui.add_space(2.0);
             }
 

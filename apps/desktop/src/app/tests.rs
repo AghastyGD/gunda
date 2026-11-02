@@ -738,6 +738,7 @@ fn capture_panel_reports_a_channel_that_did_not_start() {
 
 /// Renders the capture download dialog alone and returns every text it drew.
 fn dialog_labels(ctx: &egui::Context, desktop: &mut Desktop) -> Vec<String> {
+    desktop.theme(ctx);
     let mut labels = Vec::new();
     for frame in 0..2 {
         let mut output = ctx.run_ui(
@@ -767,6 +768,7 @@ fn dialog_labels(ctx: &egui::Context, desktop: &mut Desktop) -> Vec<String> {
 
 /// Renders the capture panel alone and returns every text it drew.
 fn capture_labels(ctx: &egui::Context, desktop: &mut Desktop) -> Vec<String> {
+    desktop.theme(ctx);
     let mut output = ctx.run_ui(
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(

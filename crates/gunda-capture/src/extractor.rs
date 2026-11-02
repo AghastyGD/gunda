@@ -88,10 +88,6 @@ impl MediaVariant {
             return format!("{width}x{height}");
         }
 
-        if let Some(codecs) = &self.codecs {
-            return codecs.clone();
-        }
-
         String::from("Media")
     }
 }

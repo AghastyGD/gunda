@@ -7,7 +7,7 @@ use gunda_core::download::{DownloadId, DownloadState};
 use crate::view::{DownloadView, bytes};
 
 use super::{
-    Desktop,
+    Desktop, fonts,
     theme::Palette,
     widgets::{display_total, metric, notice, progress},
 };
@@ -62,7 +62,7 @@ impl Desktop {
         ui.label(
             RichText::new("Status")
                 .size(11.0)
-                .strong()
+                .family(fonts::semibold())
                 .color(colors.muted),
         );
         ui.add_space(4.0);
@@ -84,10 +84,11 @@ impl Desktop {
             .right_text(
                 RichText::new(format!("{count}"))
                     .size(11.0)
+                    .monospace()
                     .color(colors.muted),
             )
             .min_size(egui::vec2(ui.available_width(), 32.0))
-            .corner_radius(6)
+            .corner_radius(4)
             .atom_ui(ui);
             if let Some(rect) = response.rect(icon_id) {
                 let color = if self.filter == filter {
@@ -244,7 +245,11 @@ impl Desktop {
         let colors = Palette::new(self.dark);
         let Some(view) = self.selected_view() else {
             ui.add_space(4.0);
-            ui.label(RichText::new("Download details").size(13.0).strong());
+            ui.label(
+                RichText::new("Download details")
+                    .size(13.0)
+                    .family(fonts::semibold()),
+            );
             ui.add_space(6.0);
             ui.label(
                 RichText::new("Select a download to see its progress, source, and folder.")
@@ -255,8 +260,15 @@ impl Desktop {
         };
         let active = self.snapshot.active.contains(&view.id);
         ui.horizontal(|ui| {
-            ui.add(egui::Label::new(RichText::new(&view.name).size(13.0).strong()).truncate())
-                .on_hover_text(&view.name);
+            ui.add(
+                egui::Label::new(
+                    RichText::new(&view.name)
+                        .size(13.0)
+                        .family(fonts::semibold()),
+                )
+                .truncate(),
+            )
+            .on_hover_text(&view.name);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(view.label(active))
@@ -315,6 +327,7 @@ const COLUMNS: [&str; 6] = ["File name", "Status", "Progress", "Size", "Speed", 
 
 fn header_label(ui: &mut egui::Ui, label: &str, colors: Palette) {
     let rect = ui.max_rect();
+    ui.painter().rect_filled(rect, 0, colors.surface);
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),

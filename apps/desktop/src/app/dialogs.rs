@@ -9,7 +9,7 @@ use crate::{
 };
 
 use super::{
-    Desktop,
+    Desktop, fonts,
     theme::Palette,
     widgets::{dialog_heading, display_total, notice, stat},
 };
@@ -51,7 +51,12 @@ impl Desktop {
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.add(
-                    egui::Label::new(RichText::new(&start.label).size(15.0).strong()).truncate(),
+                    egui::Label::new(
+                        RichText::new(&start.label)
+                            .size(15.0)
+                            .family(fonts::semibold()),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(&start.label);
                 ui.label(RichText::new(&start.details).size(12.0).color(colors.muted));
@@ -68,7 +73,7 @@ impl Desktop {
                     );
                 });
                 ui.add_space(18.0);
-                ui.label(RichText::new("Save to").size(12.0).strong());
+                ui.label(RichText::new("Save to").size(11.0).color(colors.muted));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let label = self
@@ -121,7 +126,7 @@ impl Desktop {
                             egui::Button::new(
                                 RichText::new("Start download")
                                     .color(colors.accent_ink)
-                                    .strong(),
+                                    .family(fonts::semibold()),
                             )
                             .fill(colors.accent)
                             .min_size(egui::vec2(132.0, 36.0)),
@@ -177,7 +182,7 @@ impl Desktop {
                         .color(colors.muted),
                 );
                 ui.add_space(18.0);
-                ui.label(RichText::new("Link").size(12.0).strong());
+                ui.label(RichText::new("Link").size(11.0).color(colors.muted));
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.url)
@@ -186,7 +191,7 @@ impl Desktop {
                         .margin(egui::vec2(10.0, 8.0)),
                 );
                 ui.add_space(18.0);
-                ui.label(RichText::new("Save to").size(12.0).strong());
+                ui.label(RichText::new("Save to").size(11.0).color(colors.muted));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let label = self
@@ -245,7 +250,7 @@ impl Desktop {
                             egui::Button::new(
                                 RichText::new("Start download")
                                     .color(colors.accent_ink)
-                                    .strong(),
+                                    .family(fonts::semibold()),
                             )
                             .fill(colors.accent)
                             .min_size(egui::vec2(132.0, 36.0)),
@@ -307,7 +312,12 @@ impl Desktop {
                     .show(ui, |ui| {
                         ui.set_min_width(496.0);
                         ui.horizontal(|ui| {
-                            ui.colored_label(color, RichText::new(view.label(active)).strong());
+                            ui.colored_label(
+                                color,
+                                RichText::new(view.label(active))
+                                    .size(12.0)
+                                    .family(fonts::semibold()),
+                            );
                             if active && view.state == DownloadState::Inspecting {
                                 ui.spinner();
                             }
@@ -390,8 +400,8 @@ impl Desktop {
                     } else {
                         "Folder"
                     })
-                    .size(12.0)
-                    .strong(),
+                    .size(11.0)
+                    .color(colors.muted),
                 );
                 ui.add_space(4.0);
                 let destination = view

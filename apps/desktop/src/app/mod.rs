@@ -1,6 +1,7 @@
 mod capture;
 mod dialogs;
 mod downloads;
+mod fonts;
 mod theme;
 mod widgets;
 

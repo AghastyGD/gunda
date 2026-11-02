@@ -950,16 +950,13 @@ impl Daemon {
                 .map(|(index, track)| {
                     let size = declared_track_size(candidate, track);
                     let mut details = vec![track_kind_name(track.kind()).to_owned()];
-                    if let Some(codecs) = track.codecs() {
-                        details.push(codecs.to_owned());
-                    }
                     if let Some(bytes) = size.or_else(|| track.size().bytes()) {
                         details.push(format_size(bytes));
                     }
                     MediaFormat {
                         label: track.label().to_owned(),
                         group: track.group().map(str::to_owned),
-                        details: details.join(" | "),
+                        details: details.join(" · "),
                         format: track.selection().map_or_else(
                             || format!("track:{index}"),
                             |selection| {
@@ -973,7 +970,7 @@ impl Daemon {
                 })
                 .collect()
         } else {
-            let mut details = candidate.content_type().unwrap_or("file").to_owned();
+            let mut details = capture_type_name(candidate).to_owned();
             if let Some(bytes) = candidate.size_bytes().or_else(|| {
                 candidate
                     .variants()
@@ -981,7 +978,7 @@ impl Daemon {
                     .filter_map(MediaVariant::size)
                     .max()
             }) {
-                details.push_str(" | ");
+                details.push_str(" · ");
                 details.push_str(&format_size(bytes));
             }
             vec![MediaFormat {
@@ -1329,7 +1326,7 @@ fn capture_variant_view(variant: &MediaVariant) -> CaptureTrackView {
     CaptureTrackView {
         label: variant.label(),
         group: None,
-        details: details.join(" | "),
+        details: details.join(" · "),
         size_bytes: variant.size(),
         url: variant.url().as_str().to_owned(),
         filename: None,
@@ -1464,6 +1461,18 @@ fn capture_kind_name(kind: ResourceKind) -> &'static str {
         ResourceKind::Dash => "DASH",
         ResourceKind::File => "File",
         ResourceKind::Unknown => "Unknown",
+    }
+}
+
+/// What the user is looking at, without exposing MIME types in the window.
+fn capture_type_name(candidate: &Candidate) -> &'static str {
+    if matches!(candidate.kind(), ResourceKind::Hls | ResourceKind::Dash) {
+        return "Stream";
+    }
+    match candidate.content_type() {
+        Some(content_type) if content_type.starts_with("video/") => "Video",
+        Some(content_type) if content_type.starts_with("audio/") => "Audio",
+        _ => "File",
     }
 }
 

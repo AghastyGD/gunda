@@ -4,7 +4,7 @@ use gunda_core::download::DownloadState;
 
 use crate::view::DownloadView;
 
-use super::Desktop;
+use super::{Desktop, fonts};
 
 /// A cool graphite palette with restrained blue and green status accents.
 #[derive(Clone, Copy)]
@@ -61,6 +61,7 @@ impl Palette {
 
 impl Desktop {
     pub(super) fn theme(&self, ctx: &egui::Context) {
+        fonts::install(ctx);
         let theme = if self.dark {
             egui::Theme::Dark
         } else {
@@ -129,9 +130,10 @@ impl Desktop {
             style
                 .text_styles
                 .insert(egui::TextStyle::Monospace, egui::FontId::monospace(12.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(17.0));
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                egui::FontId::new(17.0, fonts::semibold()),
+            );
         });
     }
 

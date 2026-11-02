@@ -1,4 +1,82 @@
 const MEDIA_SELECTOR = 'video, audio, source';
+const OVERLAY_LABEL = 'Download';
+const DOWNLOAD_ICON =
+  '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v6.5m0 0 2.75-2.75M8 9 5.25 6.25M3 12.25h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const OVERLAY_CSS = `
+  .controls { all: initial; position: relative; display: inline-block; }
+  .button {
+    all: unset;
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-width: 96px;
+    padding: 9px 12px;
+    border: 1px solid rgba(55, 67, 82, .9);
+    border-radius: 6px;
+    background: rgba(19, 25, 34, .92);
+    color: #e5ebf2;
+    font: 600 12px/1 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    cursor: pointer;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+    opacity: .9;
+    transition: background-color .12s ease, border-color .12s ease, opacity .12s ease;
+  }
+  .button:hover { background: rgba(35, 44, 56, .96); border-color: #4a5a6c; opacity: 1; }
+  .button:focus-visible { outline: 2px solid #519df0; outline-offset: 2px; opacity: 1; }
+  .button:disabled { cursor: default; opacity: .62; }
+  .button svg { color: #519df0; flex: none; }
+  .panel {
+    all: initial;
+    box-sizing: border-box;
+    display: none;
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    width: 236px;
+    max-height: 320px;
+    overflow: auto;
+    padding: 4px;
+    border: 1px solid #374352;
+    border-radius: 6px;
+    background: rgba(19, 25, 34, .98);
+    color: #e5ebf2;
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, .45);
+    pointer-events: auto;
+    scrollbar-width: thin;
+    scrollbar-color: #374352 transparent;
+  }
+  .panel::-webkit-scrollbar { width: 8px; }
+  .panel::-webkit-scrollbar-thumb { background: #374352; border-radius: 4px; }
+  .group {
+    padding: 8px 8px 3px;
+    color: #9ba8b8;
+    font: 600 10px/1.3 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+  .option {
+    all: unset;
+    box-sizing: border-box;
+    display: block;
+    width: 100%;
+    padding: 8px;
+    border-radius: 4px;
+    color: #e5ebf2;
+    font: 600 12px/1.3 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    text-align: left;
+    cursor: pointer;
+  }
+  .option:hover { background: #232c38; }
+  .option:focus-visible { outline: 1px solid #519df0; outline-offset: -1px; }
+  .option:disabled { cursor: default; opacity: .55; }
+  .details {
+    display: block;
+    margin-top: 2px;
+    color: #9ba8b8;
+    font: 400 10px/1.35 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  }
+`;
 const overlays = new WeakMap<
   HTMLVideoElement,
   { host: HTMLElement; button: HTMLButtonElement; panel: HTMLElement }
@@ -101,24 +179,33 @@ function positionOverlay(video: HTMLVideoElement): void {
   }
 
   overlay.host.style.display = 'block';
-  overlay.host.style.left = `${Math.max(8, Math.min(window.innerWidth - 92, rect.right - 82))}px`;
+  overlay.host.style.right = `${Math.max(8, window.innerWidth - rect.right + 8)}px`;
   overlay.host.style.top = `${Math.max(8, rect.top + 8)}px`;
+}
+
+function setButtonLabel(button: HTMLButtonElement, label: string): void {
+  const span = button.querySelector<HTMLSpanElement>('.label');
+  if (span) {
+    span.textContent = label;
+  } else {
+    button.textContent = label;
+  }
 }
 
 function setOverlayStatus(
   button: HTMLButtonElement,
   label: string,
-  reset = false,
+  options: { busy?: boolean; resetAfter?: number } = {},
 ): void {
-  button.textContent = label;
-  button.disabled = label !== 'Gunda';
-  if (reset) {
-    setTimeout(() => {
-      if (button.isConnected) {
-        button.textContent = 'Gunda';
+  setButtonLabel(button, label);
+  button.disabled = options.busy === true;
+  if (options.resetAfter) {
+    window.setTimeout(() => {
+      if (button.isConnected && button.textContent === label) {
+        setButtonLabel(button, OVERLAY_LABEL);
         button.disabled = false;
       }
-    }, 2200);
+    }, options.resetAfter);
   }
 }
 
@@ -146,9 +233,12 @@ async function openDownloadStart(
   });
   if (opened !== undefined) {
     clearFormats(panel);
-    setOverlayStatus(button, 'Gunda', true);
+    button.setAttribute('aria-expanded', 'false');
+    setOverlayStatus(button, OVERLAY_LABEL);
   } else {
-    setOverlayStatus(button, 'Try again', true);
+    clearFormats(panel);
+    button.setAttribute('aria-expanded', 'false');
+    setOverlayStatus(button, 'Try again', { resetAfter: 3000 });
   }
 }
 
@@ -176,14 +266,8 @@ function showFormats(
   for (const [group, entries] of groups) {
     if (group) {
       const heading = document.createElement('div');
+      heading.className = 'group';
       heading.textContent = group;
-      heading.style.cssText = [
-        'box-sizing: border-box',
-        'color: rgba(255,255,255,.58)',
-        'font: 700 10px/1.3 system-ui, sans-serif',
-        'letter-spacing: .02em',
-        'padding: 8px 8px 2px',
-      ].join(';');
       panel.append(heading);
     }
 
@@ -195,8 +279,9 @@ function showFormats(
   }
 
   panel.style.display = 'block';
-  button.textContent = 'Formats';
   button.disabled = false;
+  button.setAttribute('aria-expanded', 'true');
+  setButtonLabel(button, OVERLAY_LABEL);
 }
 
 function formatOption(
@@ -209,28 +294,9 @@ function formatOption(
 ): HTMLButtonElement {
   const option = document.createElement('button');
   option.type = 'button';
+  option.className = 'option';
   option.textContent = format.label;
   option.title = format.details;
-  option.style.cssText = [
-    'all: initial',
-    'box-sizing: border-box',
-    'display: block',
-    'width: 100%',
-    'border: 0',
-    'border-radius: 4px',
-    'background: transparent',
-    'color: #fff',
-    'cursor: pointer',
-    'font: 600 12px/1.25 system-ui, sans-serif',
-    'padding: 8px',
-    'text-align: left',
-  ].join(';');
-  option.addEventListener('mouseenter', () => {
-    option.style.background = 'rgba(255,255,255,.12)';
-  });
-  option.addEventListener('mouseleave', () => {
-    option.style.background = 'transparent';
-  });
   option.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -246,9 +312,8 @@ function formatOption(
   });
 
   const details = document.createElement('span');
+  details.className = 'details';
   details.textContent = format.details;
-  details.style.cssText =
-    'display:block;color:rgba(255,255,255,.65);font:400 10px/1.3 system-ui,sans-serif;margin-top:3px;';
   option.append(details);
 
   return option;
@@ -260,11 +325,13 @@ async function openFormats(
 ): Promise<void> {
   if (panel.style.display === 'block') {
     clearFormats(panel);
-    setOverlayStatus(button, 'Gunda');
+    button.setAttribute('aria-expanded', 'false');
+    setOverlayStatus(button, OVERLAY_LABEL);
     return;
   }
 
-  setOverlayStatus(button, 'Loading...');
+  setOverlayStatus(button, 'Finding formats', { busy: true });
+  button.setAttribute('aria-expanded', 'false');
   clearFormats(panel);
   window.postMessage(
     { source: 'gunda-page', kind: 'refresh' } satisfies PageRefresh,
@@ -286,10 +353,10 @@ async function openFormats(
         response.filename,
       );
     } else {
-      setOverlayStatus(button, 'Not found', true);
+      setOverlayStatus(button, 'No formats', { resetAfter: 2600 });
     }
   } else {
-    setOverlayStatus(button, 'Try again', true);
+    setOverlayStatus(button, 'Try again', { resetAfter: 3000 });
   }
 }
 
@@ -308,48 +375,19 @@ function addOverlay(video: HTMLVideoElement): void {
   host.style.cssText =
     'all: initial; position: fixed; z-index: 2147483647; display: none; pointer-events: none;';
   const shadow = host.attachShadow({ mode: 'open' });
+  const style = document.createElement('style');
+  style.textContent = OVERLAY_CSS;
   const panel = document.createElement('div');
-  panel.style.cssText = [
-    'all: initial',
-    'box-sizing: border-box',
-    'display: none',
-    'position: absolute',
-    'top: calc(100% + 6px)',
-    'right: 0',
-    'width: 230px',
-    'max-height: 320px',
-    'overflow: auto',
-    'pointer-events: auto',
-    'border: 1px solid rgba(255,255,255,.28)',
-    'border-radius: 7px',
-    'background: rgba(12,18,28,.96)',
-    'box-shadow: 0 8px 24px rgba(0,0,0,.42)',
-    'padding: 5px',
-  ].join(';');
+  panel.className = 'panel';
+  panel.setAttribute('role', 'group');
+  panel.setAttribute('aria-label', 'Available formats');
   const button = document.createElement('button');
   button.type = 'button';
-  button.textContent = 'Download Video';
+  button.className = 'button';
   button.title = 'Download this video with Gunda';
-  button.style.cssText = [
-    'all: initial',
-    'box-sizing: border-box',
-    'pointer-events: auto',
-    'border: 1px solid rgba(255,255,255,.35)',
-    'border-radius: 6px',
-    'background: rgba(12,18,28,.82)',
-    'color: #fff',
-    'cursor: pointer',
-    'font: 600 12px/1 system-ui, sans-serif',
-    'padding: 8px 10px',
-    'box-shadow: 0 4px 14px rgba(0,0,0,.3)',
-    'opacity: .82',
-  ].join(';');
-  button.addEventListener('mouseenter', () => {
-    button.style.opacity = '1';
-  });
-  button.addEventListener('mouseleave', () => {
-    button.style.opacity = '.82';
-  });
+  button.setAttribute('aria-haspopup', 'true');
+  button.setAttribute('aria-expanded', 'false');
+  button.innerHTML = `${DOWNLOAD_ICON}<span class="label">${OVERLAY_LABEL}</span>`;
   button.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -357,9 +395,9 @@ function addOverlay(video: HTMLVideoElement): void {
   });
 
   const controls = document.createElement('div');
-  controls.style.cssText = 'all: initial; position: relative; display: inline-block;';
+  controls.className = 'controls';
   controls.append(button, panel);
-  shadow.append(controls);
+  shadow.append(style, controls);
   document.documentElement.append(host);
   overlays.set(video, { host, button, panel });
   positionOverlay(video);

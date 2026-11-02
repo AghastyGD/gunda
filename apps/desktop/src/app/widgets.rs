@@ -3,7 +3,7 @@ use gunda_core::download::DownloadState;
 
 use crate::view::{DownloadView, bytes};
 
-use super::theme::Palette;
+use super::{fonts, theme::Palette};
 
 #[derive(Clone, Copy)]
 pub(super) enum Icon {
@@ -123,7 +123,7 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Colo
 }
 
 pub(super) fn dialog_heading(ui: &mut egui::Ui, title: &str, subtitle: &str, colors: Palette) {
-    ui.add(egui::Label::new(RichText::new(title).size(15.0).strong()).truncate())
+    ui.add(egui::Label::new(RichText::new(title).size(15.0).family(fonts::semibold())).truncate())
         .on_hover_text(title);
     ui.label(RichText::new(subtitle).size(12.0).color(colors.muted));
 }
