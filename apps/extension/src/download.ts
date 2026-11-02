@@ -17,6 +17,9 @@ const browserSize =
     : null;
 const browserPageUrl = parameters.get('page_url') ?? '';
 const browserPageTitle = parameters.get('page_title') ?? '';
+const detectedFilename = parameters.get('filename') ?? 'download';
+
+document.body.classList.toggle('browser-prompt', browserPrompt);
 
 function downloadElement<T extends HTMLElement>(id: string): T {
   const found = document.getElementById(id);
@@ -43,6 +46,12 @@ const chooseButton = downloadElement<HTMLButtonElement>('choose');
 const startButton = downloadElement<HTMLButtonElement>('start');
 const cancelButton = downloadElement<HTMLButtonElement>('cancel');
 const setupFailure = downloadElement<HTMLElement>('setup-failure');
+const addressField = downloadElement<HTMLInputElement>('address');
+const addressFieldRow = downloadElement<HTMLElement>('address-field');
+const rememberCheckbox = downloadElement<HTMLInputElement>('remember');
+const rememberLabel = downloadElement<HTMLElement>('remember-label');
+const sourceRow = downloadElement<HTMLElement>('source-row');
+const sourceTitle = downloadElement<HTMLElement>('source-title');
 
 function downloadFormatBytes(value: number): string {
   if (!Number.isFinite(value) || value < 0) {
@@ -58,10 +67,39 @@ function downloadFormatBytes(value: number): string {
   return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
 }
 
-function downloadTypeLabel(contentType: string): string {
+function typeFromFilename(filename: string): string {
+  const extension = /\.([a-z0-9]+)$/i.exec(filename)?.[1]?.toLowerCase() ?? '';
+  if (/(mp4|mkv|webm|mov|avi|m4v|ts)/.test(extension)) {
+    return 'Video';
+  }
+  if (/(mp3|m4a|flac|wav|ogg|opus|aac)/.test(extension)) {
+    return 'Audio';
+  }
+  if (/(jpg|jpeg|png|gif|webp|avif|svg)/.test(extension)) {
+    return 'Image';
+  }
+  if (/(zip|rar|7z|tar|gz|bz2|xz|zst)/.test(extension)) {
+    return 'Archive';
+  }
+  if (extension === 'pdf') {
+    return 'PDF document';
+  }
+  if (/(doc|docx|odt|rtf)/.test(extension)) {
+    return 'Document';
+  }
+  if (/(xls|xlsx|ods|csv)/.test(extension)) {
+    return 'Spreadsheet';
+  }
+  if (/(ppt|pptx|odp)/.test(extension)) {
+    return 'Presentation';
+  }
+  return 'File';
+}
+
+function downloadTypeLabel(contentType: string, filename: string): string {
   const essence = contentType.split(';')[0]?.trim().toLowerCase() ?? '';
-  if (!essence) {
-    return 'File';
+  if (!essence || /octet-stream|binary/.test(essence)) {
+    return typeFromFilename(filename);
   }
   if (essence.startsWith('video/')) {
     return 'Video';
@@ -90,7 +128,66 @@ function downloadTypeLabel(contentType: string): string {
   if (/(presentation|powerpoint)/i.test(essence)) {
     return 'Presentation';
   }
-  return 'File';
+  return typeFromFilename(filename);
+}
+
+const browserCategory = downloadTypeLabel(browserContentType, detectedFilename);
+const CATEGORY_FOLDERS_KEY = 'browserCategoryFolders';
+
+type CategoryFolders = Record<string, string>;
+
+function pageHost(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./i, '');
+  } catch {
+    return '';
+  }
+}
+
+async function readCategoryFolders(): Promise<CategoryFolders> {
+  try {
+    const stored = await chrome.storage.local.get(CATEGORY_FOLDERS_KEY);
+    const value: unknown = stored[CATEGORY_FOLDERS_KEY];
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return {};
+    }
+    const folders: CategoryFolders = {};
+    for (const [key, folder] of Object.entries(value)) {
+      if (typeof folder === 'string') {
+        folders[key] = folder;
+      }
+    }
+    return folders;
+  } catch {
+    return {};
+  }
+}
+
+async function rememberCategoryFolder(
+  category: string,
+  directory: string,
+): Promise<void> {
+  if (!directory) {
+    return;
+  }
+  const folders = await readCategoryFolders();
+  folders[category] = directory;
+  try {
+    await chrome.storage.local.set({ [CATEGORY_FOLDERS_KEY]: folders });
+  } catch {
+    // Remembering the folder is optional.
+  }
+}
+
+async function applyCategoryFolder(
+  category: string,
+  fallback: string,
+): Promise<void> {
+  const folders = await readCategoryFolders();
+  const remembered = folders[category];
+  if (remembered && directoryInput.value === fallback) {
+    directoryInput.value = remembered;
+  }
 }
 
 function downloadStateLabel(state: string): string {
@@ -294,6 +391,10 @@ startButton.addEventListener('click', async () => {
       return;
     }
 
+    if (rememberCheckbox.checked) {
+      void rememberCategoryFolder(browserCategory, directory);
+    }
+
     startButton.disabled = true;
     setupFailure.textContent = '';
     try {
@@ -356,14 +457,32 @@ startButton.addEventListener('click', async () => {
 if (Number.isSafeInteger(downloadId) && downloadId > 0) {
   beginProgress(downloadId);
 } else if (browserPrompt) {
-  const filename = parameters.get('filename') ?? 'download';
+  const filename = detectedFilename;
+  const initialDirectory = parameters.get('directory') ?? '';
   formatLabel.textContent = filename;
   formatDetails.textContent = [
-    downloadTypeLabel(browserContentType),
+    browserCategory,
     browserSize === null ? 'Size unknown' : downloadFormatBytes(browserSize),
   ].join(' · ');
   filenameInput.value = filename;
-  directoryInput.value = parameters.get('directory') ?? '';
+  directoryInput.value = initialDirectory;
+  addressField.value = browserUrl;
+  addressField.title = browserUrl;
+  addressField.addEventListener('focus', () => addressField.select());
+  if (!browserUrl) {
+    addressFieldRow.style.display = 'none';
+  }
+  rememberLabel.textContent = `Remember this folder for ${browserCategory}`;
+  const source = browserPageTitle || pageHost(browserPageUrl);
+  if (source) {
+    sourceTitle.textContent = source;
+    sourceTitle.title = browserPageTitle
+      ? `${browserPageTitle}\n${browserPageUrl}`
+      : browserPageUrl;
+  } else {
+    sourceRow.style.display = 'none';
+  }
+  void applyCategoryFolder(browserCategory, initialDirectory);
   if (!browserUrl || !browserPageUrl || browserDownload === null) {
     setupFailure.textContent = 'This download is no longer available.';
     startButton.disabled = true;

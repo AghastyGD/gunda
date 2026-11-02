@@ -1123,7 +1123,7 @@ function openBrowserDownloadWindow(prompt: BrowserDownloadPrompt): Promise<boole
           url: url.href,
           type: 'popup',
           width: 520,
-          height: 340,
+          height: 440,
         },
         (created) => {
           resolve(!chrome.runtime.lastError && created !== undefined);

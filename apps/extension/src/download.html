@@ -122,6 +122,64 @@
         outline-offset: 0;
       }
 
+      .address {
+        color: var(--text);
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 11px;
+      }
+
+      .browser-only {
+        display: none;
+      }
+
+      body.browser-prompt .field.browser-only {
+        display: grid;
+      }
+
+      body.browser-prompt .meta {
+        display: grid;
+      }
+
+      .meta {
+        display: none;
+        gap: 6px;
+      }
+
+      .remember {
+        align-items: center;
+        color: var(--muted);
+        cursor: pointer;
+        display: flex;
+        font-size: 12px;
+        gap: 8px;
+      }
+
+      .remember input {
+        accent-color: var(--accent);
+        height: 14px;
+        margin: 0;
+        width: 14px;
+      }
+
+      .source {
+        align-items: baseline;
+        color: var(--muted);
+        display: flex;
+        font-size: 11px;
+        gap: 6px;
+        min-width: 0;
+      }
+
+      .source-label {
+        flex: none;
+      }
+
+      .source-title {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
       .directory {
         display: flex;
         gap: 8px;
@@ -215,6 +273,16 @@
         <strong id="format-label">Selected format</strong>
         <span id="format-details"></span>
       </div>
+      <div class="field browser-only" id="address-field">
+        <label for="address">URL</label>
+        <input
+          id="address"
+          class="address"
+          type="text"
+          readonly
+          spellcheck="false"
+        />
+      </div>
       <div class="field">
         <label for="filename">File name</label>
         <input id="filename" type="text" spellcheck="false" />
@@ -224,6 +292,16 @@
         <div class="directory">
           <input id="directory" type="text" spellcheck="false" />
           <button id="choose" type="button">Choose…</button>
+        </div>
+      </div>
+      <div class="meta browser-only">
+        <label class="remember">
+          <input id="remember" type="checkbox" />
+          <span id="remember-label">Remember this folder</span>
+        </label>
+        <div class="source" id="source-row">
+          <span class="source-label">From</span>
+          <span class="source-title" id="source-title"></span>
         </div>
       </div>
       <div class="failure" id="setup-failure"></div>
