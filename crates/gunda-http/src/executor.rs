@@ -420,7 +420,7 @@ impl StagedTransfer for HttpStagedTransfer {
 
 fn http_failure(error: HttpError) -> DownloadFailure {
     if let HttpError::UnexpectedStatus(status) = error {
-        let kind = if matches!(status, 401 | 403) {
+        let kind = if status == 401 {
             FailureKind::Authentication
         } else {
             FailureKind::RemoteRejected
@@ -630,7 +630,8 @@ mod failure_tests {
     #[test]
     fn http_status_failures_preserve_codes_reasons_and_retryability() {
         for (status, reason, kind, retryable) in [
-            (403, "Forbidden", FailureKind::Authentication, false),
+            (401, "Unauthorized", FailureKind::Authentication, false),
+            (403, "Forbidden", FailureKind::RemoteRejected, false),
             (404, "Not Found", FailureKind::RemoteRejected, false),
             (429, "Too Many Requests", FailureKind::RemoteRejected, true),
             (

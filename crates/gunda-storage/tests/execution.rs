@@ -37,97 +37,77 @@ async fn serve_file() -> (Url, JoinHandle<()>) {
     .await
 }
 
-async fn serve_response(response: &'static [u8]) -> (Url, JoinHandle<()>) {
+const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+const SERVER_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn serve_requests(responses: Vec<&'static [u8]>) -> (Url, JoinHandle<Vec<Vec<u8>>>) {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .expect("local listener must bind");
-
     let address = listener.local_addr().expect("address must exist");
 
     let task = tokio::spawn(async move {
-        timeout(Duration::from_secs(10), async move {
-            let (mut socket, _) = listener.accept().await.expect("client must connect");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
+        let mut requests = Vec::with_capacity(responses.len());
 
-            loop {
-                let read = socket
-                    .read(&mut buffer)
-                    .await
-                    .expect("request must be readable");
-                assert_ne!(read, 0, "client closed before sending headers");
-
-                request.extend_from_slice(&buffer[..read]);
-                assert!(request.len() <= 16 * 1024);
-
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
-                }
-            }
-
-            assert!(request.starts_with(b"GET /file.bin HTTP/1.1\r\n"));
-
-            socket
-                .write_all(response)
+        for response in responses {
+            // Fixture setup runs before the client connects and must not consume
+            // the exchange deadline on slow runners.
+            let (mut socket, _) = timeout(SERVER_CONNECT_TIMEOUT, listener.accept())
                 .await
-                .expect("response must be written");
+                .expect("client must connect within its deadline")
+                .expect("client must connect");
 
-            socket.shutdown().await.expect("socket must close");
-        })
-        .await
-        .expect("server must finish within its deadline");
+            let request = timeout(SERVER_EXCHANGE_TIMEOUT, async {
+                let request = read_request(&mut socket).await;
+                socket
+                    .write_all(response)
+                    .await
+                    .expect("response must be written");
+                socket.shutdown().await.expect("socket must close");
+                request
+            })
+            .await
+            .expect("server exchange must finish within its deadline");
+
+            requests.push(request);
+        }
+
+        requests
     });
 
     let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
+    (url, task)
+}
+
+async fn serve_response(response: &'static [u8]) -> (Url, JoinHandle<()>) {
+    let (url, task) = serve_requests(vec![response]).await;
+
+    let task = tokio::spawn(async move {
+        task.await.expect("server task must succeed");
+    });
 
     (url, task)
 }
 
 async fn serve_range_response() -> (Url, JoinHandle<Vec<u8>>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("local listener must bind");
-    let address = listener.local_addr().expect("address must exist");
+    let (url, task) = serve_requests(vec![
+        b"HTTP/1.1 206 Partial Content\r\n\
+          Content-Range: bytes 5-9/10\r\n\
+          Content-Length: 5\r\n\
+          ETag: \"version-31\"\r\n\
+          Connection: close\r\n\r\n\
+          world"
+            .as_slice(),
+    ])
+    .await;
 
     let task = tokio::spawn(async move {
-        timeout(Duration::from_secs(10), async move {
-            let (mut socket, _) = listener.accept().await.expect("client must connect");
-            let mut request = Vec::new();
-            let mut buffer = [0_u8; 1024];
-
-            loop {
-                let read = socket
-                    .read(&mut buffer)
-                    .await
-                    .expect("request must be readable");
-                assert_ne!(read, 0, "client closed before sending headers");
-                request.extend_from_slice(&buffer[..read]);
-                assert!(request.len() <= 16 * 1024);
-
-                if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                    break;
-                }
-            }
-
-            socket
-                .write_all(
-                    b"HTTP/1.1 206 Partial Content\r\n\
-                      Content-Range: bytes 5-9/10\r\n\
-                      Content-Length: 5\r\n\
-                      ETag: \"version-31\"\r\n\
-                      Connection: close\r\n\r\n\
-                      world",
-                )
-                .await
-                .expect("response must be written");
-            socket.shutdown().await.expect("socket must close");
-            request
-        })
-        .await
-        .expect("server must finish within its deadline")
+        task.await
+            .expect("server task must succeed")
+            .pop()
+            .expect("server must receive one request")
     });
 
-    let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
     (url, task)
 }
 
@@ -145,6 +125,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
         assert!(request.len() <= 16 * 1024);
 
         if request.windows(4).any(|part| part == b"\r\n\r\n") {
+            assert!(request.starts_with(b"GET /file.bin HTTP/1.1\r\n"));
             return request;
         }
     }
@@ -153,31 +134,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
 async fn serve_captured_responses(
     responses: Vec<&'static [u8]>,
 ) -> (Url, JoinHandle<Vec<Vec<u8>>>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("local listener must bind");
-    let address = listener.local_addr().expect("address must exist");
-
-    let task = tokio::spawn(async move {
-        timeout(Duration::from_secs(15), async move {
-            let mut requests = Vec::with_capacity(responses.len());
-            for response in responses {
-                let (mut socket, _) = listener.accept().await.expect("client must connect");
-                requests.push(read_request(&mut socket).await);
-                socket
-                    .write_all(response)
-                    .await
-                    .expect("response must be written");
-                socket.shutdown().await.expect("socket must close");
-            }
-            requests
-        })
-        .await
-        .expect("server must finish within its deadline")
-    });
-
-    let url = Url::parse(&format!("http://{address}/file.bin")).expect("local URL must be valid");
-    (url, task)
+    serve_requests(responses).await
 }
 
 fn new_download(url: Url, directory: &Path) -> NewDownload {
@@ -599,6 +556,104 @@ async fn checkpoint_failure_keeps_partial_and_prevents_publication() {
 
     server.await.expect("server must finish");
     manager.into_repository().close().await;
+}
+
+#[tokio::test]
+async fn authentication_and_refusal_failures_survive_repository_reload() {
+    let directory = tempdir().expect("temporary directory must exist");
+    let database_path = directory.path().join("gunda.sqlite3");
+    let output_directory = directory.path().join("downloads");
+    tokio::fs::create_dir(&output_directory)
+        .await
+        .expect("output directory must be created");
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must open");
+    let manager = DownloadManager::start(repository)
+        .await
+        .expect("manager must start");
+    let executor = HttpExecutor::new(HttpClient::new().expect("HTTP client must build"));
+
+    let (authentication_url, authentication_server) = serve_response(
+        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (refusal_url, refusal_server) =
+        serve_response(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+
+    let authentication_id = manager
+        .create(new_download(authentication_url, &output_directory))
+        .await
+        .expect("authentication job must be created")
+        .download_id();
+    let refusal_id = manager
+        .create(new_download(refusal_url, &output_directory))
+        .await
+        .expect("refusal job must be created")
+        .download_id();
+
+    for id in [authentication_id, refusal_id] {
+        let report = timeout(Duration::from_secs(10), manager.execute(id, &executor))
+            .await
+            .expect("execution must not stall")
+            .expect("failure must persist");
+        assert!(matches!(report.event, DownloadEvent::Failed { .. }));
+    }
+
+    authentication_server
+        .await
+        .expect("authentication server must finish");
+    refusal_server.await.expect("refusal server must finish");
+
+    let authentication = manager.job(authentication_id).expect("job must exist");
+    assert_eq!(authentication.state(), DownloadState::Failed);
+    let failure = authentication
+        .last_failure()
+        .expect("authentication failure must exist");
+    assert_eq!(failure.kind(), FailureKind::Authentication);
+    assert_eq!(failure.message(), "HTTP 401 Unauthorized");
+    assert!(!failure.is_retryable());
+
+    let refusal = manager.job(refusal_id).expect("job must exist");
+    assert_eq!(refusal.state(), DownloadState::Failed);
+    let failure = refusal.last_failure().expect("refusal failure must exist");
+    assert_eq!(failure.kind(), FailureKind::RemoteRejected);
+    assert_eq!(failure.message(), "HTTP 403 Forbidden");
+    assert!(!failure.is_retryable());
+
+    assert!(!partial_path(&output_directory, authentication_id).exists());
+    assert!(!partial_path(&output_directory, refusal_id).exists());
+
+    manager.into_repository().close().await;
+
+    let repository = SqliteDownloadRepository::open(&database_path)
+        .await
+        .expect("repository must reopen");
+    let authentication = repository
+        .find_by_id(authentication_id)
+        .await
+        .expect("authentication lookup must succeed")
+        .expect("authentication job must remain");
+    let failure = authentication
+        .last_failure()
+        .expect("authentication failure must remain");
+    assert_eq!(failure.kind(), FailureKind::Authentication);
+    assert_eq!(failure.message(), "HTTP 401 Unauthorized");
+    assert!(!failure.is_retryable());
+
+    let refusal = repository
+        .find_by_id(refusal_id)
+        .await
+        .expect("refusal lookup must succeed")
+        .expect("refusal job must remain");
+    let failure = refusal.last_failure().expect("refusal failure must remain");
+    assert_eq!(failure.kind(), FailureKind::RemoteRejected);
+    assert_eq!(failure.message(), "HTTP 403 Forbidden");
+    assert!(!failure.is_retryable());
+
+    repository.close().await;
 }
 
 #[tokio::test]

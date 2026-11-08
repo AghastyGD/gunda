@@ -101,29 +101,35 @@ async fn execution_reuses_the_opened_get_across_phases() {
 }
 
 #[tokio::test]
-async fn preparation_failure_creates_no_partial_file() {
-    let directory = tempdir().expect("temporary directory must exist");
+async fn preparation_distinguishes_authentication_from_refusal_without_a_partial_file() {
+    for (status, reason, expected_kind) in [
+        (401, "Unauthorized", FailureKind::Authentication),
+        (403, "Forbidden", FailureKind::RemoteRejected),
+    ] {
+        let directory = tempdir().expect("temporary directory must exist");
 
-    let (url, server) = serve_once(
-        "HTTP/1.1 403 Forbidden\r\n\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\
-         \r\n",
-    )
-    .await;
+        let (url, server) = serve_once(&format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             Content-Length: 0\r\n\
+             Connection: close\r\n\
+             \r\n"
+        ))
+        .await;
 
-    let executor = HttpExecutor::new(HttpClient::new().expect("client must build"));
+        let executor = HttpExecutor::new(HttpClient::new().expect("client must build"));
 
-    let failure = match executor.prepare(input(url, directory.path())).await {
-        Ok(_) => panic!("authorization rejection must fail preparation"),
-        Err(failure) => failure,
-    };
+        let failure = match executor.prepare(input(url, directory.path())).await {
+            Ok(_) => panic!("HTTP {status} must fail preparation"),
+            Err(failure) => failure,
+        };
 
-    assert_eq!(failure.kind(), FailureKind::Authentication);
-    assert!(!failure.is_retryable());
-    assert!(!partial_path(directory.path(), test_id()).exists());
+        assert_eq!(failure.kind(), expected_kind);
+        assert_eq!(failure.message(), format!("HTTP {status} {reason}"));
+        assert!(!failure.is_retryable());
+        assert!(!partial_path(directory.path(), test_id()).exists());
 
-    server.await.expect("server task must succeed");
+        server.await.expect("server task must succeed");
+    }
 }
 
 #[tokio::test]

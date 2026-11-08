@@ -55,15 +55,17 @@ The pipeline has these responsibilities:
   completed it) and opens an extension-hosted start window, so nothing keeps
   transferring in the background. Nothing is sent to the daemon until **Start
   Download** is pressed; that window shows the filename, known size, and
-  destination folder, and can hand the download back to the browser. **Cancel**
-  asks the browser to download the URL again. If the window cannot open, or
-  Chrome can neither cancel nor remove its copy, the browser keeps its download
-  and nothing is queued. If the daemon refuses or times out on Start, the
-  extension restores the browser download. A restored download is recognised by
-  its URL for a short window, because Chrome does not reliably expose
-  `byExtensionId` when the item is created, so it is not prompted again. `blob:`, `data:`, and other
-  non-HTTP(S) downloads are ignored because the daemon cannot fetch them
-  without the page's session.
+  destination folder, and can hand the download back to the browser. After
+  Start, the window closes and the desktop details shows the download; the
+  optional **Show progress in this window** checkbox keeps an enriched progress
+  window open. **Cancel** asks the browser to download the URL again. If the
+  window cannot open, or Chrome can neither cancel nor remove its copy, the
+  browser keeps its download and nothing is queued. If the daemon refuses or
+  times out on Start, the extension restores the browser download. A restored
+  download is recognised by its URL for a short window, because Chrome does not
+  reliably expose `byExtensionId` when the item is created, so it is not
+  prompted again. `blob:`, `data:`, and other non-HTTP(S) downloads are ignored
+  because the daemon cannot fetch them without the page's session.
 - **A local transport.** An extension cannot open a raw socket, so candidates
   reach the Gunda daemon either over a loopback WebSocket or through the
   browser's native-messaging bridge, which needs an installed host manifest and
@@ -339,7 +341,7 @@ the greeting, limited to `MAX_MESSAGE_BYTES` (2 MiB).
 | `recorded` | one source produced one or more accepted or duplicate candidate IDs |
 | `download_queued` | the daemon accepted the page download and the job is being created |
 | `download_unavailable` | the page download could not be queued |
-| `download_status` | filename, state, written bytes, total bytes, and failure state |
+| `download_status` | filename, state, written bytes, total bytes, failure state, and optional source, destination, and output |
 | `download_status_unavailable` | the download status could not be read |
 | `page_formats` | the capture ID, its formats, and the suggested folder and filename |
 | `formats_unavailable` | formats could not be listed |
@@ -560,15 +562,18 @@ Implemented:
     the size when the daemon knew it), Start, and Cancel. The window reuses the
     exact capture whose formats were listed, so a newer capture on the same page
     cannot replace that choice. The folder picker uses the native-messaging host.
-    Starting switches the same window to a progress view with current state,
-    bytes written, total size, failures, and progress without opening the
-    desktop.
+    After Start, the window closes and the desktop details shows the download.
+    The optional **Show progress in this window** checkbox keeps a progress
+    view open with state, percentage, downloaded and total size, speed, time
+    left, source, folder or saved file, and failures.
 13. **Browser download prompt:** an eligible Chrome download is cancelled and
     erased immediately (or its finished file removed), so it never keeps
     transferring behind the window, then a setup window shows its filename,
     known size, and destination folder. The folder defaults to the last browser
     download folder or Chrome's current download folder. Nothing is sent to the
-    daemon until Start Download; then the job is queued. Cancel restores the
+    daemon until Start Download; then the job is queued, the window closes, and
+    the desktop details shows the download. The optional **Show progress in
+    this window** checkbox keeps a progress view open. Cancel restores the
     download through `chrome.downloads.download`, as does a daemon refusal or
     timeout after Start. If the window cannot open, or Chrome can neither cancel
     nor remove its copy, the browser keeps the download and no job is queued.
