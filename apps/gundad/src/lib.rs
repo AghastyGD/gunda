@@ -906,6 +906,16 @@ impl Daemon {
                             failure: job
                                 .last_failure()
                                 .map(|failure| failure_kind_name(failure.kind()).to_owned()),
+                            source: Some(job.request().url().origin().ascii_serialization()),
+                            destination: Some(
+                                job.destination().directory().to_string_lossy().into_owned(),
+                            ),
+                            output: job
+                                .resolved_destination()
+                                .filter(|_| job.state() == DownloadState::Completed)
+                                .map(|destination| {
+                                    destination.final_path().to_string_lossy().into_owned()
+                                }),
                         })
                     })
                     .ok_or(Refusal::NoDownload);

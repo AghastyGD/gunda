@@ -44,11 +44,13 @@ browser's copy (or removes the finished file if Chrome had already completed it)
 so nothing keeps downloading in the background, then opens a start window with
 the filename, known size, folder picker, Start Download, and Cancel. Nothing is
 sent to the daemon until Start. **Start Download** queues the job in Gunda;
-**Cancel** asks Chrome to download the URL again. If the window cannot open, or
-Chrome can neither cancel nor remove its copy, the browser keeps its download
-and nothing is queued. If the daemon is unreachable, refuses the URL, or times
-out after Start, the extension restores the browser download. Downloads started
-by another extension are left alone.
+**Cancel** asks Chrome to download the URL again. After Start, the start window
+closes and the desktop details shows the download. The optional **Show progress
+in this window** checkbox keeps an enriched progress window open. If the window
+cannot open, or Chrome can neither cancel nor remove its copy, the browser
+keeps its download and nothing is queued. If the daemon is unreachable, refuses
+the URL, or times out after Start, the extension restores the browser download.
+Downloads started by another extension are left alone.
 
 The prompt names the file from the most specific source it can find: the
 browser's suggested name, then the name declared in `Content-Disposition`,
@@ -71,8 +73,9 @@ with a non-HTTP(S) URL (`ignored_non_http`) are counted separately.
 The player control asks the page agent to refresh media detection before it
 lists the formats of the newest capture for that exact page. Choosing a format
 opens a start window with the filename, folder picker, format summary, known
-file size, Start, and Cancel. Starting switches the same window to live progress
-without opening the desktop.
+file size, Start, and Cancel. After Start, the window closes and the desktop
+details shows the download. The optional **Show progress in this window**
+checkbox keeps an enriched progress window open.
 
 ## Installing it
 

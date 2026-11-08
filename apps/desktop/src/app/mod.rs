@@ -28,7 +28,8 @@ struct CaptureStart {
     id: gunda_capture::CandidateId,
     track: Option<TrackChoice>,
     label: String,
-    details: String,
+    source: String,
+    type_label: String,
     size_bytes: Option<u64>,
 }
 
@@ -92,7 +93,7 @@ impl Desktop {
                 && let Some(id) = next.active.iter().next().copied()
             {
                 self.selected = Some(id);
-                if self.transfer.is_none() {
+                if self.transfer.is_none() && self.capture_start.is_none() {
                     self.transfer = Some(id);
                 }
                 self.filter = Filter::All;
@@ -185,6 +186,7 @@ impl Desktop {
                     .clicked()
                 {
                     self.transfer = self.selected;
+                    self.capture_start = None;
                     ui.close();
                 }
             });
@@ -296,6 +298,7 @@ impl Desktop {
             ui.separator();
             if action_button(ui, Icon::Inspect, "Details", selected.is_some()).clicked() {
                 self.transfer = self.selected;
+                self.capture_start = None;
             }
             if self.busy() {
                 ui.spinner();
@@ -484,8 +487,11 @@ impl Desktop {
             .frame(egui::Frame::new().fill(colors.background).inner_margin(8))
             .show(ui, |ui| self.table(ui));
         self.add_dialog(&ctx);
-        self.transfer_dialog(&ctx);
-        self.capture_dialog(&ctx);
+        if self.capture_start.is_some() {
+            self.capture_dialog(&ctx);
+        } else {
+            self.transfer_dialog(&ctx);
+        }
     }
 }
 

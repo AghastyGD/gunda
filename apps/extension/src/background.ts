@@ -534,8 +534,8 @@ function openDownloadWindow(
   void chrome.windows.create({
     url: url.href,
     type: 'popup',
-    width: 520,
-    height: 340,
+    width: 560,
+    height: 560,
   });
 }
 
@@ -1122,8 +1122,8 @@ function openBrowserDownloadWindow(prompt: BrowserDownloadPrompt): Promise<boole
         {
           url: url.href,
           type: 'popup',
-          width: 520,
-          height: 440,
+          width: 560,
+          height: 560,
         },
         (created) => {
           resolve(!chrome.runtime.lastError && created !== undefined);

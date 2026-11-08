@@ -1,5 +1,6 @@
 use eframe::egui::{self, RichText};
 use gunda_capture::CandidateId;
+use url::Url;
 
 use crate::backend::{CaptureStatus, CaptureTracks, CaptureView, Command, TrackChoice, TrackView};
 use crate::view::bytes;
@@ -108,6 +109,7 @@ impl Desktop {
         if let Some(start) = actions.start {
             self.error = None;
             self.capture_start = Some(start);
+            self.transfer = None;
         }
     }
 }
@@ -156,6 +158,32 @@ fn capture_summary(capture: &CaptureView) -> String {
     }
 
     parts.join(" · ")
+}
+
+/// The origin shown in the download dialog, without a long path or query.
+fn capture_source(value: &str) -> String {
+    Url::parse(value)
+        .ok()
+        .map(|url| {
+            let origin = url.origin().ascii_serialization();
+            if origin == "null" {
+                value.to_owned()
+            } else {
+                origin
+            }
+        })
+        .unwrap_or_else(|| value.to_owned())
+}
+
+/// The kind shown in the download dialog for a chosen track.
+fn track_type_label(details: &str) -> &str {
+    details
+        .split(" · ")
+        .next()
+        .unwrap_or(details)
+        .split(" - ")
+        .next()
+        .unwrap_or(details)
 }
 
 /// Names for captured content types, never raw MIME types.
@@ -241,7 +269,12 @@ fn row(
                 id: capture.id,
                 track: None,
                 label: label.to_owned(),
-                details: summary.clone(),
+                source: capture
+                    .page_title
+                    .clone()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or_else(|| capture_source(&capture.url)),
+                type_label: capture_type_label(capture).to_owned(),
                 size_bytes: capture.size_bytes,
             });
         }
@@ -304,7 +337,12 @@ fn tracks_of(
                                 selection: track.selection.clone(),
                             }),
                             label: track.label.clone(),
-                            details: track.details.clone(),
+                            source: capture
+                                .page_title
+                                .clone()
+                                .filter(|title| !title.trim().is_empty())
+                                .unwrap_or_else(|| capture_source(track.url.as_str())),
+                            type_label: track_type_label(&track.details).to_owned(),
                             size_bytes: track.size_bytes.or(capture.size_bytes),
                         });
                     }

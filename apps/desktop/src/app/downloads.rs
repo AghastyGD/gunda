@@ -235,6 +235,7 @@ impl Desktop {
                         if response.double_clicked() {
                             self.selected = Some(view.id);
                             self.transfer = Some(view.id);
+                            self.capture_start = None;
                         }
                     });
                 });

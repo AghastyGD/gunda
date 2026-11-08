@@ -33,6 +33,13 @@ const nameField = downloadElement<HTMLElement>('name');
 const stateField = downloadElement<HTMLElement>('state');
 const writtenField = downloadElement<HTMLElement>('written');
 const totalField = downloadElement<HTMLElement>('total');
+const percentField = downloadElement<HTMLElement>('percent');
+const speedField = downloadElement<HTMLElement>('speed');
+const remainingField = downloadElement<HTMLElement>('remaining');
+const progressSource = downloadElement<HTMLElement>('progress-source');
+const folderLabel = downloadElement<HTMLElement>('folder-label');
+const folderField = downloadElement<HTMLElement>('folder');
+const showProgressInput = downloadElement<HTMLInputElement>('show-progress');
 const failureField = downloadElement<HTMLElement>('failure');
 const bar = downloadElement<HTMLElement>('bar');
 const closeButton = downloadElement<HTMLButtonElement>('close');
@@ -65,6 +72,17 @@ function downloadFormatBytes(value: number): string {
     unit += 1;
   }
   return `${amount.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function downloadFormatRemaining(
+  total: number,
+  written: number,
+  rate: number,
+): string {
+  const seconds = Math.max(0, Math.ceil((total - written) / rate));
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `About ${minutes}m ${String(rest).padStart(2, '0')}s`;
 }
 
 function typeFromFilename(filename: string): string {
@@ -266,6 +284,14 @@ async function requestDownloadStatusView(): Promise<DownloadStatusResponse | nul
   }
 }
 
+type DownloadRateSample = {
+  id: number;
+  written: number;
+  at: number;
+};
+
+let downloadRateSample: DownloadRateSample | null = null;
+let downloadRate = 0;
 let downloadTimer: ReturnType<typeof setInterval> | null = null;
 
 async function refreshDownload(): Promise<void> {
@@ -279,19 +305,69 @@ async function refreshDownload(): Promise<void> {
   }
 
   const status = response.status;
+  const active =
+    status.state === 'downloading' || status.state === 'finalizing';
+  const now = performance.now();
+  if (!active) {
+    downloadRateSample = null;
+    downloadRate = 0;
+  } else if (!downloadRateSample || downloadRateSample.id !== status.id) {
+    downloadRateSample = { id: status.id, written: status.written, at: now };
+    downloadRate = 0;
+  } else {
+    const elapsed = (now - downloadRateSample.at) / 1000;
+    if (elapsed >= 1) {
+      downloadRate = Math.max(
+        0,
+        (status.written - downloadRateSample.written) / elapsed,
+      );
+      downloadRateSample = { id: status.id, written: status.written, at: now };
+    }
+  }
+
   nameField.textContent = status.name;
   nameField.title = status.name;
   stateField.textContent = downloadStateLabel(status.state);
   writtenField.textContent = downloadFormatBytes(status.written);
   totalField.textContent =
     status.total === null ? 'Size unknown' : downloadFormatBytes(status.total);
+  speedField.textContent =
+    active && downloadRate > 0 ? `${downloadFormatBytes(downloadRate)}/s` : '-';
+  let remaining = '-';
+  if (active && downloadRate > 0) {
+    remaining =
+      status.total === null
+        ? 'Unknown'
+        : downloadFormatRemaining(status.total, status.written, downloadRate);
+  }
+  remainingField.textContent = remaining;
   failureField.textContent = status.failure ? downloadFailureLabel(status.failure) : '';
+
+  const source =
+    browserPageTitle || pageHost(browserPageUrl) || status.source || '';
+  progressSource.textContent = source;
+  progressSource.title =
+    browserPageTitle && browserPageUrl
+      ? `${browserPageTitle}\n${browserPageUrl}`
+      : source;
+  progressSource.style.display = source ? 'block' : 'none';
+
+  const savedFile = status.output ?? '';
+  const folder = savedFile || status.destination || directoryInput.value || '';
+  folderLabel.textContent = savedFile ? 'Saved file' : 'Folder';
+  folderField.textContent = folder || 'Unknown';
+  folderField.title = folder;
 
   if (status.total !== null && status.total > 0) {
     const percent = Math.min(100, (status.written / status.total) * 100);
+    percentField.textContent = `${Math.round(percent)}%`;
     bar.style.width = `${percent.toFixed(1)}%`;
   } else if (status.state === 'completed') {
+    percentField.textContent = '100%';
     bar.style.width = '100%';
+  } else {
+    percentField.textContent = 'Size unknown';
+    bar.style.width = '0%';
   }
 
   if (
@@ -306,12 +382,15 @@ async function refreshDownload(): Promise<void> {
   }
 }
 
-function beginProgress(id: number): void {
+function beginProgress(id: number, showWindow = true): void {
   downloadId = id;
   setup.style.display = 'none';
   progress.style.display = 'block';
   void refreshDownload();
   downloadTimer = setInterval(() => void refreshDownload(), 750);
+  if (!showWindow) {
+    window.close();
+  }
 }
 
 closeButton.addEventListener('click', () => window.close());
@@ -380,6 +459,7 @@ startButton.addEventListener('click', async () => {
   const format = parameters.get('format') ?? '';
   const directory = directoryInput.value.trim();
   const filename = filenameInput.value.trim();
+  const showProgress = showProgressInput.checked;
 
   if (browserPrompt) {
     if (!browserUrl || !browserPageUrl || browserDownload === null) {
@@ -410,7 +490,7 @@ startButton.addEventListener('click', async () => {
         filename,
       })) as DownloadResponse | undefined;
       if (response?.kind === 'queued') {
-        beginProgress(response.id);
+        beginProgress(response.id, showProgress);
       } else {
         setupFailure.textContent = browserStartFailureLabel(response?.reason);
         startButton.disabled = response?.reason === 'invalid_download';
@@ -443,7 +523,7 @@ startButton.addEventListener('click', async () => {
       filename,
     })) as DownloadResponse | undefined;
     if (response?.kind === 'queued') {
-      beginProgress(response.id);
+      beginProgress(response.id, showProgress);
     } else {
       setupFailure.textContent = 'Gunda could not start this download.';
       startButton.disabled = false;

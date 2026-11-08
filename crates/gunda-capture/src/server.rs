@@ -1344,6 +1344,9 @@ mod tests {
                 written: 10,
                 total: Some(100),
                 failure: None,
+                source: None,
+                destination: None,
+                output: None,
             }))
             .expect("the connection waits for status");
 

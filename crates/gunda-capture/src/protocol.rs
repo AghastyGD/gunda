@@ -51,6 +51,15 @@ pub struct CaptureDownloadStatus {
     pub written: u64,
     pub total: Option<u64>,
     pub failure: Option<String>,
+    /// Origin of the download request, for display in the browser window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Folder the download is saved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    /// Final path once the download has completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 /// Why a report was not turned into a candidate.

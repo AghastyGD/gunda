@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Gunda Download</title>
+    <title>Gunda - Download details</title>
     <style>
       :root {
         color-scheme: light;
@@ -193,11 +193,47 @@
         display: none;
       }
 
+      .source-line {
+        color: var(--muted);
+        font-size: 12px;
+        margin: 0 0 16px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .summary {
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 14px 16px;
+      }
+
+      .status-line {
+        align-items: baseline;
+        display: flex;
+        gap: 12px;
+        justify-content: space-between;
+      }
+
+      .status-line .state {
+        color: var(--accent);
+        font-weight: 600;
+      }
+
+      .percent {
+        color: var(--text);
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 12px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+
       .track {
         background: var(--track);
         border-radius: 3px;
         height: 6px;
-        margin: 16px 0 8px;
+        margin: 12px 0 14px;
         overflow: hidden;
       }
 
@@ -208,13 +244,68 @@
         width: 0;
       }
 
-      .sizes {
+      .metrics {
+        display: grid;
+        gap: 12px 16px;
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .metric {
+        display: grid;
+        gap: 2px;
+        min-width: 0;
+      }
+
+      .metric span {
         color: var(--muted);
-        display: flex;
-        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
         font-size: 11px;
+      }
+
+      .metric strong {
+        font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+        font-size: 12px;
         font-variant-numeric: tabular-nums;
-        justify-content: space-between;
+        font-weight: 500;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .details {
+        display: grid;
+        gap: 8px;
+        margin-top: 16px;
+      }
+
+      .detail {
+        align-items: baseline;
+        display: grid;
+        gap: 8px;
+        grid-template-columns: 72px 1fr;
+        min-width: 0;
+      }
+
+      .detail span {
+        color: var(--muted);
+        font-size: 11px;
+      }
+
+      .detail strong {
+        font-size: 12px;
+        font-weight: 400;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .options {
+        display: grid;
+        gap: 3px;
+      }
+
+      .hint {
+        color: var(--muted);
+        font-size: 11px;
       }
 
       .failure {
@@ -227,11 +318,24 @@
         display: none;
       }
 
+      .progress .failure {
+        margin-top: 12px;
+      }
+
       .actions {
         display: flex;
         gap: 8px;
         justify-content: flex-end;
         margin-top: 2px;
+      }
+
+      .progress .actions {
+        align-items: center;
+        margin-top: 18px;
+      }
+
+      .progress .actions .hint {
+        margin-right: auto;
       }
 
       button {
@@ -304,6 +408,13 @@
           <span class="source-title" id="source-title"></span>
         </div>
       </div>
+      <div class="options">
+        <label class="remember">
+          <input id="show-progress" type="checkbox" />
+          <span>Show progress in this window</span>
+        </label>
+        <span class="hint">The download continues in Gunda after this window closes.</span>
+      </div>
       <div class="failure" id="setup-failure"></div>
       <div class="actions">
         <button id="cancel" type="button">Cancel</button>
@@ -313,14 +424,29 @@
 
     <div class="progress" id="progress">
       <h1 id="name">Preparing download</h1>
-      <div class="state" id="state">Connecting to Gunda…</div>
-      <div class="track"><div class="bar" id="bar"></div></div>
-      <div class="sizes">
-        <span id="written">0 B</span>
-        <span id="total">Size unknown</span>
+      <div class="source-line" id="progress-source"></div>
+      <div class="summary">
+        <div class="status-line">
+          <span class="state" id="state">Connecting to Gunda…</span>
+          <span class="percent" id="percent">0%</span>
+        </div>
+        <div class="track"><div class="bar" id="bar"></div></div>
+        <div class="metrics">
+          <div class="metric"><span>Downloaded</span><strong id="written">0 B</strong></div>
+          <div class="metric"><span>File size</span><strong id="total">Size unknown</strong></div>
+          <div class="metric"><span>Speed</span><strong id="speed">-</strong></div>
+          <div class="metric"><span>Time left</span><strong id="remaining">-</strong></div>
+        </div>
+      </div>
+      <div class="details">
+        <div class="detail">
+          <span id="folder-label">Folder</span>
+          <strong id="folder">-</strong>
+        </div>
       </div>
       <div class="failure" id="failure"></div>
       <div class="actions">
+        <span class="hint">The download continues in Gunda.</span>
         <button id="close" type="button">Close</button>
       </div>
     </div>

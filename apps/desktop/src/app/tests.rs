@@ -688,7 +688,8 @@ fn capture_download_dialog_confirms_start_folder_and_size() {
         id: 7,
         track: None,
         label: "A movie.mp4".into(),
-        details: "Video · A movie page".into(),
+        source: "A movie page".into(),
+        type_label: "Video".into(),
         size_bytes: Some(1_234_567),
     });
 
@@ -696,7 +697,13 @@ fn capture_download_dialog_confirms_start_folder_and_size() {
     let has = |needle: &str| labels.iter().any(|label| label.contains(needle));
 
     assert!(has("A movie.mp4"), "missing file name: {labels:?}");
-    assert!(has("Video · A movie page"), "missing details: {labels:?}");
+    assert!(has("A movie page"), "missing page title: {labels:?}");
+    assert!(
+        has("Ready to download"),
+        "missing pending state: {labels:?}"
+    );
+    assert!(has("Not started"), "missing start state: {labels:?}");
+    assert!(has("Video"), "missing format: {labels:?}");
     assert!(has("File size"), "missing size label: {labels:?}");
     assert!(has("1.2 MiB"), "missing file size: {labels:?}");
     assert!(has("Save to"), "missing folder label: {labels:?}");

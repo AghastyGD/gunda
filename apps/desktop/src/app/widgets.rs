@@ -125,7 +125,8 @@ fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, color: Colo
 pub(super) fn dialog_heading(ui: &mut egui::Ui, title: &str, subtitle: &str, colors: Palette) {
     ui.add(egui::Label::new(RichText::new(title).size(15.0).family(fonts::semibold())).truncate())
         .on_hover_text(title);
-    ui.label(RichText::new(subtitle).size(12.0).color(colors.muted));
+    ui.add(egui::Label::new(RichText::new(subtitle).size(12.0).color(colors.muted)).truncate())
+        .on_hover_text(subtitle);
 }
 
 pub(super) fn stat(ui: &mut egui::Ui, label: &str, value: &str, colors: Palette) {

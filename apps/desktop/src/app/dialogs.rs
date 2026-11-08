@@ -43,36 +43,55 @@ impl Desktop {
         let mut cancel = false;
         let mut start_now = false;
 
-        egui::Window::new("Start download")
+        egui::Window::new("Download details")
+            .id(egui::Id::new("transfer"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .default_width(560.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(&start.label)
-                            .size(15.0)
-                            .family(fonts::semibold()),
-                    )
-                    .truncate(),
-                )
-                .on_hover_text(&start.label);
-                ui.label(RichText::new(&start.details).size(12.0).color(colors.muted));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    stat(
-                        ui,
-                        "File size",
-                        &start
+                dialog_heading(ui, &start.label, &start.source, colors);
+                ui.add_space(16.0);
+                egui::Frame::new()
+                    .fill(colors.background)
+                    .stroke(egui::Stroke::new(1.0, colors.border))
+                    .corner_radius(8)
+                    .inner_margin(16)
+                    .show(ui, |ui| {
+                        ui.set_min_width(496.0);
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                colors.accent,
+                                RichText::new("Ready to download")
+                                    .size(12.0)
+                                    .family(fonts::semibold()),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new("Not started").size(12.0).color(colors.muted),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(12.0);
+                        let width = ui.available_width();
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 4.0, colors.track);
+                        ui.add_space(16.0);
+                        let size = start
                             .size_bytes
                             .map(bytes)
-                            .unwrap_or_else(|| "Unknown".into()),
-                        colors,
-                    );
-                });
-                ui.add_space(18.0);
+                            .unwrap_or_else(|| "Unknown".into());
+                        ui.columns(2, |columns| {
+                            stat(&mut columns[0], "File size", &size, colors);
+                            stat(&mut columns[1], "Format", &start.type_label, colors);
+                        });
+                    });
+                ui.add_space(16.0);
                 ui.label(RichText::new("Save to").size(11.0).color(colors.muted));
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -116,7 +135,7 @@ impl Desktop {
                     ui.add_space(12.0);
                     notice(ui, error, self.error_color());
                 }
-                ui.add_space(18.0);
+                ui.add_space(16.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -148,13 +167,15 @@ impl Desktop {
         if start_now {
             match self.destination.clone() {
                 Some(directory) => {
+                    self.error = None;
                     self.send(Command::Capture {
                         id: start.id,
                         directory,
                         track: start.track,
                     });
-                    self.capture_start = None;
-                    self.error = None;
+                    if self.error.is_none() {
+                        self.capture_start = None;
+                    }
                 }
                 None => self.error = Some("Choose a destination folder.".into()),
             }

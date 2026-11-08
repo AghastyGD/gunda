@@ -164,6 +164,9 @@ type CaptureDownloadStatus = {
   written: number;
   total: number | null;
   failure: string | null;
+  source?: string | null;
+  destination?: string | null;
+  output?: string | null;
 };
 
 type DownloadStatusResponse =
