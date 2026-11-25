@@ -292,13 +292,9 @@ impl CaptureServer {
                         } => self.catalog.get(*id).cloned(),
                         CaptureRequest::Formats { .. }
                         | CaptureRequest::Download { .. }
-                        | CaptureRequest::Status { .. } => self
-                            .catalog
-                            .candidates()
-                            .iter()
-                            .filter(|candidate| same_page(candidate.page_url(), page_url))
-                            .max_by_key(|candidate| page_candidate_score(candidate))
-                            .cloned(),
+                        | CaptureRequest::Status { .. } => {
+                            page_candidate(self.catalog.candidates(), page_url).cloned()
+                        }
                     };
                     match (candidate, request) {
                         (Some(candidate), CaptureRequest::Formats { reply, .. }) => {
@@ -718,6 +714,58 @@ async fn converse(
     }
 }
 
+/// Picks the capture a page lookup refers to.
+///
+/// Instagram and Facebook load posts before the user opens them, so a capture
+/// recorded on another page of the site still matches the post it describes.
+fn page_candidate<'a>(candidates: &'a [Candidate], page_url: &Url) -> Option<&'a Candidate> {
+    let media_key = page_media_key(page_url);
+    let same_media = |candidate: &Candidate| {
+        media_key.is_some() && candidate.media_key() == media_key.as_deref()
+    };
+
+    candidates
+        .iter()
+        .filter(|candidate| same_media(candidate) || same_page(candidate.page_url(), page_url))
+        .max_by_key(|candidate| (same_media(candidate), page_candidate_score(candidate)))
+}
+
+/// Names the post a social page shows, in the form the extractor records.
+fn page_media_key(url: &Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    let after = |names: &[&str]| {
+        segments
+            .windows(2)
+            .find(|pair| names.contains(&pair[0]))
+            .map(|pair| pair[1])
+    };
+
+    if host == "instagram.com" || host.ends_with(".instagram.com") {
+        return after(&["p", "reel", "reels", "tv"]).map(|code| format!("instagram:{code}"));
+    }
+
+    if host == "facebook.com" || host.ends_with(".facebook.com") {
+        let id = if segments.first() == Some(&"watch") {
+            url.query_pairs()
+                .find(|(name, _)| name == "v")
+                .map(|(_, value)| value.into_owned())
+        } else if segments.contains(&"videos") {
+            segments.last().map(|segment| (*segment).to_owned())
+        } else {
+            after(&["reel"]).map(str::to_owned)
+        };
+        return id
+            .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+            .map(|id| format!("facebook:{id}"));
+    }
+
+    None
+}
+
 fn same_page(left: &Url, right: &Url) -> bool {
     left.scheme() == right.scheme()
         && left.host_str() == right.host_str()
@@ -905,7 +953,12 @@ mod tests {
     use tokio::time::{Duration, timeout};
     use url::Url;
 
-    use super::{CaptureHandle, CaptureServer, DEFAULT_PATH};
+    use serde_json::json;
+
+    use super::{
+        CaptureHandle, CaptureServer, DEFAULT_PATH, page_candidate, page_media_key, source_reports,
+    };
+    use crate::candidate::Catalog;
     use crate::pairing::PairingToken;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION};
     use crate::test_client::TestClient;
@@ -916,6 +969,150 @@ mod tests {
         CaptureServer::bind(PairingToken::generate().expect("randomness is available"))
             .await
             .expect("the listener binds")
+    }
+
+    fn page(url: &str) -> Url {
+        Url::parse(url).expect("the test URL is valid")
+    }
+
+    fn record_source(catalog: &mut Catalog, page_url: &str, document: &serde_json::Value) {
+        for report in source_reports("https://example.com/api/graphql", page_url, None, document)
+            .expect("the source has media")
+        {
+            catalog.record(report);
+        }
+    }
+
+    #[test]
+    fn social_post_pages_name_their_media() {
+        for (url, key) in [
+            (
+                "https://www.instagram.com/p/ABC123/",
+                Some("instagram:ABC123"),
+            ),
+            (
+                "https://www.instagram.com/reels/ABC123/",
+                Some("instagram:ABC123"),
+            ),
+            (
+                "https://www.instagram.com/someone/reel/ABC123/",
+                Some("instagram:ABC123"),
+            ),
+            ("https://www.instagram.com/", None),
+            (
+                "https://www.facebook.com/watch/?v=4211",
+                Some("facebook:4211"),
+            ),
+            ("https://www.facebook.com/reel/4211", Some("facebook:4211")),
+            (
+                "https://www.facebook.com/someone/videos/4211/",
+                Some("facebook:4211"),
+            ),
+            ("https://www.facebook.com/someone", None),
+            ("https://example.com/p/ABC123/", None),
+        ] {
+            assert_eq!(page_media_key(&page(url)).as_deref(), key, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_post_opened_from_the_feed_finds_media_captured_on_the_feed() {
+        let mut catalog = Catalog::new(16);
+        record_source(
+            &mut catalog,
+            "https://www.instagram.com/",
+            &json!({ "items": [
+                { "code": "FIRST", "video_versions": [{ "url": "https://cdn.example/first.mp4" }] },
+                { "code": "SECOND", "video_versions": [{ "url": "https://cdn.example/second.mp4" }] }
+            ]}),
+        );
+
+        let found = page_candidate(
+            catalog.candidates(),
+            &page("https://www.instagram.com/reel/FIRST/"),
+        )
+        .expect("the post's capture is found");
+
+        assert_eq!(found.url().as_str(), "https://cdn.example/first.mp4");
+    }
+
+    #[test]
+    fn a_post_page_prefers_its_own_media_over_others_loaded_there() {
+        let mut catalog = Catalog::new(16);
+        record_source(
+            &mut catalog,
+            "https://www.instagram.com/reels/FIRST/",
+            &json!({ "items": [
+                { "code": "FIRST", "video_versions": [{ "url": "https://cdn.example/first.mp4" }] }
+            ]}),
+        );
+        record_source(
+            &mut catalog,
+            "https://www.instagram.com/reels/FIRST/",
+            &json!({ "items": [
+                { "code": "NEXT", "video_versions": [
+                    { "url": "https://cdn.example/next-low.mp4", "width": 320, "height": 568 },
+                    { "url": "https://cdn.example/next-high.mp4", "width": 720, "height": 1280 }
+                ]}
+            ]}),
+        );
+
+        let found = page_candidate(
+            catalog.candidates(),
+            &page("https://www.instagram.com/reels/FIRST/"),
+        )
+        .expect("the post's capture is found");
+
+        assert_eq!(found.url().as_str(), "https://cdn.example/first.mp4");
+    }
+
+    #[test]
+    fn a_facebook_reel_finds_its_own_video_among_preloaded_reels() {
+        let mut catalog = Catalog::new(16);
+        record_source(
+            &mut catalog,
+            "https://www.facebook.com/reel/41",
+            &json!({ "items": [
+                { "id": "41", "media": { "progressive_urls": [
+                    { "progressive_url": "https://cdn.example/41.mp4", "metadata": { "quality": "HD" } }
+                ]}},
+                { "id": "42", "media": { "progressive_urls": [
+                    { "progressive_url": "https://cdn.example/42.mp4", "metadata": { "quality": "HD" } }
+                ]}}
+            ]}),
+        );
+
+        for id in ["41", "42"] {
+            let found = page_candidate(
+                catalog.candidates(),
+                &page(&format!("https://www.facebook.com/reel/{id}")),
+            )
+            .expect("the reel's capture is found");
+
+            assert_eq!(
+                found.url().as_str(),
+                format!("https://cdn.example/{id}.mp4")
+            );
+            assert_eq!(found.variants().len(), 1);
+        }
+    }
+
+    #[test]
+    fn another_post_does_not_match_a_capture_from_a_different_page() {
+        let mut catalog = Catalog::new(16);
+        record_source(
+            &mut catalog,
+            "https://www.instagram.com/",
+            &json!({ "code": "FIRST", "video_versions": [{ "url": "https://cdn.example/first.mp4" }] }),
+        );
+
+        assert!(
+            page_candidate(
+                catalog.candidates(),
+                &page("https://www.instagram.com/p/OTHER/"),
+            )
+            .is_none()
+        );
     }
 
     /// Keeps a broken implementation from hanging the suite.

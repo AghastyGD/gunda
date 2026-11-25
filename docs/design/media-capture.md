@@ -98,11 +98,21 @@ daemon validates, deduplicates, and ranks the complete presentation. The
 YouTube page agent also reads the bounded initial player response exposed by
 the player.
 
-Instagram capture recognises GraphQL, media-info, route-definition, and
-`__a=1` response routes. Extracted records may carry `shortcode_media`,
-`carousel_media`, `video_versions`, `video_url`, caption metadata, and
-`video_dash_manifest`. Response recursion handles nested sidecars and media
-edges without assuming one fixed JSON path.
+Instagram capture recognises GraphQL, `api/v1`, route-definition, and `__a=1`
+response routes. Facebook capture recognises GraphQL and API routes. These
+endpoints answer with JavaScript or HTML content types, and Facebook streams
+deferred results as one JSON document per line, so known endpoints accept any
+textual body and parse each line. On both sites the page agent forwards only
+objects that own a media field (such as `video_versions`, `browser_native_hd_url`,
+or `hd_src`), with their scalar fields and caption. Inline DASH manifests
+(`video_dash_manifest`, `dash_manifest`) are XML, not URLs, and are ignored.
+
+Each Instagram or Facebook presentation records its post identifier (the
+Instagram shortcode or the numeric Facebook video id). A format lookup for a
+post page such as `/reel/CODE/` or `/watch/?v=ID` matches that identifier even
+when the media was captured on the feed, and prefers it over other media loaded
+on the same page. On a feed, the overlay sends the link of the post that
+contains the video, limited to the tab's origin.
 
 The page agent is registered as a `MAIN`-world content script at
 `document_start` on every HTTP page. It patches `fetch` and XHR before site
@@ -508,8 +518,10 @@ choice is a default, not a restriction; the picker still lists every variant.
 - Loopback is not a boundary, because every page in the browser can reach it. The
   pairing token and the extension-origin policy are what protect the channel, and
   a connection that fails either is closed without a reply.
-- The extension reports a URL, a content type, and a page title only: never
-  cookies, never request headers, never page content.
+- The current capture protocol reports URLs, content types, page titles, and
+  bounded source JSON. It does not send cookies or request headers. A proposed
+  runtime-only session design is in `docs/design/browser-session-capture.md`; it
+  is not implemented.
 
 ## 5. Roadmap
 

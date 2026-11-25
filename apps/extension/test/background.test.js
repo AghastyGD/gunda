@@ -343,6 +343,67 @@ test('a pending download survives a worker restart and is sent after pairing', a
   assert.equal(session.pending.length, 0);
 });
 
+test('a source report names the page that supplied it', async () => {
+  const { socket, send } = await connected();
+
+  await send(
+    {
+      kind: 'source',
+      source_url: 'https://www.instagram.com/api/graphql?query=reel',
+      document: {
+        data: {
+          media: {
+            video_versions: [
+              {
+                url: 'https://cdn.example.com/reel.mp4',
+                width: 1080,
+                height: 1920,
+              },
+            ],
+          },
+        },
+      },
+    },
+    {
+      tab: {
+        url: 'https://www.instagram.com/reel/example/',
+        title: 'A reel',
+      },
+    },
+  );
+  await settle();
+
+  const source = socket.sent
+    .map((entry) => JSON.parse(entry))
+    .find((entry) => entry.kind === 'source');
+  assert.ok(source);
+  assert.equal(
+    source.source_url,
+    'https://www.instagram.com/api/graphql?query=reel',
+  );
+  assert.equal(source.page_url, 'https://www.instagram.com/reel/example/');
+  assert.equal(source.page_title, 'A reel');
+  assert.equal(source.document.data.media.video_versions[0].width, 1080);
+});
+
+test('a format request uses the post page only on the tab origin', async () => {
+  const { socket, send } = await connected();
+  const tab = { tab: { url: 'https://www.instagram.com/', title: 'Instagram' } };
+
+  void send({ kind: 'list-formats', page_url: 'https://www.instagram.com/p/ABC123/' }, tab);
+  void send({ kind: 'list-formats', page_url: 'https://evil.example/p/ABC123/' }, tab);
+  await settle();
+
+  const pages = socket.sent
+    .map((entry) => JSON.parse(entry))
+    .filter((entry) => entry.kind === 'list_formats')
+    .map((entry) => entry.page_url);
+  assert.deepEqual(pages, [
+    'https://www.instagram.com/p/ABC123/',
+    'https://www.instagram.com/',
+  ]);
+});
+
 test('a browser download is counted and kept when the channel is unavailable', async () => {
   const { session, triggerDownload } = install();
 

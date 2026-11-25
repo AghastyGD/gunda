@@ -39,6 +39,7 @@ pub struct Report {
     page_title: Option<String>,
     filename: Option<String>,
     variants: Vec<MediaVariant>,
+    media_key: Option<String>,
 }
 
 impl Report {
@@ -84,6 +85,7 @@ impl Report {
             page_title,
             filename: None,
             variants: Vec::new(),
+            media_key: None,
         })
     }
 
@@ -109,15 +111,20 @@ impl Report {
         page_url: &Url,
         page_title: Option<&str>,
     ) -> Result<Self, Refusal> {
-        let title = presentation.title.as_deref().or(page_title);
+        let title = presentation
+            .title
+            .clone()
+            .or_else(|| page_title.and_then(site_page_title))
+            .or_else(|| presentation.media_key().and_then(media_title));
         let mut report = Self::new(
             presentation.url.as_str(),
             presentation.content_type.as_deref(),
             page_url.as_str(),
-            title,
+            title.as_deref(),
         )?;
 
         report.variants = presentation.variants;
+        report.media_key = presentation.media_key;
         report.size_bytes = report.variants.iter().filter_map(MediaVariant::size).max();
 
         Ok(report)
@@ -136,6 +143,7 @@ pub struct Candidate {
     page_title: Option<String>,
     filename: Option<String>,
     variants: Vec<MediaVariant>,
+    media_key: Option<String>,
     first_seen: Instant,
     last_seen: Instant,
     seen: u32,
@@ -189,6 +197,12 @@ impl Candidate {
     #[must_use]
     pub fn variants(&self) -> &[MediaVariant] {
         &self.variants
+    }
+
+    /// The site's identifier for the post this media belongs to.
+    #[must_use]
+    pub fn media_key(&self) -> Option<&str> {
+        self.media_key.as_deref()
     }
 
     /// The final path segment of the resource URL, still percent-encoded.
@@ -286,6 +300,9 @@ impl Catalog {
             if !report.variants.is_empty() {
                 existing.variants = report.variants;
             }
+            if report.media_key.is_some() {
+                existing.media_key = report.media_key;
+            }
 
             return Recorded {
                 id: existing.id,
@@ -308,6 +325,7 @@ impl Catalog {
                 page_title: report.page_title,
                 filename: report.filename,
                 variants: report.variants,
+                media_key: report.media_key,
                 first_seen: now,
                 last_seen: now,
                 seen: 1,
@@ -358,6 +376,43 @@ impl Catalog {
     pub fn clear(&mut self) {
         self.candidates.clear();
     }
+}
+
+/// Removes notification counts and site suffixes from a social tab title.
+///
+/// Returns `None` when only the site name remains, since it names no video.
+fn site_page_title(title: &str) -> Option<String> {
+    let mut title = title.trim();
+    if let Some(rest) = title.strip_prefix('(')
+        && let Some((count, rest)) = rest.split_once(')')
+        && !count.is_empty()
+        && count
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'+')
+    {
+        title = rest.trim_start();
+    }
+    for suffix in [" | Facebook", " • Instagram", " | Instagram"] {
+        if let Some(rest) = title.strip_suffix(suffix) {
+            title = rest.trim_end();
+        }
+    }
+
+    (!title.is_empty()
+        && !title.eq_ignore_ascii_case("facebook")
+        && !title.eq_ignore_ascii_case("instagram"))
+    .then(|| title.to_owned())
+}
+
+/// Names a social video by its site identifier when nothing better is known.
+fn media_title(media_key: &str) -> Option<String> {
+    let (site, id) = media_key.split_once(':')?;
+    let site = match site {
+        "facebook" => "Facebook",
+        "instagram" => "Instagram",
+        _ => return None,
+    };
+    Some(format!("{site} video {id}"))
 }
 
 /// What a reported resource turned out to be.
@@ -480,9 +535,54 @@ fn truncate(value: &str, bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use gunda_core::download::{DownloadOrigin, ResourceKind};
+    use serde_json::json;
+    use url::Url;
 
-    use super::{Catalog, DEFAULT_CAPACITY, Report};
+    use super::{Catalog, DEFAULT_CAPACITY, Report, site_page_title};
+    use crate::extractor::extract;
     use crate::protocol::Refusal;
+
+    fn facebook_report(page_title: Option<&str>) -> Report {
+        let page_url = Url::parse("https://www.facebook.com/reel/4211").expect("valid URL");
+        let source_url = Url::parse("https://www.facebook.com/api/graphql/").expect("valid URL");
+        let document = json!({
+            "id": "4211",
+            "browser_native_hd_url": "https://cdn.example/4211.mp4"
+        });
+        let presentation = extract(&page_url, &source_url, &document)
+            .expect("the reel is extracted")
+            .remove(0);
+
+        Report::from_extracted(presentation, &page_url, page_title).expect("the report is valid")
+    }
+
+    #[test]
+    fn social_tab_titles_lose_counts_and_site_names() {
+        assert_eq!(
+            site_page_title("(3) A cat video | Facebook").as_deref(),
+            Some("A cat video")
+        );
+        assert_eq!(site_page_title("(12) Facebook"), None);
+        assert_eq!(site_page_title("Instagram"), None);
+        assert_eq!(
+            site_page_title("Quarterly report").as_deref(),
+            Some("Quarterly report")
+        );
+    }
+
+    #[test]
+    fn a_facebook_video_without_text_is_named_by_its_id() {
+        let report = facebook_report(Some("(3) Facebook"));
+
+        assert_eq!(report.page_title.as_deref(), Some("Facebook video 4211"));
+    }
+
+    #[test]
+    fn a_facebook_video_uses_a_useful_tab_title() {
+        let report = facebook_report(Some("(3) A cat video | Facebook"));
+
+        assert_eq!(report.page_title.as_deref(), Some("A cat video"));
+    }
 
     fn report(url: &str) -> Report {
         Report::new(url, None, "https://example.com/watch", None).expect("the report is valid")

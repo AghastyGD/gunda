@@ -41,7 +41,7 @@ type RuntimeMessage =
     }
   | { kind: 'reconnect' }
   | { kind: 'forget' }
-  | { kind: 'list-formats' }
+  | { kind: 'list-formats'; page_url?: string }
   | { kind: 'download-status'; id: number }
   | {
       kind: 'open-download';

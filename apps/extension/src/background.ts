@@ -388,9 +388,12 @@ function reportCandidate(candidate: CandidateReport): void {
   enqueue(message);
 }
 
-function reportSource(
-  source: { source_url: string; document: unknown },
-): void {
+function reportSource(source: {
+  source_url: string;
+  page_url: string;
+  page_title: string | null;
+  document: unknown;
+}): void {
   const message = JSON.stringify({ kind: 'source', ...source });
   if (new TextEncoder().encode(message).byteLength > MAX_SOURCE_MESSAGE_BYTES) {
     void count('source_too_large');
@@ -443,6 +446,20 @@ async function waitForCaptureConnection(): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return true;
+}
+
+// A content script may name the post a video belongs to, but only on the
+// tab's own origin, so a page cannot steer lookups to another site.
+function formatPage(tabUrl: string, hint: unknown): string {
+  if (typeof hint !== 'string') {
+    return tabUrl;
+  }
+  try {
+    const page = new URL(hint);
+    return page.origin === new URL(tabUrl).origin ? page.href : tabUrl;
+  } catch {
+    return tabUrl;
+  }
 }
 
 async function requestPageFormats(pageUrl: string): Promise<FormatResponse> {
@@ -1452,7 +1469,7 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
     if (!sender.tab?.url || !/^https?:/i.test(sender.tab.url)) {
       return;
     }
-    void requestPageFormats(sender.tab.url).then(sendResponse);
+    void requestPageFormats(formatPage(sender.tab.url, message.page_url)).then(sendResponse);
     return true;
   }
 
@@ -1503,6 +1520,8 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
   if (message.kind === 'source') {
     reportSource({
       source_url: message.source_url,
+      page_url: sender.tab.url,
+      page_title: sender.tab.title ?? null,
       document: message.document,
     });
     return;

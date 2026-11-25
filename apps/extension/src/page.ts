@@ -1,10 +1,33 @@
 const MAX_BODY_BYTES = 1536 * 1024;
+const MAX_SOCIAL_BODY_BYTES = 12 * 1024 * 1024;
+const MAX_SOCIAL_NODES = 500_000;
+const MAX_SOCIAL_ITEMS = 64;
+const MAX_SOCIAL_SCALAR_CHARS = 4096;
 const YOUTUBE_POLL_MS = 500;
 const YOUTUBE_POLL_LIMIT = 30;
 const MEDIA_FILE_PATH =
   /\.(mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|mp3|m4a|aac|ogg|oga|opus|flac|wav)$/i;
 const MEDIA_SOURCE_HINT =
-  /video(?:_versions|_url|Url)|playable_url|playableUrl|browser_native_\w+_url|progressive_urls|hlsManifestUrl|dashManifestUrl|manifest_url|stream_url|playback_url|contentUrl|\.(?:mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|m3u8|mpd|mp3|m4a|aac|ogg|oga|opus|flac|wav)(?:["'\\?])/i;
+  /video(?:_versions|_url|Url)|playable_url|playableUrl|browser_native_\w+_url|progressive_urls|hlsManifestUrl|dashManifestUrl|manifest_url|stream_url|playback_url|contentUrl|hd_src|sd_src|\.(?:mp4|m4v|webm|mkv|mov|flv|avi|wmv|mpeg|mpg|3gp|ogv|m3u8|mpd|mp3|m4a|aac|ogg|oga|opus|flac|wav)(?:["'\\?])/i;
+// Fields that carry media URLs on Instagram and Facebook. Objects owning one are
+// the only part of those sites' page data that leaves the page.
+const SOCIAL_MEDIA_FIELDS = new Set([
+  'video_versions',
+  'video_resources',
+  'video_url',
+  'browser_native_hd_url',
+  'browser_native_sd_url',
+  'playable_url',
+  'playable_url_quality_hd',
+  'hd_src',
+  'sd_src',
+  'progressive_urls',
+  'playback_url',
+]);
+const SOCIAL_CONTEXT_FIELDS = new Set(['caption', 'edge_media_to_caption', 'title']);
+const SOCIAL_ID_FIELDS = ['code', 'shortcode', 'pk', 'video_id', 'videoId', 'id'];
+const FACEBOOK_TEXT_FIELDS = ['title', 'message', 'savable_description'];
+const MAX_SOCIAL_TITLE_CHARS = 200;
 
 if (!window.__gundaPageAgent) {
   window.__gundaPageAgent = true;
@@ -21,7 +44,7 @@ function installPageAgent(): void {
       const parsed = new URL(url, location.href);
       const host = parsed.hostname.toLowerCase();
       if (site(host, 'instagram.com')) {
-        return /graphql|api\/v1\/media\/[^/]+\/info|ajax\/route-definition|__a=1/i.test(
+        return /graphql|api\/v1\/|ajax\/route-definition|__a=1/i.test(
           parsed.pathname + parsed.search,
         );
       }
@@ -35,6 +58,128 @@ function installPageAgent(): void {
       return false;
     }
     return false;
+  }
+
+  function socialPage(): boolean {
+    const host = location.hostname.toLowerCase();
+    return site(host, 'instagram.com') || site(host, 'facebook.com');
+  }
+
+  function bodyLimit(): number {
+    return socialPage() ? MAX_SOCIAL_BODY_BYTES : MAX_BODY_BYTES;
+  }
+
+  // Instagram answers its API with text/javascript and Facebook with text/html,
+  // so known endpoints accept any textual body and let JSON parsing decide.
+  function textual(type: string, knownSource: boolean): boolean {
+    if (/json|text\/plain/i.test(type)) {
+      return true;
+    }
+    return knownSource && (type === '' || /javascript|text\/html/i.test(type));
+  }
+
+  function socialIds(object: Record<string, unknown>): Record<string, unknown> | null {
+    const ids: Record<string, unknown> = {};
+    for (const name of SOCIAL_ID_FIELDS) {
+      const field = object[name];
+      if (
+        (typeof field === 'string' && field.length > 0 && field.length <= 64) ||
+        typeof field === 'number'
+      ) {
+        ids[name] = field;
+      }
+    }
+    return Object.keys(ids).length > 0 ? ids : null;
+  }
+
+  // Facebook keeps a post's text beside or above the video, not inside it.
+  function facebookText(object: Record<string, unknown>): string | null {
+    if (!site(location.hostname.toLowerCase(), 'facebook.com')) {
+      return null;
+    }
+    for (const name of FACEBOOK_TEXT_FIELDS) {
+      const field = object[name];
+      const text =
+        typeof field === 'string'
+          ? field
+          : field && typeof field === 'object'
+            ? (field as { text?: unknown }).text
+            : null;
+      if (typeof text === 'string' && text.trim()) {
+        return text.trim().slice(0, MAX_SOCIAL_TITLE_CHARS);
+      }
+    }
+    return null;
+  }
+
+  // Keeps only objects that own a media field, with their scalar fields and
+  // caption, so private page data on social sites never leaves the page. Media
+  // nested below its post keeps the nearest enclosing identifiers and text.
+  function socialMedia(value: unknown): unknown {
+    type Context = { ids: Record<string, unknown> | null; title: string | null };
+    const items: Record<string, unknown>[] = [];
+    const pending: [unknown, Context][] = [[value, { ids: null, title: null }]];
+    let nodes = 0;
+
+    while (pending.length > 0 && nodes < MAX_SOCIAL_NODES && items.length < MAX_SOCIAL_ITEMS) {
+      const entry = pending.pop();
+      if (!entry) {
+        break;
+      }
+      const [current, parent] = entry;
+      nodes += 1;
+      if (Array.isArray(current)) {
+        for (const item of current) {
+          pending.push([item, parent]);
+        }
+        continue;
+      }
+      if (!current || typeof current !== 'object') {
+        continue;
+      }
+      const object = current as Record<string, unknown>;
+      const entries = Object.entries(object);
+      const ownIds = socialIds(object);
+      const context: Context = {
+        ids: ownIds ?? parent.ids,
+        title: facebookText(object) ?? parent.title,
+      };
+      if (entries.some(([name]) => SOCIAL_MEDIA_FIELDS.has(name))) {
+        const item: Record<string, unknown> = {};
+        for (const [name, field] of entries) {
+          if (SOCIAL_MEDIA_FIELDS.has(name) || SOCIAL_CONTEXT_FIELDS.has(name)) {
+            item[name] = field;
+          } else if (
+            typeof field === 'number' ||
+            typeof field === 'boolean' ||
+            (typeof field === 'string' && field.length <= MAX_SOCIAL_SCALAR_CHARS)
+          ) {
+            item[name] = field;
+          }
+        }
+        const wrap = (!ownIds && parent.ids !== null) || context.title !== null;
+        items.push(
+          wrap
+            ? {
+                ...context.ids,
+                ...(context.title ? { title: context.title } : {}),
+                media: item,
+              }
+            : item,
+        );
+      }
+      for (const [, field] of entries) {
+        if (field && typeof field === 'object') {
+          pending.push([field, context]);
+        }
+      }
+    }
+
+    return items.length > 0 ? { items } : null;
+  }
+
+  function sourceDocument(value: unknown): unknown {
+    return socialPage() ? socialMedia(value) : value;
   }
 
   function reportSource(sourceUrl: string, document: unknown): void {
@@ -97,15 +242,12 @@ function installPageAgent(): void {
       const text = script.textContent;
       if (
         !text ||
-        text.length > MAX_BODY_BYTES ||
+        text.length > bodyLimit() ||
         !(type === 'application/json' || type === 'application/ld+json')
       ) {
         continue;
       }
-      const value = jsonBody(text);
-      if (value !== null) {
-        reportSource(location.href, value);
-      }
+      reportDocument(location.href, text);
     }
   }
 
@@ -138,15 +280,15 @@ function installPageAgent(): void {
     }
   });
 
-  async function boundedText(response: Response): Promise<string | null> {
+  async function boundedText(response: Response, limit: number): Promise<string | null> {
     const length = Number(response.headers.get('content-length'));
-    if (Number.isFinite(length) && length > MAX_BODY_BYTES) {
+    if (Number.isFinite(length) && length > limit) {
       return null;
     }
 
     if (!response.body) {
       const text = await response.text();
-      return new TextEncoder().encode(text).byteLength > MAX_BODY_BYTES ? null : text;
+      return new TextEncoder().encode(text).byteLength > limit ? null : text;
     }
 
     const reader = response.body.getReader();
@@ -160,7 +302,7 @@ function installPageAgent(): void {
         break;
       }
       bytes += value.byteLength;
-      if (bytes > MAX_BODY_BYTES) {
+      if (bytes > limit) {
         await reader.cancel();
         return null;
       }
@@ -170,37 +312,62 @@ function installPageAgent(): void {
     return text + decoder.decode();
   }
 
-  function jsonBody(text: string): unknown {
-    const clean = text
+  function withoutGuard(text: string): string {
+    return text
       .trim()
       .replace(/^\)\]\}',?\s*/, '')
       .replace(/^for\s*\(;;\);/, '');
+  }
+
+  // Facebook streams deferred GraphQL results as one JSON document per line.
+  function jsonBody(text: string): unknown {
+    const clean = withoutGuard(text);
     try {
       return JSON.parse(clean) as unknown;
     } catch {
-      return null;
+      const values: unknown[] = [];
+      for (const line of clean.split(/\r?\n/)) {
+        const part = withoutGuard(line);
+        if (!part) {
+          continue;
+        }
+        try {
+          values.push(JSON.parse(part) as unknown);
+        } catch {
+          continue;
+        }
+      }
+      return values.length > 0 ? values : null;
+    }
+  }
+
+  function reportDocument(sourceUrl: string, text: string): void {
+    const value = jsonBody(text);
+    if (value === null) {
+      return;
+    }
+    const document = sourceDocument(value);
+    if (document !== null) {
+      reportSource(sourceUrl, document);
     }
   }
 
   async function capture(url: string, response: Response): Promise<void> {
     const knownSource = target(url);
     const type = response.headers.get('content-type') ?? '';
-    if (!/json|text\/plain/i.test(type)) {
+    if (!textual(type, knownSource)) {
       return;
     }
 
     try {
-      const text = await boundedText(response);
+      const text = await boundedText(response, knownSource ? bodyLimit() : MAX_BODY_BYTES);
       if (!text) {
         return;
       }
       if (!knownSource && !MEDIA_SOURCE_HINT.test(text)) {
         return;
       }
-      const value = jsonBody(text);
-      if (value !== null) {
-        reportSource(url, value);
-      }
+      reportDocument(url, text);
     } catch {
       return;
     }
@@ -235,7 +402,7 @@ function installPageAgent(): void {
       () => {
         const type = this.getResponseHeader('content-type') ?? '';
         const requestUrl = this.__gundaUrl ?? '';
-        if (!/json|text\/plain/i.test(type) || !target(requestUrl)) {
+        if (!target(requestUrl) || !textual(type, true)) {
           return;
         }
         try {
@@ -245,13 +412,10 @@ function installPageAgent(): void {
               : this.responseType === 'json'
                 ? JSON.stringify(this.response)
                 : null;
-          if (!text || text.length > MAX_BODY_BYTES) {
+          if (!text || text.length > bodyLimit()) {
             return;
           }
-          const value = jsonBody(text);
-          if (value !== null) {
-            reportSource(new URL(requestUrl, location.href).href, value);
-          }
+          reportDocument(new URL(requestUrl, location.href).href, text);
         } catch {
           return;
         }

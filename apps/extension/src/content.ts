@@ -1,4 +1,6 @@
 const MEDIA_SELECTOR = 'video, audio, source';
+const INSTAGRAM_MEDIA_PATH = /^\/(?:[^/]+\/)?(?:p|reels?|tv)\/[\w-]+\/?$/;
+const FACEBOOK_MEDIA_PATH = /^\/(?:reel\/\d+|(?:[^/]+\/)?videos\/(?:[^/]+\/)?\d+|watch)\/?$/;
 const OVERLAY_LABEL = 'Download';
 const DOWNLOAD_ICON =
   '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v6.5m0 0 2.75-2.75M8 9 5.25 6.25M3 12.25h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -319,7 +321,54 @@ function formatOption(
   return option;
 }
 
+function onSite(domain: string): boolean {
+  const host = location.hostname.toLowerCase();
+  return host === domain || host.endsWith(`.${domain}`);
+}
+
+function mediaPageUrl(href: string): string | null {
+  try {
+    const url = new URL(href, location.href);
+    if (url.origin !== location.origin) {
+      return null;
+    }
+    if (onSite('instagram.com') && INSTAGRAM_MEDIA_PATH.test(url.pathname)) {
+      return url.href;
+    }
+    if (
+      onSite('facebook.com') &&
+      FACEBOOK_MEDIA_PATH.test(url.pathname) &&
+      (url.pathname.replace(/\/$/, '') !== '/watch' || url.searchParams.has('v'))
+    ) {
+      return url.href;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+// Feeds show many videos on one page URL, so the post's own link tells Gunda
+// which captured video the button belongs to.
+function mediaPage(video: HTMLVideoElement): string | null {
+  if (!onSite('instagram.com') && !onSite('facebook.com')) {
+    return null;
+  }
+  const post = video.closest('article, [role="article"]');
+  if (!post) {
+    return null;
+  }
+  for (const link of post.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+    const page = mediaPageUrl(link.href);
+    if (page) {
+      return page;
+    }
+  }
+  return null;
+}
+
 async function openFormats(
+  video: HTMLVideoElement,
   button: HTMLButtonElement,
   panel: HTMLElement,
 ): Promise<void> {
@@ -339,9 +388,10 @@ async function openFormats(
   );
   await new Promise((resolve) => setTimeout(resolve, 1500));
 
-  const response = await sendRuntimeMessage<FormatResponse>({
-    kind: 'list-formats',
-  });
+  const page = mediaPage(video);
+  const response = await sendRuntimeMessage<FormatResponse>(
+    page ? { kind: 'list-formats', page_url: page } : { kind: 'list-formats' },
+  );
   if (response) {
     if (response?.kind === 'formats' && response.formats.length > 0) {
       showFormats(
@@ -391,7 +441,7 @@ function addOverlay(video: HTMLVideoElement): void {
   button.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
-    void openFormats(button, panel);
+    void openFormats(video, button, panel);
   });
 
   const controls = document.createElement('div');

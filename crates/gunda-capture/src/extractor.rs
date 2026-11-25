@@ -5,6 +5,7 @@
 //! daemon so browser-side code cannot inject unvalidated downloads.
 
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use serde_json::{Map, Value};
 use url::Url;
@@ -28,6 +29,9 @@ const MAX_URL_BYTES: usize = 8 * 1024;
 
 /// Largest title retained for one presentation.
 const MAX_TITLE_CHARS: usize = 200;
+
+/// Largest site media identifier retained for one presentation.
+const MAX_MEDIA_ID_BYTES: usize = 64;
 
 /// One directly downloadable quality of a presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,6 +103,7 @@ pub struct ExtractedPresentation {
     pub(crate) content_type: Option<String>,
     pub(crate) title: Option<String>,
     pub(crate) variants: Vec<MediaVariant>,
+    pub(crate) media_key: Option<String>,
 }
 
 impl ExtractedPresentation {
@@ -115,6 +120,12 @@ impl ExtractedPresentation {
     #[must_use]
     pub fn variants(&self) -> &[MediaVariant] {
         &self.variants
+    }
+
+    /// The site's identifier for the post this media belongs to.
+    #[must_use]
+    pub fn media_key(&self) -> Option<&str> {
+        self.media_key.as_deref()
     }
 }
 
@@ -162,11 +173,19 @@ impl Platform {
     }
 }
 
+/// What the nearest enclosing objects say about the post being visited.
+#[derive(Debug, Clone, Default)]
+struct Context {
+    media_key: Option<Rc<str>>,
+    title: Option<Rc<str>>,
+}
+
 struct Collector<'a> {
     platform: Platform,
     source_url: &'a Url,
     presentations: BTreeMap<String, PresentationBuilder>,
-    fallback_variants: Vec<MediaVariant>,
+    fallback_variants: Vec<(Context, MediaVariant)>,
+    context: Context,
     nodes: usize,
 }
 
@@ -177,14 +196,15 @@ impl<'a> Collector<'a> {
             source_url,
             presentations: BTreeMap::new(),
             fallback_variants: Vec::new(),
+            context: Context::default(),
             nodes: 0,
         }
     }
 
     fn visit(&mut self, document: &Value) {
-        let mut pending = vec![(document, 0_usize)];
+        let mut pending = vec![(document, 0_usize, Context::default())];
 
-        while let Some((value, depth)) = pending.pop() {
+        while let Some((value, depth, context)) = pending.pop() {
             if self.nodes >= MAX_NODES
                 || self.presentations.len() >= MAX_PRESENTATIONS
                 || depth > MAX_DEPTH
@@ -197,16 +217,27 @@ impl<'a> Collector<'a> {
             match value {
                 Value::Array(items) => {
                     if depth < MAX_DEPTH {
-                        pending.extend(items.iter().map(|item| (item, depth + 1)));
+                        pending.extend(items.iter().map(|item| (item, depth + 1, context.clone())));
                     }
                 }
                 Value::Object(object) => {
+                    self.context = context;
                     self.consider(object);
                     if depth < MAX_DEPTH {
+                        let inner = Context {
+                            media_key: self
+                                .media_key(object)
+                                .map(Rc::from)
+                                .or_else(|| self.context.media_key.clone()),
+                            title: self
+                                .post_title(object)
+                                .map(Rc::from)
+                                .or_else(|| self.context.title.clone()),
+                        };
                         pending.extend(
                             object
                                 .values()
-                                .map(|child| (child, depth.saturating_add(1))),
+                                .map(|child| (child, depth.saturating_add(1), inner.clone())),
                         );
                     }
                 }
@@ -216,9 +247,9 @@ impl<'a> Collector<'a> {
                         && !self
                             .fallback_variants
                             .iter()
-                            .any(|existing| existing.url == variant.url)
+                            .any(|(_, existing)| existing.url == variant.url)
                     {
-                        self.fallback_variants.push(variant);
+                        self.fallback_variants.push((context, variant));
                     }
                 }
                 _ => {}
@@ -270,7 +301,6 @@ impl<'a> Collector<'a> {
             Some("video/mp4"),
             object,
         );
-
         if !variants.is_empty() {
             self.add_presentation(object, variants, None, instagram_title(object));
         }
@@ -279,49 +309,48 @@ impl<'a> Collector<'a> {
     fn consider_facebook(&mut self, object: &Map<String, Value>) {
         let mut variants = Vec::new();
 
-        add_labeled_variant(
-            &mut variants,
-            object.get("browser_native_hd_url"),
-            Some("video/mp4"),
-            object,
-            "HD",
-            2,
-        );
-        add_labeled_variant(
-            &mut variants,
-            object.get("playable_url_quality_hd"),
-            Some("video/mp4"),
-            object,
-            "HD",
-            2,
-        );
-        add_labeled_variant(
-            &mut variants,
-            object.get("browser_native_sd_url"),
-            Some("video/mp4"),
-            object,
-            "SD",
-            1,
-        );
-        add_labeled_variant(
-            &mut variants,
-            object.get("playable_url"),
-            Some("video/mp4"),
-            object,
-            "SD",
-            1,
-        );
+        for (name, label, rank) in [
+            ("browser_native_hd_url", "HD", 2),
+            ("playable_url_quality_hd", "HD", 2),
+            ("hd_src", "HD", 2),
+            ("browser_native_sd_url", "SD", 1),
+            ("playable_url", "SD", 1),
+            ("sd_src", "SD", 1),
+        ] {
+            add_labeled_variant(
+                &mut variants,
+                object.get(name),
+                Some("video/mp4"),
+                object,
+                label,
+                rank,
+            );
+        }
 
         if let Some(progressive) = object.get("progressive_urls").and_then(Value::as_array) {
-            for item in progressive {
-                if let Some(item) = item.as_object() {
-                    add_variant(&mut variants, item.get("url"), Some("video/mp4"), item);
+            for item in progressive.iter().filter_map(Value::as_object) {
+                let url = item.get("progressive_url").or_else(|| item.get("url"));
+                let quality = item
+                    .get("metadata")
+                    .and_then(Value::as_object)
+                    .and_then(|metadata| metadata.get("quality"))
+                    .and_then(Value::as_str);
+                match quality {
+                    Some(quality) if quality.eq_ignore_ascii_case("hd") => {
+                        add_labeled_variant(&mut variants, url, Some("video/mp4"), item, "HD", 2);
+                    }
+                    Some(quality) if quality.eq_ignore_ascii_case("sd") => {
+                        add_labeled_variant(&mut variants, url, Some("video/mp4"), item, "SD", 1);
+                    }
+                    _ => add_variant(&mut variants, url, Some("video/mp4"), item),
                 }
             }
         }
 
         if !variants.is_empty() {
-            self.add_presentation(object, variants, None, None);
+            let title =
+                facebook_title(object).or_else(|| self.context.title.as_deref().map(str::to_owned));
+            self.add_presentation(object, variants, None, title);
         }
     }
 
@@ -438,7 +467,20 @@ impl<'a> Collector<'a> {
         manifest: Option<MediaVariant>,
         title: Option<String>,
     ) {
-        let key = presentation_key(object, self.source_url, &variants)
+        // A post's media is often split across nested objects that carry no
+        // identifier of their own, so they group under the enclosing post.
+        let own_key = self.media_key(object);
+        let media_key = own_key
+            .clone()
+            .or_else(|| self.context.media_key.as_deref().map(str::to_owned));
+        let key = own_key
+            .or_else(|| presentation_key(object))
+            .or_else(|| media_key.clone())
+            .or_else(|| {
+                variants
+                    .first()
+                    .map(|variant| variant.url.as_str().to_owned())
+            })
             .or_else(|| manifest.as_ref().map(|item| item.url.as_str().to_owned()))
             .unwrap_or_else(|| self.source_url.as_str().to_owned());
 
@@ -446,6 +488,9 @@ impl<'a> Collector<'a> {
 
         if builder.title.is_none() {
             builder.title = title;
+        }
+        if builder.media_key.is_none() {
+            builder.media_key = media_key;
         }
         if builder.manifest.is_none() {
             builder.manifest = manifest;
@@ -455,19 +500,62 @@ impl<'a> Collector<'a> {
         }
     }
 
+    /// Names the post an object describes, in the form page lookups use.
+    fn media_key(&self, object: &Map<String, Value>) -> Option<String> {
+        let (site, names, valid): (&str, &[&str], fn(&str) -> bool) = match self.platform {
+            Platform::Instagram => ("instagram", &["code", "shortcode"], |id| {
+                id.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            }),
+            Platform::Facebook => ("facebook", &["video_id", "videoId", "id"], |id| {
+                id.bytes().all(|byte| byte.is_ascii_digit())
+            }),
+            Platform::YouTube | Platform::Generic => return None,
+        };
+
+        names
+            .iter()
+            .filter_map(|name| object.get(*name).and_then(scalar_string))
+            .find(|id| !id.is_empty() && id.len() <= MAX_MEDIA_ID_BYTES && valid(id))
+            .map(|id| format!("{site}:{id}"))
+    }
+
+    /// Text that names a post on sites where media sits below its post.
+    fn post_title(&self, object: &Map<String, Value>) -> Option<String> {
+        match self.platform {
+            Platform::Facebook => facebook_title(object),
+            Platform::Instagram | Platform::YouTube | Platform::Generic => None,
+        }
+    }
+
     fn finish(self) -> Result<Vec<ExtractedPresentation>, Refusal> {
-        if self.presentations.is_empty() && !self.fallback_variants.is_empty() {
-            let mut builder = PresentationBuilder::default();
-            for variant in self.fallback_variants {
+        let social = matches!(self.platform, Platform::Instagram | Platform::Facebook);
+        let mut presentations = self.presentations;
+
+        // Loose media URLs from different posts must not become qualities of
+        // one presentation, so social sites group them by post or keep them apart.
+        if presentations.is_empty() {
+            for (context, variant) in self.fallback_variants {
+                let key = match (&context.media_key, social) {
+                    (Some(media_key), _) => media_key.to_string(),
+                    (None, true) => variant.url.as_str().to_owned(),
+                    (None, false) => String::new(),
+                };
+                if !presentations.contains_key(&key) && presentations.len() >= MAX_PRESENTATIONS {
+                    continue;
+                }
+                let builder = presentations.entry(key).or_default();
+                if builder.media_key.is_none() {
+                    builder.media_key = context.media_key.as_deref().map(str::to_owned);
+                }
+                if builder.title.is_none() {
+                    builder.title = context.title.as_deref().map(str::to_owned);
+                }
                 builder.add_variant(variant);
-            }
-            if let Some(presentation) = builder.finish() {
-                return Ok(vec![presentation]);
             }
         }
 
-        let mut presentations = self
-            .presentations
+        let mut presentations = presentations
             .into_values()
             .filter_map(PresentationBuilder::finish)
             .collect::<Vec<_>>();
@@ -493,6 +581,7 @@ struct PresentationBuilder {
     variants: Vec<MediaVariant>,
     manifest: Option<MediaVariant>,
     title: Option<String>,
+    media_key: Option<String>,
 }
 
 impl PresentationBuilder {
@@ -520,6 +609,7 @@ impl PresentationBuilder {
                 content_type: manifest.content_type,
                 title: self.title,
                 variants: self.variants,
+                media_key: self.media_key,
             });
         }
 
@@ -537,6 +627,7 @@ impl PresentationBuilder {
             content_type: best.content_type,
             title: self.title,
             variants: self.variants,
+            media_key: self.media_key,
         })
     }
 }
@@ -659,11 +750,7 @@ fn media_path(url: Option<&Url>) -> bool {
         })
 }
 
-fn presentation_key(
-    object: &Map<String, Value>,
-    source_url: &Url,
-    variants: &[MediaVariant],
-) -> Option<String> {
+fn presentation_key(object: &Map<String, Value>) -> Option<String> {
     for name in [
         "pk",
         "video_id",
@@ -686,10 +773,7 @@ fn presentation_key(
         return Some(format!("videoId:{id}"));
     }
 
-    variants
-        .first()
-        .map(|variant| variant.url.as_str().to_owned())
-        .or_else(|| Some(source_url.as_str().to_owned()))
+    None
 }
 
 fn instagram_title(object: &Map<String, Value>) -> Option<String> {
@@ -815,13 +899,31 @@ fn variant_area(variant: &MediaVariant) -> u64 {
         .map_or(0, |(width, height)| u64::from(width) * u64::from(height))
 }
 
+/// Reads the text Facebook shows with a post or video.
+fn facebook_title(object: &Map<String, Value>) -> Option<String> {
+    ["title", "message", "savable_description"]
+        .iter()
+        .filter_map(|name| object.get(*name))
+        .filter_map(|value| {
+            value
+                .as_str()
+                .or_else(|| value.as_object()?.get("text")?.as_str())
+        })
+        .map(clean_title)
+        .find(|title| !title.is_empty())
+}
+
+/// Joins words split by line breaks or other control characters.
 fn clean_title(title: &str) -> String {
     title
+        .split(|character: char| character.is_whitespace() || character.is_control())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
         .chars()
-        .filter(|character| !character.is_control())
         .take(MAX_TITLE_CHARS)
         .collect::<String>()
-        .trim()
+        .trim_end()
         .to_owned()
 }
 
@@ -890,6 +992,223 @@ mod tests {
         assert_eq!(presentations.len(), 1);
         assert_eq!(presentations[0].variants().len(), 2);
         assert_eq!(presentations[0].variants()[0].label(), "HD");
+    }
+
+    #[test]
+    fn extracts_facebook_player_sources_with_hd_first() {
+        let document = json!({
+            "video": {
+                "video_id": "8",
+                "hd_src": "https://cdn.example/hd.mp4",
+                "sd_src": "https://cdn.example/sd.mp4"
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.facebook.com/reel/8/"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("Facebook player sources are extracted");
+
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(
+            presentations[0].url().as_str(),
+            "https://cdn.example/hd.mp4"
+        );
+        assert_eq!(presentations[0].variants().len(), 2);
+        assert_eq!(presentations[0].variants()[0].label(), "HD");
+    }
+
+    #[test]
+    fn an_instagram_presentation_names_its_post() {
+        let document = json!({
+            "media": {
+                "pk": "media-8",
+                "code": "ABC_12-x",
+                "video_versions": [{ "url": "https://cdn.example/reel.mp4" }],
+                "video_dash_manifest": "<?xml version=\"1.0\"?><MPD></MPD>"
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.instagram.com/"),
+            &page("https://www.instagram.com/api/graphql"),
+            &document,
+        )
+        .expect("Instagram media is extracted");
+
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(presentations[0].media_key(), Some("instagram:ABC_12-x"));
+        assert_eq!(presentations[0].variants().len(), 1);
+    }
+
+    #[test]
+    fn a_facebook_presentation_names_its_video_but_not_a_text_id() {
+        let document = json!([
+            { "id": "4211", "browser_native_hd_url": "https://cdn.example/a.mp4" },
+            { "id": "VXNlcjox", "playable_url": "https://cdn.example/b.mp4" }
+        ]);
+
+        let mut keys = extract(
+            &page("https://www.facebook.com/"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("Facebook media is extracted")
+        .iter()
+        .map(|presentation| presentation.media_key().map(str::to_owned))
+        .collect::<Vec<_>>();
+        keys.sort();
+
+        assert_eq!(keys, [None, Some(String::from("facebook:4211"))]);
+    }
+
+    #[test]
+    fn facebook_reels_stay_separate_and_keep_their_video_ids() {
+        let reel = |id: &str| {
+            json!({
+                "id": id,
+                "videoDeliveryLegacyFields": {
+                    "browser_native_sd_url": format!("https://cdn.example/{id}-sd.mp4")
+                },
+                "videoDeliveryResponseFragment": {
+                    "videoDeliveryResponseResult": {
+                        "progressive_urls": [
+                            {
+                                "progressive_url": format!("https://cdn.example/{id}-hd.mp4"),
+                                "metadata": { "quality": "HD" }
+                            },
+                            {
+                                "progressive_url": format!("https://cdn.example/{id}-sd.mp4"),
+                                "metadata": { "quality": "SD" }
+                            }
+                        ]
+                    }
+                }
+            })
+        };
+        let document = json!({ "data": { "reels": [reel("41"), reel("42")] } });
+
+        let presentations = extract(
+            &page("https://www.facebook.com/reel/41"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("Facebook reels are extracted");
+
+        assert_eq!(presentations.len(), 2);
+        for presentation in &presentations {
+            let id = presentation
+                .media_key()
+                .and_then(|key| key.strip_prefix("facebook:"))
+                .expect("each reel names its video");
+            assert_eq!(
+                presentation.url().as_str(),
+                format!("https://cdn.example/{id}-hd.mp4")
+            );
+            let mut labels = presentation
+                .variants()
+                .iter()
+                .map(MediaVariant::label)
+                .collect::<Vec<_>>();
+            labels.sort();
+            assert_eq!(labels, ["HD", "SD"]);
+        }
+    }
+
+    #[test]
+    fn a_facebook_reel_takes_its_title_from_the_enclosing_post() {
+        let document = json!({
+            "story": {
+                "message": { "text": "A cat that\nlikes boxes" },
+                "attachments": [{
+                    "media": {
+                        "id": "4211",
+                        "videoDeliveryLegacyFields": {
+                            "browser_native_hd_url": "https://cdn.example/4211-hd.mp4"
+                        }
+                    }
+                }]
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.facebook.com/reel/4211"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("the reel is extracted");
+
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(presentations[0].title(), Some("A cat that likes boxes"));
+        assert_eq!(presentations[0].media_key(), Some("facebook:4211"));
+    }
+
+    #[test]
+    fn loose_facebook_media_urls_from_different_videos_are_not_merged() {
+        let document = json!([
+            { "id": "41", "node": { "attachment": "https://cdn.example/41.mp4" } },
+            { "id": "42", "node": { "attachment": "https://cdn.example/42.mp4" } }
+        ]);
+
+        let presentations = extract(
+            &page("https://www.facebook.com/reel/41"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("loose media URLs are extracted");
+
+        assert_eq!(presentations.len(), 2);
+        assert!(
+            presentations
+                .iter()
+                .all(|presentation| presentation.variants().len() == 1)
+        );
+    }
+
+    #[test]
+    fn finds_a_complete_facebook_media_url_without_a_known_field() {
+        let document = json!({
+            "node": {
+                "id": "video-11",
+                "playback_url": "https://cdn.example/fallback.mp4"
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.facebook.com/watch/?v=11"),
+            &page("https://www.facebook.com/api/graphql/"),
+            &document,
+        )
+        .expect("a generic Facebook field is extracted");
+
+        assert_eq!(
+            presentations[0].url().as_str(),
+            "https://cdn.example/fallback.mp4"
+        );
+    }
+
+    #[test]
+    fn finds_a_complete_instagram_media_url_without_a_known_field() {
+        let document = json!({
+            "media": {
+                "pk": "media-9",
+                "playback_url": "https://cdn.example/fallback.mp4"
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.instagram.com/reel/example/"),
+            &page("https://www.instagram.com/api/graphql"),
+            &document,
+        )
+        .expect("a generic Instagram field is extracted");
+
+        assert_eq!(
+            presentations[0].url().as_str(),
+            "https://cdn.example/fallback.mp4"
+        );
     }
 
     #[test]
