@@ -52,6 +52,9 @@ use crate::view::bytes;
 
 #[cfg(not(test))]
 mod daemon_client;
+mod window_claim;
+
+pub use window_claim::{WindowClaim, claim_window};
 
 #[derive(Clone, Default)]
 pub struct Snapshot {

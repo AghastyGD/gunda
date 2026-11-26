@@ -100,9 +100,9 @@ struct ClientContext<'a> {
     ctx: &'a egui::Context,
 }
 
-struct ConnectedDaemon {
-    reader: Reader,
-    writer: Writer,
+pub(super) struct ConnectedDaemon {
+    pub(super) reader: Reader,
+    pub(super) writer: Writer,
     initial: IpcSnapshot,
 }
 
@@ -147,6 +147,7 @@ async fn run_connected(
                     snapshot.busy = false;
                     publish(sender, ctx, snapshot.clone());
                 }
+                ServerMessage::WindowHosted { .. } | ServerMessage::ShowWindow { .. } => {}
             },
             Wake::Daemon(None) => return Err("Gundad disconnected."),
             Wake::Command(Some(command)) => {
@@ -353,7 +354,7 @@ fn failure_message(kind: &str) -> &'static str {
     }
 }
 
-async fn connect_daemon(directory: &Path) -> Result<ConnectedDaemon, &'static str> {
+pub(super) async fn connect_daemon(directory: &Path) -> Result<ConnectedDaemon, &'static str> {
     if let Ok(connected) = try_connect(directory).await {
         return Ok(connected);
     }

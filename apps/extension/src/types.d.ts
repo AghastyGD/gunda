@@ -43,6 +43,7 @@ type RuntimeMessage =
   | { kind: 'forget' }
   | { kind: 'list-formats'; page_url?: string }
   | { kind: 'download-status'; id: number }
+  | { kind: 'show-download'; id: number }
   | {
       kind: 'open-download';
       capture_id: number;

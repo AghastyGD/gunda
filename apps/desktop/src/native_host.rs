@@ -12,11 +12,14 @@ use gunda_capture::{
     endpoint_path as capture_endpoint_path, load_endpoint as load_capture_endpoint,
     load_token as load_capture_token, token_path as capture_token_path,
 };
+use gunda_core::download::DownloadId;
 use gunda_ipc::{
     NATIVE_HOST_NAME, NATIVE_HOST_PROTOCOL_VERSION, NativeHostRequest, NativeHostResponse,
     read_endpoint, read_native_host_request, write_chrome_native_host_manifest,
     write_native_host_response,
 };
+
+use crate::system;
 
 const CHROME_EXTENSION_ID: &str = "mpjbdgojfmnkhfmlcggfdephcjcoklce";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -110,6 +113,20 @@ pub fn run(directory: PathBuf) -> Result<(), Box<dyn Error>> {
                     Some(path) => NativeHostResponse::Directory { path },
                     None => NativeHostResponse::Error {
                         message: "No folder was selected.".into(),
+                    },
+                }
+            }
+        }
+        NativeHostRequest::ShowDownload { version, id } => {
+            if version != NATIVE_HOST_PROTOCOL_VERSION {
+                NativeHostResponse::Error {
+                    message: "The extension uses an unsupported native host protocol.".into(),
+                }
+            } else {
+                match DownloadId::new(id).map(|id| system::launch_download_window(&directory, id)) {
+                    Ok(Ok(())) => NativeHostResponse::Shown,
+                    Ok(Err(_)) | Err(_) => NativeHostResponse::Error {
+                        message: "Gunda could not open the download window.".into(),
                     },
                 }
             }

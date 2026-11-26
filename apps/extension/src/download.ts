@@ -39,7 +39,6 @@ const remainingField = downloadElement<HTMLElement>('remaining');
 const progressSource = downloadElement<HTMLElement>('progress-source');
 const folderLabel = downloadElement<HTMLElement>('folder-label');
 const folderField = downloadElement<HTMLElement>('folder');
-const showProgressInput = downloadElement<HTMLInputElement>('show-progress');
 const failureField = downloadElement<HTMLElement>('failure');
 const bar = downloadElement<HTMLElement>('bar');
 const closeButton = downloadElement<HTMLButtonElement>('close');
@@ -382,15 +381,29 @@ async function refreshDownload(): Promise<void> {
   }
 }
 
-function beginProgress(id: number, showWindow = true): void {
+function beginProgress(id: number): void {
   downloadId = id;
   setup.style.display = 'none';
   progress.style.display = 'block';
   void refreshDownload();
   downloadTimer = setInterval(() => void refreshDownload(), 750);
-  if (!showWindow) {
-    window.close();
+}
+
+// Progress stays in this window only when Gunda cannot show its own.
+async function handOff(id: number): Promise<void> {
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      kind: 'show-download',
+      id,
+    })) as { shown?: boolean } | undefined;
+    if (response?.shown) {
+      window.close();
+      return;
+    }
+  } catch {
+    // Fall back to showing progress here.
   }
+  beginProgress(id);
 }
 
 closeButton.addEventListener('click', () => window.close());
@@ -459,7 +472,6 @@ startButton.addEventListener('click', async () => {
   const format = parameters.get('format') ?? '';
   const directory = directoryInput.value.trim();
   const filename = filenameInput.value.trim();
-  const showProgress = showProgressInput.checked;
 
   if (browserPrompt) {
     if (!browserUrl || !browserPageUrl || browserDownload === null) {
@@ -490,7 +502,7 @@ startButton.addEventListener('click', async () => {
         filename,
       })) as DownloadResponse | undefined;
       if (response?.kind === 'queued') {
-        beginProgress(response.id, showProgress);
+        void handOff(response.id);
       } else {
         setupFailure.textContent = browserStartFailureLabel(response?.reason);
         startButton.disabled = response?.reason === 'invalid_download';
@@ -523,7 +535,7 @@ startButton.addEventListener('click', async () => {
       filename,
     })) as DownloadResponse | undefined;
     if (response?.kind === 'queued') {
-      beginProgress(response.id, showProgress);
+      void handOff(response.id);
     } else {
       setupFailure.textContent = 'Gunda could not start this download.';
       startButton.disabled = false;

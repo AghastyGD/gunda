@@ -298,11 +298,6 @@
         white-space: nowrap;
       }
 
-      .options {
-        display: grid;
-        gap: 3px;
-      }
-
       .hint {
         color: var(--muted);
         font-size: 11px;
@@ -408,13 +403,6 @@
           <span class="source-title" id="source-title"></span>
         </div>
       </div>
-      <div class="options">
-        <label class="remember">
-          <input id="show-progress" type="checkbox" />
-          <span>Show progress in this window</span>
-        </label>
-        <span class="hint">The download continues in Gunda after this window closes.</span>
-      </div>
       <div class="failure" id="setup-failure"></div>
       <div class="actions">
         <button id="cancel" type="button">Cancel</button>
@@ -446,7 +434,6 @@
       </div>
       <div class="failure" id="failure"></div>
       <div class="actions">
-        <span class="hint">The download continues in Gunda.</span>
         <button id="close" type="button">Close</button>
       </div>
     </div>

@@ -9,8 +9,10 @@ function install({
   initialSession = {},
   localValues = {},
   tabs = [{ url: 'https://example.com/reports', title: 'Example' }],
+  nativeResponse = { kind: 'error' },
 } = {}) {
   const session = { ...initialSession };
+  const nativeMessages = [];
   const local = { ...localValues };
   const sockets = [];
   const cancelled = [];
@@ -100,7 +102,10 @@ function install({
       connectNative() {
         throw new Error('native host unavailable');
       },
-      sendNativeMessage: async () => ({ kind: 'error' }),
+      sendNativeMessage: async (_host, message) => {
+        nativeMessages.push(message);
+        return nativeResponse;
+      },
       getURL: (path) => `chrome-extension://test/${path}`,
       onInstalled: { addListener() {} },
       onStartup: { addListener() {} },
@@ -200,6 +205,7 @@ function install({
     removedFiles,
     createdWindows,
     restoredDownloads,
+    nativeMessages,
     failCancellation() {
       cancelFails = true;
     },
@@ -402,6 +408,34 @@ test('a format request uses the post page only on the tab origin', async () => {
     'https://www.instagram.com/p/ABC123/',
     'https://www.instagram.com/',
   ]);
+});
+
+test('a started download is shown in the Gunda window', async () => {
+  const { send, nativeMessages } = install({ nativeResponse: { kind: 'shown' } });
+
+  const response = await send({ kind: 'show-download', id: 42 });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { shown: true });
+  assert.deepEqual(JSON.parse(JSON.stringify(nativeMessages)), [
+    { kind: 'show_download', version: 1, id: 42 },
+  ]);
+});
+
+test('a download window is not requested for an invalid id', async () => {
+  const { send, nativeMessages } = install({ nativeResponse: { kind: 'shown' } });
+
+  const response = await send({ kind: 'show-download', id: -1 });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { shown: false });
+  assert.equal(nativeMessages.length, 0);
+});
+
+test('a failed native host keeps progress in the browser dialog', async () => {
+  const { send } = install();
+
+  const response = await send({ kind: 'show-download', id: 42 });
+
+  assert.deepEqual(JSON.parse(JSON.stringify(response)), { shown: false });
 });
 
 test('a browser download is counted and kept when the channel is unavailable', async () => {

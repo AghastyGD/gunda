@@ -589,6 +589,71 @@ async fn daemon_rejects_a_client_with_the_wrong_token() {
     daemon.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_opened_twice_raises_the_first_and_is_freed_on_disconnect() {
+    let directory = tempdir().unwrap();
+    let daemon = tokio::spawn(gundad::run(directory.path().to_path_buf()));
+    let endpoint = wait_for_endpoint(directory.path()).await;
+    let token = load_token(&directory.path().join("gundad-token"))
+        .unwrap()
+        .unwrap();
+    let claim = ClientMessage::Command {
+        command: Command::HostWindow { download: Some(7) },
+    };
+    let (mut first, _initial) = connect(&endpoint, token.as_str()).await.unwrap();
+    let (mut second, _initial) = connect(&endpoint, token.as_str()).await.unwrap();
+
+    first.send(&claim).await.unwrap();
+    assert!(wait_for_claim(&mut first).await);
+    second.send(&claim).await.unwrap();
+    assert!(!wait_for_claim(&mut second).await);
+    assert_eq!(wait_for_raise(&mut first).await, Some(7));
+
+    drop(first);
+    let accepted = timeout(Duration::from_secs(5), async {
+        loop {
+            second.send(&claim).await.unwrap();
+            if wait_for_claim(&mut second).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the window must be freed when its host disconnects");
+    assert!(accepted);
+
+    daemon.abort();
+}
+
+async fn wait_for_claim(connection: &mut Connection) -> bool {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match connection.receive::<ServerMessage>().await.unwrap() {
+                ServerMessage::WindowHosted { accepted } => return accepted,
+                ServerMessage::Error { message } => panic!("daemon error: {message}"),
+                ServerMessage::Snapshot { .. } | ServerMessage::ShowWindow { .. } => {}
+            }
+        }
+    })
+    .await
+    .expect("daemon must answer the window claim")
+}
+
+async fn wait_for_raise(connection: &mut Connection) -> Option<i64> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match connection.receive::<ServerMessage>().await.unwrap() {
+                ServerMessage::ShowWindow { download } => return download,
+                ServerMessage::Error { message } => panic!("daemon error: {message}"),
+                ServerMessage::Snapshot { .. } | ServerMessage::WindowHosted { .. } => {}
+            }
+        }
+    })
+    .await
+    .expect("daemon must ask the first window to come forward")
+}
+
 async fn wait_for_endpoint(directory: &std::path::Path) -> String {
     timeout(Duration::from_secs(3), async {
         loop {
@@ -613,7 +678,9 @@ async fn wait_for_completed(connection: &mut Connection) -> Snapshot {
                 {
                     return snapshot;
                 }
-                ServerMessage::Snapshot { .. } => {}
+                ServerMessage::Snapshot { .. }
+                | ServerMessage::WindowHosted { .. }
+                | ServerMessage::ShowWindow { .. } => {}
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
             }
         }
@@ -629,7 +696,9 @@ async fn wait_for_capture(connection: &mut Connection) -> Snapshot {
                 ServerMessage::Snapshot { snapshot } if !snapshot.captures.is_empty() => {
                     return snapshot;
                 }
-                ServerMessage::Snapshot { .. } => {}
+                ServerMessage::Snapshot { .. }
+                | ServerMessage::WindowHosted { .. }
+                | ServerMessage::ShowWindow { .. } => {}
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
             }
         }
@@ -645,7 +714,9 @@ async fn wait_for_tracks(connection: &mut Connection) -> Snapshot {
                 ServerMessage::Snapshot { snapshot } if snapshot.capture_tracks.is_some() => {
                     return snapshot;
                 }
-                ServerMessage::Snapshot { .. } => {}
+                ServerMessage::Snapshot { .. }
+                | ServerMessage::WindowHosted { .. }
+                | ServerMessage::ShowWindow { .. } => {}
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
             }
         }
@@ -663,7 +734,9 @@ async fn wait_for_state(connection: &mut Connection, state: &str) -> Snapshot {
                 {
                     return snapshot;
                 }
-                ServerMessage::Snapshot { .. } => {}
+                ServerMessage::Snapshot { .. }
+                | ServerMessage::WindowHosted { .. }
+                | ServerMessage::ShowWindow { .. } => {}
                 ServerMessage::Error { message } => panic!("daemon error: {message}"),
             }
         }

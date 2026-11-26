@@ -1,11 +1,12 @@
 use std::sync::mpsc;
 
 use eframe::egui::{self, RichText};
-use gunda_core::download::DownloadState;
+use gunda_core::download::{DownloadId, DownloadState};
 
 use crate::{
     backend::{Command, validate_url},
-    view::bytes,
+    system,
+    view::{DownloadView, bytes},
 };
 
 use super::{
@@ -311,10 +312,8 @@ impl Desktop {
         else {
             return;
         };
-        let active = self.snapshot.active.contains(&view.id);
-        let colors = Palette::new(self.dark);
-        let color = self.state_color(&view, active);
         let mut open = true;
+        let mut hide = false;
         egui::Window::new("Download details")
             .id(egui::Id::new("transfer"))
             .open(&mut open)
@@ -323,208 +322,287 @@ impl Desktop {
             .default_width(560.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                dialog_heading(ui, &view.name, &view.source, colors);
-                ui.add_space(16.0);
-                egui::Frame::new()
-                    .fill(colors.background)
-                    .stroke(egui::Stroke::new(1.0, colors.border))
-                    .corner_radius(8)
-                    .inner_margin(16)
-                    .show(ui, |ui| {
-                        ui.set_min_width(496.0);
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                color,
-                                RichText::new(view.label(active))
-                                    .size(12.0)
-                                    .family(fonts::semibold()),
-                            );
-                            if active && view.state == DownloadState::Inspecting {
-                                ui.spinner();
-                            }
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if let Some(fraction) = view.progress() {
-                                        ui.label(
-                                            RichText::new(format!("{:.0}%", fraction * 100.0))
-                                                .size(13.0)
-                                                .monospace(),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            RichText::new("Size unknown")
-                                                .size(12.0)
-                                                .color(colors.muted),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(12.0);
-                        if let Some(fraction) = view.progress() {
-                            let width = ui.available_width();
-                            let (rect, _) = ui.allocate_exact_size(
-                                egui::vec2(width, 8.0),
-                                egui::Sense::hover(),
-                            );
-                            ui.painter().rect_filled(rect, 4.0, colors.track);
-                            if fraction > 0.0 {
-                                let mut filled = rect;
-                                filled.set_width(rect.width() * fraction);
-                                ui.painter().rect_filled(
-                                    filled,
-                                    4.0,
-                                    if view.state == DownloadState::Completed {
-                                        colors.success
-                                    } else {
-                                        colors.accent
-                                    },
-                                );
-                            }
-                        } else if active {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(
-                                    RichText::new(
-                                        "The final size will appear when the download finishes.",
-                                    )
-                                    .size(12.0)
-                                    .color(colors.muted),
-                                );
-                            });
-                        }
-                        ui.add_space(16.0);
-                        ui.columns(2, |columns| {
-                            stat(&mut columns[0], "Downloaded", &bytes(view.written), colors);
-                            stat(&mut columns[1], "File size", &display_total(&view), colors);
-                        });
-                        ui.add_space(12.0);
-                        ui.columns(2, |columns| {
-                            stat(
-                                &mut columns[0],
-                                "Speed",
-                                &if active && self.rate > 0 {
-                                    format!("{}/s", bytes(self.rate))
-                                } else {
-                                    "-".into()
-                                },
-                                colors,
-                            );
-                            stat(&mut columns[1], "Time left", &self.remaining(&view), colors);
-                        });
-                    });
-                ui.add_space(16.0);
-                ui.label(
-                    RichText::new(if view.output.is_some() {
-                        "Saved file"
+                hide = self.transfer_panel(ui, &view);
+            });
+        if !open || hide {
+            self.transfer = None;
+        }
+    }
+
+    /// Draws one download in its own window.
+    pub(super) fn download_window(&mut self, ui: &mut egui::Ui, id: DownloadId) {
+        let colors = Palette::new(self.dark);
+        let ctx = ui.ctx().clone();
+        let view = self
+            .snapshot
+            .jobs
+            .iter()
+            .find(|view| view.id == id)
+            .cloned();
+        let title = view.as_ref().map_or_else(
+            || String::from("Gunda"),
+            |view| match view.progress() {
+                Some(fraction) if view.state != DownloadState::Completed => {
+                    format!("{:.0}% {}", fraction * 100.0, view.name)
+                }
+                _ => view.name.clone(),
+            },
+        );
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(colors.surface).inner_margin(20))
+            .show(ui, |ui| {
+                let Some(view) = view else {
+                    if self.snapshot.ready {
+                        ui.label("This download is no longer in the list.");
                     } else {
-                        "Folder"
-                    })
-                    .size(11.0)
-                    .color(colors.muted),
-                );
-                ui.add_space(4.0);
-                let destination = view
-                    .output
-                    .as_ref()
-                    .unwrap_or(&view.destination)
-                    .to_string_lossy();
-                ui.add(egui::Label::new(destination.as_ref()).truncate())
-                    .on_hover_text(destination.as_ref());
-                if let Some(error) = &view.error {
-                    ui.add_space(12.0);
-                    notice(ui, error, self.error_color());
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                self.snapshot
+                                    .notice
+                                    .as_deref()
+                                    .unwrap_or("Connecting to Gunda"),
+                            );
+                        });
+                    }
+                    return;
+                };
+                if self.transfer_panel(ui, &view) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if active && !view.pause_supported {
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(
-                            "This server does not support resuming this download. Cancelling will stop it permanently.",
-                        )
-                        .size(12.0)
-                        .color(colors.muted),
-                    );
-                }
-                ui.add_space(16.0);
-                ui.separator();
-                ui.add_space(8.0);
+            });
+    }
+
+    /// Draws a download's progress and actions, and reports whether Hide was chosen.
+    fn transfer_panel(&mut self, ui: &mut egui::Ui, view: &DownloadView) -> bool {
+        let active = self.snapshot.active.contains(&view.id);
+        let colors = Palette::new(self.dark);
+        let color = self.state_color(view, active);
+        let mut hide = false;
+        dialog_heading(ui, &view.name, &view.source, colors);
+        ui.add_space(16.0);
+        egui::Frame::new()
+            .fill(colors.background)
+            .stroke(egui::Stroke::new(1.0, colors.border))
+            .corner_radius(8)
+            .inner_margin(16)
+            .show(ui, |ui| {
+                ui.set_min_width(496.0);
                 ui.horizontal(|ui| {
-                    if active {
-                        ui.label(
-                            RichText::new("Hide keeps the download running.")
-                                .size(11.0)
-                                .color(colors.muted),
-                        );
+                    ui.colored_label(
+                        color,
+                        RichText::new(view.label(active))
+                            .size(12.0)
+                            .family(fonts::semibold()),
+                    );
+                    if active && view.state == DownloadState::Inspecting {
+                        ui.spinner();
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new("Hide").min_size(egui::vec2(80.0, 36.0)))
-                            .clicked()
-                        {
-                            self.transfer = None;
-                        }
-                        if active {
-                            if ui
-                                .add(
-                                    egui::Button::new("Cancel download")
-                                        .min_size(egui::vec2(124.0, 36.0)),
-                                )
-                                .clicked()
-                            {
-                                self.backend.cancel(view.id);
-                            }
-                            if ui
-                                .add_enabled(
-                                    view.pause_supported,
-                                    egui::Button::new("Pause")
-                                        .min_size(egui::vec2(92.0, 36.0)),
-                                )
-                                .on_disabled_hover_text(
-                                    "This server does not support resuming this download.",
-                                )
-                                .clicked()
-                                && !self.backend.pause(view.id)
-                            {
-                                self.error = Some("This download cannot be paused safely.".into());
-                            }
+                        if let Some(fraction) = view.progress() {
+                            ui.label(
+                                RichText::new(format!("{:.0}%", fraction * 100.0))
+                                    .size(13.0)
+                                    .monospace(),
+                            );
                         } else {
-                            if view.can_restart()
-                                && ui.add_enabled(!self.busy(), egui::Button::new("Restart")
-                                    .min_size(egui::vec2(92.0, 36.0)))
-                                    .on_hover_text("Discard saved progress and download again from zero. Existing files are kept.")
-                                    .clicked()
-                            {
-                                self.send(Command::Restart(view.id));
-                            }
-                            if (view.completion_pending || view.can_resume() || view.can_retry())
-                                && ui.add_enabled(
-                                    !self.busy(),
-                                    egui::Button::new(RichText::new(if view.completion_pending {
-                                        "Save status"
-                                    } else if view.can_retry() {
-                                        "Retry"
-                                    } else {
-                                        "Resume"
-                                    }).color(colors.accent_ink))
-                                        .fill(colors.accent)
-                                        .min_size(egui::vec2(92.0, 36.0)),
-                                ).clicked()
-                            {
-                                self.send(if view.completion_pending {
-                                    Command::SaveStatus(view.id)
-                                } else if view.can_retry() {
-                                    Command::Retry(view.id)
-                                } else {
-                                    Command::Resume(view.id)
-                                });
-                            }
+                            ui.label(RichText::new("Size unknown").size(12.0).color(colors.muted));
                         }
                     });
                 });
+                ui.add_space(12.0);
+                if let Some(fraction) = view.progress() {
+                    let width = ui.available_width();
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 8.0), egui::Sense::hover());
+                    ui.painter().rect_filled(rect, 4.0, colors.track);
+                    if fraction > 0.0 {
+                        let mut filled = rect;
+                        filled.set_width(rect.width() * fraction);
+                        ui.painter().rect_filled(
+                            filled,
+                            4.0,
+                            if view.state == DownloadState::Completed {
+                                colors.success
+                            } else {
+                                colors.accent
+                            },
+                        );
+                    }
+                } else if active {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("The final size will appear when the download finishes.")
+                                .size(12.0)
+                                .color(colors.muted),
+                        );
+                    });
+                }
+                ui.add_space(16.0);
+                ui.columns(2, |columns| {
+                    stat(&mut columns[0], "Downloaded", &bytes(view.written), colors);
+                    stat(&mut columns[1], "File size", &display_total(view), colors);
+                });
+                ui.add_space(12.0);
+                ui.columns(2, |columns| {
+                    stat(
+                        &mut columns[0],
+                        "Speed",
+                        &if active && self.rate > 0 {
+                            format!("{}/s", bytes(self.rate))
+                        } else {
+                            "-".into()
+                        },
+                        colors,
+                    );
+                    stat(&mut columns[1], "Time left", &self.remaining(view), colors);
+                });
             });
-        if !open {
-            self.transfer = None;
+        ui.add_space(16.0);
+        ui.label(
+            RichText::new(if view.output.is_some() {
+                "Saved file"
+            } else {
+                "Folder"
+            })
+            .size(11.0)
+            .color(colors.muted),
+        );
+        ui.add_space(4.0);
+        let destination = view
+            .output
+            .as_ref()
+            .unwrap_or(&view.destination)
+            .to_string_lossy();
+        ui.add(egui::Label::new(destination.as_ref()).truncate())
+            .on_hover_text(destination.as_ref());
+        if self.standalone.is_some()
+            && let Some(message) = &self.error
+        {
+            ui.add_space(12.0);
+            notice(ui, message, self.error_color());
         }
+        if let Some(error) = &view.error {
+            ui.add_space(12.0);
+            notice(ui, error, self.error_color());
+        }
+        if active && !view.pause_supported {
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "This server does not support resuming this download. Cancelling will stop it permanently.",
+                )
+                .size(12.0)
+                .color(colors.muted),
+            );
+        }
+        ui.add_space(16.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if active {
+                ui.label(
+                    RichText::new("Hide keeps the download running.")
+                        .size(11.0)
+                        .color(colors.muted),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(egui::Button::new("Hide").min_size(egui::vec2(80.0, 36.0)))
+                    .clicked()
+                {
+                    hide = true;
+                }
+                if active {
+                    if ui
+                        .add(
+                            egui::Button::new("Cancel download")
+                                .min_size(egui::vec2(124.0, 36.0)),
+                        )
+                        .clicked()
+                    {
+                        self.backend.cancel(view.id);
+                    }
+                    if ui
+                        .add_enabled(
+                            view.pause_supported,
+                            egui::Button::new("Pause")
+                                .min_size(egui::vec2(92.0, 36.0)),
+                        )
+                        .on_disabled_hover_text(
+                            "This server does not support resuming this download.",
+                        )
+                        .clicked()
+                        && !self.backend.pause(view.id)
+                    {
+                        self.error = Some("This download cannot be paused safely.".into());
+                    }
+                } else {
+                    if view.state == DownloadState::Completed
+                        && let Some(output) = &view.output
+                    {
+                        if ui
+                            .add(egui::Button::new("Open folder").min_size(egui::vec2(108.0, 36.0)))
+                            .clicked()
+                            && system::show_in_folder(output).is_err()
+                        {
+                            self.error = Some("Could not open the folder.".into());
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("Open file").color(colors.accent_ink))
+                                    .fill(colors.accent)
+                                    .min_size(egui::vec2(100.0, 36.0)),
+                            )
+                            .clicked()
+                            && system::open_file(output).is_err()
+                        {
+                            self.error = Some("Could not open the file.".into());
+                        }
+                    }
+                    if view.can_restart()
+                        && ui.add_enabled(!self.busy(), egui::Button::new("Restart")
+                            .min_size(egui::vec2(92.0, 36.0)))
+                            .on_hover_text("Discard saved progress and download again from zero. Existing files are kept.")
+                            .clicked()
+                    {
+                        self.send(Command::Restart(view.id));
+                    }
+                    if (view.completion_pending || view.can_resume() || view.can_retry())
+                        && ui.add_enabled(
+                            !self.busy(),
+                            egui::Button::new(RichText::new(if view.completion_pending {
+                                "Save status"
+                            } else if view.can_retry() {
+                                "Retry"
+                            } else {
+                                "Resume"
+                            }).color(colors.accent_ink))
+                                .fill(colors.accent)
+                                .min_size(egui::vec2(92.0, 36.0)),
+                        ).clicked()
+                    {
+                        self.send(if view.completion_pending {
+                            Command::SaveStatus(view.id)
+                        } else if view.can_retry() {
+                            Command::Retry(view.id)
+                        } else {
+                            Command::Resume(view.id)
+                        });
+                    }
+                }
+            });
+        });
+        hide
     }
 }

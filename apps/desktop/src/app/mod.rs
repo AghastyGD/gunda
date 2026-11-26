@@ -8,15 +8,28 @@ mod widgets;
 #[cfg(test)]
 mod tests;
 
-use std::{path::PathBuf, sync::mpsc, time::Instant};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::PathBuf,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use eframe::egui::{self, RichText};
 use gunda_core::download::{DownloadId, DownloadState};
 
 use crate::{
     backend::{Backend, Command, Snapshot, TrackChoice},
+    system,
     view::{DownloadView, bytes},
 };
+
+/// Shared with download windows, which have no menu of their own.
+const THEME_FILE: &str = "ui-theme";
+
+/// A second request for the same window within this time is ignored.
+const WINDOW_LAUNCH_INTERVAL: Duration = Duration::from_secs(2);
 
 use downloads::Filter;
 use theme::Palette;
@@ -52,15 +65,27 @@ pub struct Desktop {
     measurement: Option<(DownloadId, u64, Instant)>,
     rate: u64,
     titlebar_sent: std::cell::Cell<bool>,
+    directory: PathBuf,
+    /// The download this window follows, when it is not the main window.
+    standalone: Option<DownloadId>,
+    known_jobs: Option<BTreeSet<DownloadId>>,
+    last_launch: Option<(DownloadId, Instant)>,
+    window_title: String,
 }
 
 impl Desktop {
-    pub fn new(cc: &eframe::CreationContext<'_>, backend: Backend) -> Self {
-        let dark = cc
-            .storage
-            .and_then(|storage| storage.get_string("theme"))
-            .as_deref()
-            != Some("light");
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        backend: Backend,
+        directory: PathBuf,
+        standalone: Option<DownloadId>,
+    ) -> Self {
+        let theme = if standalone.is_some() {
+            fs::read_to_string(directory.join(THEME_FILE)).ok()
+        } else {
+            cc.storage.and_then(|storage| storage.get_string("theme"))
+        };
+        let dark = theme.as_deref().map(str::trim) != Some("light");
         let desktop = Self {
             backend,
             snapshot: Snapshot::default(),
@@ -81,23 +106,80 @@ impl Desktop {
             measurement: None,
             rate: 0,
             titlebar_sent: std::cell::Cell::new(false),
+            directory,
+            standalone,
+            known_jobs: None,
+            last_launch: None,
+            window_title: String::new(),
         };
         desktop.theme(&cc.egui_ctx);
+        if standalone.is_none() {
+            desktop.share_theme();
+        }
         desktop
+    }
+
+    /// Lets download windows open in the theme chosen here.
+    fn share_theme(&self) {
+        let _ = fs::write(
+            self.directory.join(THEME_FILE),
+            if self.dark { "dark" } else { "light" },
+        );
+    }
+
+    /// Shows a download: its own window while it is unfinished, details once it is done.
+    fn show_download(&mut self, id: DownloadId, state: DownloadState) {
+        if self.standalone.is_some() || state == DownloadState::Completed {
+            self.transfer = Some(id);
+            self.capture_start = None;
+            return;
+        }
+        if self
+            .last_launch
+            .is_some_and(|(last, at)| last == id && at.elapsed() < WINDOW_LAUNCH_INTERVAL)
+        {
+            return;
+        }
+        self.last_launch = Some((id, Instant::now()));
+        if system::launch_download_window(&self.directory, id).is_err() {
+            self.error = Some("Could not open the download window.".into());
+        }
+    }
+
+    fn show_selected(&mut self) {
+        if let Some(view) = self.selected_view() {
+            self.show_download(view.id, view.state);
+        }
     }
 
     fn update(&mut self) {
         if self.backend.snapshots.has_changed().unwrap_or(true) {
             let next = self.backend.snapshots.borrow_and_update().clone();
-            if self.selected.is_none()
-                && let Some(id) = next.active.iter().next().copied()
-            {
+            if let Some(id) = self.standalone {
                 self.selected = Some(id);
-                if self.transfer.is_none() && self.capture_start.is_none() {
-                    self.transfer = Some(id);
+            } else {
+                if self.selected.is_none()
+                    && let Some(id) = next.active.iter().next().copied()
+                {
+                    self.selected = Some(id);
+                    self.filter = Filter::All;
+                    self.search.clear();
                 }
-                self.filter = Filter::All;
-                self.search.clear();
+                if next.ready {
+                    // A download that appears while the app is open gets its window,
+                    // whichever way it was started.
+                    let started: Vec<_> = self.known_jobs.as_ref().map_or_else(Vec::new, |known| {
+                        next.jobs
+                            .iter()
+                            .filter(|view| !known.contains(&view.id))
+                            .map(|view| (view.id, view.state))
+                            .collect()
+                    });
+                    self.known_jobs = Some(next.jobs.iter().map(|view| view.id).collect());
+                    for (id, state) in started {
+                        self.show_download(id, state);
+                    }
+                }
             }
             self.pending = false;
             self.snapshot = next;
@@ -185,8 +267,7 @@ impl Desktop {
                     .add_enabled(self.selected.is_some(), egui::Button::new("Details"))
                     .clicked()
                 {
-                    self.transfer = self.selected;
-                    self.capture_start = None;
+                    self.show_selected();
                     ui.close();
                 }
             });
@@ -198,6 +279,7 @@ impl Desktop {
                 ui.selectable_value(&mut self.dark, true, "Dark mode");
                 if previous != self.dark {
                     self.theme(ui.ctx());
+                    self.share_theme();
                     ui.close();
                 }
             });
@@ -243,15 +325,19 @@ impl Desktop {
                 },
                 !self.busy() && (save_status || can_resume || can_retry),
             );
-            if resume_action.clicked() {
-                let id = selected.as_ref().unwrap().id;
+            if resume_action.clicked()
+                && let Some(view) = &selected
+            {
                 self.send(if save_status {
-                    Command::SaveStatus(id)
+                    Command::SaveStatus(view.id)
                 } else if can_retry {
-                    Command::Retry(id)
+                    Command::Retry(view.id)
                 } else {
-                    Command::Resume(id)
+                    Command::Resume(view.id)
                 });
+                if !save_status {
+                    self.show_download(view.id, DownloadState::Queued);
+                }
             }
             if action_button(
                 ui,
@@ -266,6 +352,7 @@ impl Desktop {
                 && let Some(view) = &selected
             {
                 self.send(Command::Restart(view.id));
+                self.show_download(view.id, DownloadState::Queued);
             }
             let pause_supported = self
                 .selected_view()
@@ -297,8 +384,7 @@ impl Desktop {
             }
             ui.separator();
             if action_button(ui, Icon::Inspect, "Details", selected.is_some()).clicked() {
-                self.transfer = self.selected;
-                self.capture_start = None;
+                self.show_selected();
             }
             if self.busy() {
                 ui.spinner();
@@ -333,6 +419,13 @@ impl Desktop {
         let ctx = ui.ctx().clone();
         if !self.titlebar_sent.replace(true) {
             self.apply_titlebar_theme(&ctx);
+        }
+        if let Some(id) = self.standalone {
+            if self.busy() {
+                ctx.request_repaint_after(Duration::from_millis(250));
+            }
+            self.download_window(ui, id);
+            return;
         }
         if self.snapshot.ready
             && !self.busy()
@@ -379,7 +472,7 @@ impl Desktop {
                 }
             }
             if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
-                self.transfer = self.selected;
+                self.show_selected();
             }
         }
         let colors = Palette::new(self.dark);

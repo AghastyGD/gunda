@@ -513,6 +513,24 @@ async function requestPageDownload(
   });
 }
 
+// Gunda shows a started download in its own window, as a desktop download
+// manager does, so the browser dialog can close.
+async function showDownloadWindow(id: unknown): Promise<{ shown: boolean }> {
+  if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+    return { shown: false };
+  }
+  try {
+    const response = (await chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, {
+      kind: 'show_download',
+      version: NATIVE_HOST_PROTOCOL_VERSION,
+      id,
+    })) as { kind?: string } | undefined;
+    return { shown: response?.kind === 'shown' };
+  } catch {
+    return { shown: false };
+  }
+}
+
 async function chooseDownloadFolder(): Promise<{ path?: string; error?: string }> {
   try {
     const response = (await chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, {
@@ -1367,6 +1385,7 @@ function runtimeMessage(value: unknown): RuntimeMessage | null {
     message.kind === 'forget' ||
     message.kind === 'list-formats' ||
     message.kind === 'download-status' ||
+    message.kind === 'show-download' ||
     message.kind === 'open-download' ||
     message.kind === 'choose-folder' ||
     message.kind === 'start-download'
@@ -1475,6 +1494,11 @@ chrome.runtime.onMessage.addListener((value: unknown, sender, sendResponse) => {
 
   if (message.kind === 'download-status') {
     void requestDownloadStatus(message.id).then(sendResponse);
+    return true;
+  }
+
+  if (message.kind === 'show-download') {
+    void showDownloadWindow(message.id).then(sendResponse);
     return true;
   }
 

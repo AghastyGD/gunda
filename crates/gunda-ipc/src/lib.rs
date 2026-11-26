@@ -31,6 +31,7 @@ pub const MAX_NATIVE_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 pub enum NativeHostRequest {
     Pairing { version: u32, agent: String },
     ChooseDirectory { version: u32 },
+    ShowDownload { version: u32, id: i64 },
 }
 
 /// A response from the native host to the browser extension.
@@ -45,6 +46,7 @@ pub enum NativeHostResponse {
     Directory {
         path: String,
     },
+    Shown,
     Error {
         message: String,
     },
@@ -164,6 +166,13 @@ pub enum Command {
         id: u64,
     },
     ClearCaptures,
+    /// Claims the window for one download, or the main window when absent.
+    ///
+    /// When another client already shows it, that client is asked to bring it
+    /// forward and the claim is refused.
+    HostWindow {
+        download: Option<i64>,
+    },
 }
 
 /// A client message. `Hello` must be the first message on every connection.
@@ -279,6 +288,8 @@ pub struct Snapshot {
 pub enum ServerMessage {
     Snapshot { snapshot: Snapshot },
     Error { message: String },
+    WindowHosted { accepted: bool },
+    ShowWindow { download: Option<i64> },
 }
 
 /// A recovered protocol or transport error.
@@ -466,6 +477,9 @@ pub async fn connect(endpoint: &str, token: &str) -> Result<(Connection, Snapsho
     match first {
         ServerMessage::Snapshot { snapshot } => Ok((connection, snapshot)),
         ServerMessage::Error { .. } => Err(IpcError::Unauthorized),
+        ServerMessage::WindowHosted { .. } | ServerMessage::ShowWindow { .. } => {
+            Err(IpcError::InvalidMessage)
+        }
     }
 }
 

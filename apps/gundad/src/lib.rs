@@ -1,12 +1,12 @@
 //! The Gunda background download daemon.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use gunda_capture::{
@@ -101,6 +101,46 @@ enum WorkerEvent {
     },
 }
 
+/// The client connection showing each window.
+///
+/// A key is a download id, or `None` for the main window. A claim lasts as long
+/// as the connection that made it.
+#[derive(Default)]
+struct WindowHosts {
+    hosts: Mutex<HashMap<Option<i64>, mpsc::UnboundedSender<()>>>,
+}
+
+impl WindowHosts {
+    fn hosts(&self) -> MutexGuard<'_, HashMap<Option<i64>, mpsc::UnboundedSender<()>>> {
+        self.hosts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Claims a window, or asks its current host to bring it forward.
+    fn claim(&self, key: Option<i64>, host: &mpsc::UnboundedSender<()>) -> bool {
+        let mut hosts = self.hosts();
+        if let Some(current) = hosts.get(&key)
+            && !current.same_channel(host)
+            && current.send(()).is_ok()
+        {
+            return false;
+        }
+        hosts.insert(key, host.clone());
+        true
+    }
+
+    fn release(&self, key: Option<i64>, host: &mpsc::UnboundedSender<()>) {
+        let mut hosts = self.hosts();
+        if hosts
+            .get(&key)
+            .is_some_and(|current| current.same_channel(host))
+        {
+            hosts.remove(&key);
+        }
+    }
+}
+
 struct CommandRequest {
     command: Command,
     response: oneshot::Sender<Result<(), String>>,
@@ -171,6 +211,9 @@ impl Daemon {
                 .map(|_| ()),
             Command::DismissCapture { id } => self.dismiss_capture(id).await,
             Command::ClearCaptures => self.clear_captures().await,
+            Command::HostWindow { .. } => {
+                Err("Windows are claimed by the client connection.".into())
+            }
         }
     }
 
@@ -723,7 +766,13 @@ pub async fn run(directory: PathBuf) -> Result<(), DaemonError> {
     let (snapshot_tx, snapshot_rx) = watch::channel(Snapshot::default());
     let (command_tx, mut command_rx) = mpsc::channel(32);
     let (worker_tx, mut worker_rx) = mpsc::unbounded_channel();
-    tokio::spawn(accept_clients(listener, token, command_tx, snapshot_rx));
+    tokio::spawn(accept_clients(
+        listener,
+        token,
+        command_tx,
+        snapshot_rx,
+        Arc::new(WindowHosts::default()),
+    ));
 
     let mut daemon = Daemon {
         manager,
@@ -1055,6 +1104,7 @@ async fn accept_clients(
     token: PairingToken,
     commands: mpsc::Sender<CommandRequest>,
     snapshots: watch::Receiver<Snapshot>,
+    windows: Arc<WindowHosts>,
 ) {
     loop {
         let Ok((stream, _)) = listener.accept().await else {
@@ -1063,10 +1113,36 @@ async fn accept_clients(
         let token = token.clone();
         let commands = commands.clone();
         let snapshots = snapshots.clone();
+        let windows = Arc::clone(&windows);
         tokio::spawn(async move {
-            let _ = serve_client(stream, token, commands, snapshots).await;
+            let (focus, focused) = mpsc::unbounded_channel();
+            let mut hosted = None;
+            let _ = serve_client(
+                stream,
+                token,
+                commands,
+                snapshots,
+                ClientWindow {
+                    windows: &windows,
+                    focus: &focus,
+                    focused,
+                    hosted: &mut hosted,
+                },
+            )
+            .await;
+            if let Some(key) = hosted {
+                windows.release(key, &focus);
+            }
         });
     }
+}
+
+/// The window state of one client connection.
+struct ClientWindow<'a> {
+    windows: &'a WindowHosts,
+    focus: &'a mpsc::UnboundedSender<()>,
+    focused: mpsc::UnboundedReceiver<()>,
+    hosted: &'a mut Option<Option<i64>>,
 }
 
 async fn serve_client(
@@ -1074,6 +1150,7 @@ async fn serve_client(
     token: PairingToken,
     commands: mpsc::Sender<CommandRequest>,
     mut snapshots: watch::Receiver<Snapshot>,
+    mut window: ClientWindow<'_>,
 ) -> Result<(), gunda_ipc::IpcError> {
     let mut connection = Connection::from_stream(stream);
     let hello = timeout(GREETING_DEADLINE, connection.receive::<ClientMessage>())
@@ -1103,6 +1180,18 @@ async fn serve_client(
         tokio::select! {
             message = reader.receive::<ClientMessage>() => {
                 match message? {
+                    ClientMessage::Command {
+                        command: Command::HostWindow { download },
+                    } => {
+                        if let Some(previous) = window.hosted.take() {
+                            window.windows.release(previous, window.focus);
+                        }
+                        let accepted = window.windows.claim(download, window.focus);
+                        if accepted {
+                            *window.hosted = Some(download);
+                        }
+                        writer.send(&ServerMessage::WindowHosted { accepted }).await?;
+                    }
                     ClientMessage::Command { command } => {
                         let (response, result) = oneshot::channel();
                         if commands.send(CommandRequest { command, response }).await.is_err() {
@@ -1119,6 +1208,11 @@ async fn serve_client(
                             })
                             .await?;
                     }
+                }
+            }
+            Some(()) = window.focused.recv() => {
+                if let Some(download) = *window.hosted {
+                    writer.send(&ServerMessage::ShowWindow { download }).await?;
                 }
             }
             changed = snapshots.changed() => {
@@ -1601,7 +1695,52 @@ fn failure_kind_name(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{content_type_extension, filename_extension, preferred_capture_filename};
+    use tokio::sync::mpsc;
+
+    use super::{
+        WindowHosts, content_type_extension, filename_extension, preferred_capture_filename,
+    };
+
+    #[test]
+    fn a_second_claim_raises_the_window_that_is_already_shown() {
+        let windows = WindowHosts::default();
+        let (first, mut raised) = mpsc::unbounded_channel();
+        let (second, _) = mpsc::unbounded_channel();
+
+        assert!(windows.claim(Some(7), &first));
+        assert!(!windows.claim(Some(7), &second));
+        assert_eq!(raised.try_recv(), Ok(()));
+        assert!(
+            windows.claim(Some(8), &second),
+            "other downloads are separate"
+        );
+        assert!(windows.claim(None, &second), "the main window is separate");
+    }
+
+    #[test]
+    fn a_window_can_be_claimed_again_after_its_host_leaves() {
+        let windows = WindowHosts::default();
+        let (first, raised) = mpsc::unbounded_channel();
+        let (second, _) = mpsc::unbounded_channel();
+
+        assert!(windows.claim(Some(7), &first));
+        windows.release(Some(7), &second);
+        assert!(
+            !windows.claim(Some(7), &second),
+            "only the host releases its claim"
+        );
+
+        windows.release(Some(7), &first);
+        assert!(windows.claim(Some(7), &second));
+
+        let (third, _) = mpsc::unbounded_channel();
+        assert!(windows.claim(Some(9), &first));
+        drop(raised);
+        assert!(
+            windows.claim(Some(9), &third),
+            "a host whose connection ended no longer holds its window"
+        );
+    }
 
     #[test]
     fn maps_common_download_types_to_extensions() {

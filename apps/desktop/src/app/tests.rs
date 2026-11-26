@@ -23,6 +23,11 @@ fn desktop(snapshot: Snapshot) -> Desktop {
         measurement: None,
         rate: 0,
         titlebar_sent: std::cell::Cell::new(true),
+        directory: PathBuf::new(),
+        standalone: None,
+        known_jobs: None,
+        last_launch: None,
+        window_title: String::new(),
     }
 }
 
@@ -230,6 +235,147 @@ fn filename_hover_has_one_tooltip_and_rows_use_the_arrow_cursor() {
             "table settings must not change other panels"
         );
     }
+}
+
+/// Renders one frame twice so layout settles, and returns every text drawn.
+fn frame_labels(ctx: &egui::Context, mut draw: impl FnMut(&mut egui::Ui)) -> Vec<String> {
+    let mut labels = Vec::new();
+    for _ in 0..2 {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            &mut draw,
+        );
+        labels = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        output.textures_delta.clear();
+    }
+    labels
+}
+
+#[test]
+fn an_unfinished_download_opens_its_own_window_instead_of_details() {
+    let view = crate::view::tests::sample(DownloadState::Downloading);
+    let id = view.id;
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.update();
+
+    desktop.show_download(id, DownloadState::Downloading);
+
+    assert!(desktop.transfer.is_none());
+    assert_eq!(desktop.last_launch.map(|(launched, _)| launched), Some(id));
+}
+
+#[test]
+fn a_finished_download_opens_details_in_the_main_window() {
+    let view = crate::view::tests::sample(DownloadState::Completed);
+    let id = view.id;
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.update();
+
+    desktop.show_download(id, DownloadState::Completed);
+
+    assert_eq!(desktop.transfer, Some(id));
+    assert!(desktop.last_launch.is_none());
+}
+
+#[test]
+fn a_download_started_while_the_app_is_open_gets_its_window() {
+    let view = crate::view::tests::sample(DownloadState::Queued);
+    let id = view.id;
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.known_jobs = Some(BTreeSet::new());
+
+    desktop.update();
+
+    assert_eq!(desktop.last_launch.map(|(launched, _)| launched), Some(id));
+    assert!(
+        desktop
+            .known_jobs
+            .as_ref()
+            .is_some_and(|known| known.contains(&id))
+    );
+}
+
+#[test]
+fn downloads_present_when_the_app_opens_do_not_open_windows() {
+    let view = crate::view::tests::sample(DownloadState::Downloading);
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+
+    desktop.update();
+
+    assert!(desktop.last_launch.is_none());
+}
+
+#[test]
+fn a_completed_download_offers_to_open_the_file_and_its_folder() {
+    let ctx = egui::Context::default();
+    let mut view = crate::view::tests::sample(DownloadState::Completed);
+    view.output = Some(PathBuf::from("Downloads/file.bin"));
+    let id = view.id;
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.update();
+    desktop.transfer = Some(id);
+    desktop.theme(&ctx);
+
+    let labels = frame_labels(&ctx, |ui| desktop.transfer_dialog(ui.ctx()));
+
+    assert!(labels.iter().any(|label| label == "Open file"));
+    assert!(labels.iter().any(|label| label == "Open folder"));
+}
+
+#[test]
+fn a_download_window_shows_only_its_download() {
+    let ctx = egui::Context::default();
+    let view = crate::view::tests::sample(DownloadState::Downloading);
+    let id = view.id;
+    let name = view.name.clone();
+    let mut desktop = desktop(Snapshot {
+        ready: true,
+        active: BTreeSet::from([id]),
+        jobs: vec![view],
+        ..Default::default()
+    });
+    desktop.standalone = Some(id);
+    desktop.theme(&ctx);
+
+    let labels = frame_labels(&ctx, |ui| desktop.render(ui));
+
+    assert!(labels.contains(&name));
+    assert!(labels.iter().any(|label| label == "Hide"));
+    assert!(labels.iter().any(|label| label == "Pause"));
+    assert!(!labels.iter().any(|label| label == "Add download"));
 }
 
 #[test]
