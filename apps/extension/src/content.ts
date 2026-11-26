@@ -1,6 +1,9 @@
 const MEDIA_SELECTOR = 'video, audio, source';
 const INSTAGRAM_MEDIA_PATH = /^\/(?:[^/]+\/)?(?:p|reels?|tv)\/[\w-]+\/?$/;
 const FACEBOOK_MEDIA_PATH = /^\/(?:reel\/\d+|(?:[^/]+\/)?videos\/(?:[^/]+\/)?\d+|watch)\/?$/;
+const REDDIT_POST_PATH = /\/comments\/([a-z0-9]+)(?:\/|$)/i;
+const REDDIT_PLAYLIST_PATH = /\/(?:HLS|DASH)Playlist[^/]*\.(m3u8|mpd)$/i;
+const SHADOW_RESCAN_MS = 500;
 const OVERLAY_LABEL = 'Download';
 const DOWNLOAD_ICON =
   '<svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 2.5v6.5m0 0 2.75-2.75M8 9 5.25 6.25M3 12.25h10" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
@@ -83,6 +86,11 @@ const overlays = new WeakMap<
   HTMLVideoElement,
   { host: HTMLElement; button: HTMLButtonElement; panel: HTMLElement }
 >();
+// Videos inside shadow roots are invisible to document queries, so every
+// overlaid video is kept here for repositioning.
+const overlaid = new Set<HTMLVideoElement>();
+const watchedRoots = new WeakSet<ShadowRoot>();
+let lastShadowScan = 0;
 
 function extensionAlive(): boolean {
   try {
@@ -164,6 +172,7 @@ function positionOverlay(video: HTMLVideoElement): void {
   if (!video.isConnected) {
     overlay.host.remove();
     overlays.delete(video);
+    overlaid.delete(video);
     return;
   }
 
@@ -348,9 +357,98 @@ function mediaPageUrl(href: string): string | null {
   return null;
 }
 
+// Like `closest`, but continues past the shadow roots a player hides in.
+function composedClosest(node: Element, selector: string): Element | null {
+  let current: Element | null = node;
+  while (current) {
+    const found = current.closest(selector);
+    if (found) {
+      return found;
+    }
+    const root = current.getRootNode();
+    current = root instanceof ShadowRoot ? root.host : null;
+  }
+  return null;
+}
+
+function redditPostPage(post: Element): URL | null {
+  try {
+    const page = new URL(post.getAttribute('permalink') ?? '', location.origin);
+    return page.origin === location.origin && REDDIT_POST_PATH.test(page.pathname) ? page : null;
+  } catch {
+    return null;
+  }
+}
+
+function redditPlaylist(url: string | null): URL | null {
+  if (!url) {
+    return null;
+  }
+  try {
+    const playlist = new URL(url, location.href);
+    return playlist.protocol === 'https:' &&
+      playlist.hostname === 'v.redd.it' &&
+      REDDIT_PLAYLIST_PATH.test(playlist.pathname)
+      ? playlist
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+// The player element that hosts the video names its playlist.
+function redditVideoPlaylist(video: HTMLVideoElement, post: Element): URL | null {
+  let current: Element | null = video;
+  while (current && current !== post) {
+    const playlist = redditPlaylist(current.getAttribute('src'));
+    if (playlist) {
+      return playlist;
+    }
+    const root = current.getRootNode();
+    current = current.parentElement ?? (root instanceof ShadowRoot ? root.host : null);
+  }
+  for (const element of post.querySelectorAll('[src]')) {
+    const playlist = redditPlaylist(element.getAttribute('src'));
+    if (playlist) {
+      return playlist;
+    }
+  }
+  return null;
+}
+
+// Reddit renders posts as HTML, so the post is described to Gunda in the shape
+// of Reddit's own post JSON to name the video and its title.
+function reportRedditVideo(video: HTMLVideoElement): void {
+  if (!onSite('reddit.com')) {
+    return;
+  }
+  const post = composedClosest(video, 'shreddit-post');
+  const page = post && redditPostPage(post);
+  const id = page && REDDIT_POST_PATH.exec(page.pathname)?.[1];
+  const playlist = post && redditVideoPlaylist(video, post);
+  if (!post || !page || !id || !playlist) {
+    return;
+  }
+  const field = playlist.pathname.toLowerCase().endsWith('.mpd') ? 'dash_url' : 'hls_url';
+  void sendRuntimeMessage({
+    kind: 'source',
+    source_url: location.href,
+    document: {
+      id,
+      permalink: page.pathname,
+      title: post.getAttribute('post-title') ?? '',
+      secure_media: { reddit_video: { [field]: playlist.href } },
+    },
+  });
+}
+
 // Feeds show many videos on one page URL, so the post's own link tells Gunda
 // which captured video the button belongs to.
 function mediaPage(video: HTMLVideoElement): string | null {
+  if (onSite('reddit.com')) {
+    const post = composedClosest(video, 'shreddit-post');
+    return (post && redditPostPage(post)?.href) ?? null;
+  }
   if (!onSite('instagram.com') && !onSite('facebook.com')) {
     return null;
   }
@@ -382,6 +480,7 @@ async function openFormats(
   setOverlayStatus(button, 'Finding formats', { busy: true });
   button.setAttribute('aria-expanded', 'false');
   clearFormats(panel);
+  reportRedditVideo(video);
   window.postMessage(
     { source: 'gunda-page', kind: 'refresh' } satisfies PageRefresh,
     location.origin,
@@ -450,7 +549,9 @@ function addOverlay(video: HTMLVideoElement): void {
   shadow.append(style, controls);
   document.documentElement.append(host);
   overlays.set(video, { host, button, panel });
+  overlaid.add(video);
   positionOverlay(video);
+  reportRedditVideo(video);
 }
 
 function refreshOverlays(): void {
@@ -461,6 +562,36 @@ function refreshOverlays(): void {
   for (const video of document.querySelectorAll('video')) {
     if (video instanceof HTMLVideoElement) {
       addOverlay(video);
+    }
+  }
+  // Custom elements often attach their shadow root after insertion, where
+  // no mutation reports it.
+  const now = Date.now();
+  if (now - lastShadowScan >= SHADOW_RESCAN_MS) {
+    lastShadowScan = now;
+    watchShadowRoots(document);
+  }
+  for (const video of overlaid) {
+    positionOverlay(video);
+  }
+}
+
+function watchShadowRoot(root: ShadowRoot): void {
+  if (watchedRoots.has(root)) {
+    return;
+  }
+  watchedRoots.add(root);
+  observer.observe(root, { childList: true, subtree: true });
+  scan(root);
+}
+
+function watchShadowRoots(node: Element | Document | ShadowRoot): void {
+  if (node instanceof Element && node.shadowRoot) {
+    watchShadowRoot(node.shadowRoot);
+  }
+  for (const element of node.querySelectorAll('*')) {
+    if (element.shadowRoot) {
+      watchShadowRoot(element.shadowRoot);
     }
   }
 }
@@ -511,7 +642,7 @@ function scan(node: Node): void {
     return;
   }
 
-  if (!(node instanceof Element || node instanceof Document)) {
+  if (!(node instanceof Element || node instanceof Document || node instanceof ShadowRoot)) {
     return;
   }
 
@@ -523,9 +654,8 @@ function scan(node: Node): void {
       addOverlay(element);
     }
   }
+  watchShadowRoots(node);
 }
-
-scan(document);
 
 const observer = new MutationObserver((records) => {
   for (const record of records) {
@@ -537,6 +667,8 @@ const observer = new MutationObserver((records) => {
     }
   }
 });
+
+scan(document);
 
 function observe(): void {
   observer.observe(document.documentElement, { childList: true, subtree: true });
@@ -558,6 +690,24 @@ document.addEventListener(
   true,
 );
 
+// Pointer events cross open shadow roots, so hovering a player finds a video
+// whose root appeared after the last scan.
+document.addEventListener(
+  'pointerover',
+  (event) => {
+    for (const target of event.composedPath()) {
+      if (target instanceof HTMLVideoElement) {
+        addOverlay(target);
+        return;
+      }
+      if (target instanceof Element && target.shadowRoot) {
+        watchShadowRoot(target.shadowRoot);
+      }
+    }
+  },
+  true,
+);
+window.addEventListener('load', () => watchShadowRoots(document), { once: true });
 window.addEventListener('scroll', refreshOverlays, true);
 window.addEventListener('resize', refreshOverlays);
 refreshOverlays();

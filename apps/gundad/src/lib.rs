@@ -1506,25 +1506,107 @@ fn suggested_capture_extension(candidate: &Candidate) -> String {
 }
 
 fn declared_track_size(candidate: &Candidate, track: &PresentationTrack) -> Option<u64> {
-    let variants = candidate.variants();
-    let audio = variants
-        .iter()
-        .filter(|variant| variant.resolution().is_none())
-        .filter_map(MediaVariant::size)
-        .max();
+    if let TrackSize::Exact(bytes) = track.size() {
+        return Some(bytes);
+    }
+    declared_size(
+        candidate.variants(),
+        track.kind(),
+        track.resolution(),
+        track.bandwidth(),
+        track.codecs(),
+    )
+}
 
-    match track.kind() {
+/// Sizes a stream track from the formats the page listed for the same media.
+///
+/// Sites list one resolution in several codecs of different sizes, so only
+/// formats in the codecs the track declares count. Several matches are told
+/// apart by bitrate; when that is impossible no size is claimed.
+fn declared_size(
+    variants: &[MediaVariant],
+    kind: TrackKind,
+    resolution: Option<(u32, u32)>,
+    bandwidth: Option<u64>,
+    codecs: Option<&str>,
+) -> Option<u64> {
+    let families = codecs.map(codec_families).unwrap_or_default();
+    let matches_codecs = |variant: &&MediaVariant| {
+        families.is_empty()
+            || variant.codecs().is_some_and(|codecs| {
+                codec_families(codecs)
+                    .iter()
+                    .all(|family| families.contains(family))
+            })
+    };
+    let declares_audio =
+        families.is_empty() || families.iter().any(|family| is_audio_codec(family));
+    let audio = || {
+        variants
+            .iter()
+            .filter(|variant| variant.resolution().is_none() && variant.size().is_some())
+            .filter(matches_codecs)
+            .filter_map(MediaVariant::size)
+            .max()
+    };
+
+    match kind {
         TrackKind::Video => {
             let video = variants
                 .iter()
-                .filter(|variant| variant.resolution() == track.resolution())
-                .filter_map(MediaVariant::size)
-                .max()?;
+                .filter(|variant| {
+                    variant.resolution().is_some()
+                        && variant.resolution() == resolution
+                        && variant.size().is_some()
+                })
+                .filter(matches_codecs)
+                .collect::<Vec<_>>();
+            let video = match video.as_slice() {
+                [] => return None,
+                [only] => only.size()?,
+                several => {
+                    let bandwidth = bandwidth?;
+                    several
+                        .iter()
+                        .filter_map(|variant| Some((variant.bitrate()?, variant.size()?)))
+                        .min_by_key(|(bitrate, _)| bitrate.abs_diff(bandwidth))
+                        .map(|(_, size)| size)?
+                }
+            };
+            let audio = if declares_audio { audio() } else { None };
             Some(video.saturating_add(audio.unwrap_or_default()))
         }
-        TrackKind::Audio => audio,
-        TrackKind::Text | TrackKind::Unknown => track.size().bytes(),
+        TrackKind::Audio => audio(),
+        TrackKind::Text | TrackKind::Unknown => None,
     }
+}
+
+/// Reduces codec strings such as `avc1.4d401f,mp4a.40.2` to codec families.
+fn codec_families(codecs: &str) -> Vec<&'static str> {
+    codecs
+        .split(',')
+        .filter_map(|codec| {
+            let family = codec.trim().split('.').next()?.to_ascii_lowercase();
+            Some(match family.as_str() {
+                "avc1" | "avc3" => "avc",
+                "hvc1" | "hev1" => "hevc",
+                "vp09" | "vp9" => "vp9",
+                "vp08" | "vp8" => "vp8",
+                "av01" => "av1",
+                "mp4a" => "aac",
+                "opus" => "opus",
+                "vorbis" => "vorbis",
+                "ac-3" => "ac-3",
+                "ec-3" => "ec-3",
+                "flac" => "flac",
+                _ => "other",
+            })
+        })
+        .collect()
+}
+
+fn is_audio_codec(family: &str) -> bool {
+    matches!(family, "aac" | "opus" | "vorbis" | "ac-3" | "ec-3" | "flac")
 }
 
 fn selection_with_size(selection: &str, size: Option<u64>) -> String {
@@ -1695,11 +1777,103 @@ fn failure_kind_name(kind: FailureKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use gunda_capture::{MediaVariant, extract};
+    use gunda_stream::TrackKind;
+    use serde_json::json;
     use tokio::sync::mpsc;
+    use url::Url;
 
     use super::{
-        WindowHosts, content_type_extension, filename_extension, preferred_capture_filename,
+        WindowHosts, content_type_extension, declared_size, filename_extension,
+        preferred_capture_filename,
     };
+
+    /// YouTube lists one resolution in several codecs, each with its own size.
+    fn youtube_formats() -> Vec<MediaVariant> {
+        let format = |itag: u32, mime: &str, size: u64, bitrate: u64, height: Option<u32>| {
+            let mut format = json!({
+                "itag": itag,
+                "url": format!("https://media.example/videoplayback?itag={itag}"),
+                "mimeType": mime,
+                "contentLength": size.to_string(),
+                "bitrate": bitrate,
+            });
+            if let Some(height) = height {
+                format["width"] = json!(height * 16 / 9);
+                format["height"] = json!(height);
+            }
+            format
+        };
+        let document = json!({
+            "videoDetails": { "videoId": "v", "title": "A trailer" },
+            "streamingData": { "adaptiveFormats": [
+                format(137, "video/mp4; codecs=\"avc1.640028\"", 16_000_000, 4_300_000, Some(1080)),
+                format(299, "video/mp4; codecs=\"avc1.64002a\"", 21_000_000, 6_000_000, Some(1080)),
+                format(248, "video/webm; codecs=\"vp9\"", 19_000_000, 2_600_000, Some(1080)),
+                format(399, "video/mp4; codecs=\"av01.0.08M.08\"", 14_000_000, 2_200_000, Some(1080)),
+                format(140, "audio/mp4; codecs=\"mp4a.40.2\"", 2_000_000, 130_000, None),
+                format(251, "audio/webm; codecs=\"opus\"", 2_400_000, 150_000, None)
+            ]}
+        });
+        let page = Url::parse("https://www.youtube.com/watch?v=v").unwrap();
+        extract(&page, &page, &document)
+            .unwrap()
+            .remove(0)
+            .variants()
+            .to_vec()
+    }
+
+    #[test]
+    fn a_stream_track_is_sized_from_formats_in_its_own_codecs() {
+        let size = declared_size(
+            &youtube_formats(),
+            TrackKind::Video,
+            Some((1920, 1080)),
+            Some(4_500_000),
+            Some("avc1.640028,mp4a.40.2"),
+        );
+
+        assert_eq!(size, Some(16_000_000 + 2_000_000));
+    }
+
+    #[test]
+    fn several_matching_formats_are_told_apart_by_bitrate() {
+        let size = declared_size(
+            &youtube_formats(),
+            TrackKind::Video,
+            Some((1920, 1080)),
+            Some(6_200_000),
+            Some("avc1.64002a,mp4a.40.2"),
+        );
+
+        assert_eq!(size, Some(21_000_000 + 2_000_000));
+    }
+
+    #[test]
+    fn no_size_is_claimed_when_the_formats_cannot_be_told_apart() {
+        let size = declared_size(
+            &youtube_formats(),
+            TrackKind::Video,
+            Some((1920, 1080)),
+            None,
+            Some("avc1.640028,mp4a.40.2"),
+        );
+
+        assert_eq!(size, None);
+    }
+
+    #[test]
+    fn an_audio_track_uses_the_audio_format_in_its_codec() {
+        let size = declared_size(
+            &youtube_formats(),
+            TrackKind::Audio,
+            None,
+            None,
+            Some("opus"),
+        );
+
+        assert_eq!(size, Some(2_400_000));
+    }
 
     #[test]
     fn a_second_claim_raises_the_window_that_is_already_shown() {

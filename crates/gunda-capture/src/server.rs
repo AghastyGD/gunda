@@ -763,6 +763,12 @@ fn page_media_key(url: &Url) -> Option<String> {
             .map(|id| format!("facebook:{id}"));
     }
 
+    if host == "reddit.com" || host.ends_with(".reddit.com") {
+        return after(&["comments"])
+            .filter(|id| id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+            .map(|id| format!("reddit:{id}"));
+    }
+
     None
 }
 
@@ -958,7 +964,7 @@ mod tests {
     use super::{
         CaptureHandle, CaptureServer, DEFAULT_PATH, page_candidate, page_media_key, source_reports,
     };
-    use crate::candidate::Catalog;
+    use crate::candidate::{Catalog, Report};
     use crate::pairing::PairingToken;
     use crate::protocol::{ClientMessage, PROTOCOL_VERSION};
     use crate::test_client::TestClient;
@@ -1009,6 +1015,11 @@ mod tests {
                 Some("facebook:4211"),
             ),
             ("https://www.facebook.com/someone", None),
+            (
+                "https://www.reddit.com/r/videos/comments/1abc/a_title/",
+                Some("reddit:1abc"),
+            ),
+            ("https://www.reddit.com/r/videos/", None),
             ("https://example.com/p/ABC123/", None),
         ] {
             assert_eq!(page_media_key(&page(url)).as_deref(), key, "{url}");
@@ -1095,6 +1106,41 @@ mod tests {
             );
             assert_eq!(found.variants().len(), 1);
         }
+    }
+
+    #[test]
+    fn a_reddit_post_finds_its_feed_video_by_permalink_and_title() {
+        let mut catalog = Catalog::new(16);
+        let playlist = "https://v.redd.it/xyz/HLSPlaylist.m3u8?a=1";
+        catalog.record(
+            Report::new(
+                playlist,
+                None,
+                "https://www.reddit.com/",
+                Some("Reddit - The heart of the internet"),
+            )
+            .expect("the playlist is captured"),
+        );
+        record_source(
+            &mut catalog,
+            "https://www.reddit.com/",
+            &json!({
+                "id": "1abc",
+                "permalink": "/r/videos/comments/1abc/a_dog/",
+                "title": "A dog on a skateboard",
+                "secure_media": { "reddit_video": { "hls_url": playlist } }
+            }),
+        );
+
+        let found = page_candidate(
+            catalog.candidates(),
+            &page("https://www.reddit.com/r/videos/comments/1abc/a_dog/"),
+        )
+        .expect("the post's video is found");
+
+        assert_eq!(found.url().as_str(), playlist);
+        assert_eq!(found.page_title(), Some("A dog on a skateboard"));
+        assert_eq!(catalog.len(), 1);
     }
 
     #[test]

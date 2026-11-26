@@ -300,8 +300,13 @@ impl Catalog {
             if !report.variants.is_empty() {
                 existing.variants = report.variants;
             }
+            // Only extraction names the post, and it also knows the post's
+            // title where a network report only has the tab's.
             if report.media_key.is_some() {
                 existing.media_key = report.media_key;
+                if report.page_title.is_some() {
+                    existing.page_title = report.page_title;
+                }
             }
 
             return Recorded {
@@ -410,6 +415,7 @@ fn media_title(media_key: &str) -> Option<String> {
     let site = match site {
         "facebook" => "Facebook",
         "instagram" => "Instagram",
+        "reddit" => "Reddit",
         _ => return None,
     };
     Some(format!("{site} video {id}"))
@@ -429,7 +435,7 @@ enum Classification {
 /// extension only reports resources the user asked to download, so the content
 /// type does not have to be media.
 fn classify(url: &Url, content_type: Option<&str>) -> Classification {
-    if range_query(url) {
+    if range_query(url) || reddit_rendition(url) {
         return Classification::Segment;
     }
 
@@ -474,6 +480,20 @@ fn range_query(url: &Url) -> bool {
             "bytestart" | "byteend" | "range"
         )
     })
+}
+
+/// Reddit serves video and audio as separate files next to the playlists that
+/// combine them, so only a playlist is a whole video.
+fn reddit_rendition(url: &Url) -> bool {
+    if url.host_str() != Some("v.redd.it") {
+        return false;
+    }
+    let name = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .unwrap_or_default();
+
+    !name.starts_with("HLSPlaylist") && !name.starts_with("DASHPlaylist")
 }
 
 /// The lowercase extension of a URL's final path segment.
@@ -672,6 +692,30 @@ mod tests {
             .expect_err("a range-marked MP4 is a fragment"),
             Refusal::SegmentStream
         );
+    }
+
+    #[test]
+    fn reddit_video_and_audio_files_are_refused_in_favor_of_their_playlist() {
+        for url in [
+            "https://v.redd.it/xyz/CMAF_720.mp4",
+            "https://v.redd.it/xyz/DASH_AUDIO_128.mp4",
+            "https://v.redd.it/xyz/HLS_720.m3u8",
+        ] {
+            assert_eq!(
+                Report::new(url, None, "https://www.reddit.com/", None)
+                    .expect_err("a single rendition is not a whole video"),
+                Refusal::SegmentStream,
+                "{url}"
+            );
+        }
+        let playlist = Report::new(
+            "https://v.redd.it/xyz/HLSPlaylist.m3u8?a=1",
+            None,
+            "https://www.reddit.com/",
+            None,
+        )
+        .expect("the playlist is captured");
+        assert_eq!(playlist.kind, ResourceKind::Hls);
     }
 
     #[test]

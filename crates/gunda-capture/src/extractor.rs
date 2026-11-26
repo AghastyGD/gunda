@@ -153,6 +153,7 @@ pub fn extract(
 enum Platform {
     Instagram,
     Facebook,
+    Reddit,
     YouTube,
     Generic,
 }
@@ -165,6 +166,8 @@ impl Platform {
             Some(Self::Instagram)
         } else if host == "facebook.com" || host.ends_with(".facebook.com") {
             Some(Self::Facebook)
+        } else if host == "reddit.com" || host.ends_with(".reddit.com") {
+            Some(Self::Reddit)
         } else if host == "youtube.com" || host.ends_with(".youtube.com") || host == "youtu.be" {
             Some(Self::YouTube)
         } else {
@@ -261,6 +264,7 @@ impl<'a> Collector<'a> {
         match self.platform {
             Platform::Instagram => self.consider_instagram(object),
             Platform::Facebook => self.consider_facebook(object),
+            Platform::Reddit => self.consider_reddit(object),
             Platform::YouTube => self.consider_youtube(object),
             Platform::Generic => self.consider_generic(object),
         }
@@ -351,6 +355,43 @@ impl<'a> Collector<'a> {
             let title =
                 facebook_title(object).or_else(|| self.context.title.as_deref().map(str::to_owned));
             self.add_presentation(object, variants, None, title);
+        }
+    }
+
+    /// Reads a post's `reddit_video`, whose playlists carry the only audio.
+    ///
+    /// The video is read from the post so a preview clip under the same post
+    /// cannot stand in for it, and its `fallback_url` is a silent file.
+    fn consider_reddit(&mut self, object: &Map<String, Value>) {
+        if !reddit_post(object) {
+            return;
+        }
+        let Some(video) = ["secure_media", "media"].iter().find_map(|name| {
+            object
+                .get(*name)?
+                .as_object()?
+                .get("reddit_video")?
+                .as_object()
+        }) else {
+            return;
+        };
+
+        let mut manifests = Vec::new();
+        for (name, content_type) in [
+            ("hls_url", "application/vnd.apple.mpegurl"),
+            ("dash_url", "application/dash+xml"),
+        ] {
+            // Reddit's listing JSON escapes ampersands unless `raw_json` is set.
+            let url = video
+                .get(name)
+                .and_then(Value::as_str)
+                .map(|url| Value::String(url.replace("&amp;", "&")));
+            add_variant(&mut manifests, url.as_ref(), Some(content_type), video);
+        }
+
+        if let Some(manifest) = manifests.into_iter().next() {
+            let title = self.post_title(object);
+            self.add_presentation(object, Vec::new(), Some(manifest), title);
         }
     }
 
@@ -510,7 +551,12 @@ impl<'a> Collector<'a> {
             Platform::Facebook => ("facebook", &["video_id", "videoId", "id"], |id| {
                 id.bytes().all(|byte| byte.is_ascii_digit())
             }),
-            Platform::YouTube | Platform::Generic => return None,
+            // Comments also carry an `id`, so only an object with a post
+            // permalink names the post.
+            Platform::Reddit if reddit_post(object) => ("reddit", &["id"], |id| {
+                id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+            }),
+            Platform::Reddit | Platform::YouTube | Platform::Generic => return None,
         };
 
         names
@@ -524,12 +570,20 @@ impl<'a> Collector<'a> {
     fn post_title(&self, object: &Map<String, Value>) -> Option<String> {
         match self.platform {
             Platform::Facebook => facebook_title(object),
-            Platform::Instagram | Platform::YouTube | Platform::Generic => None,
+            Platform::Reddit if reddit_post(object) => object
+                .get("title")
+                .and_then(Value::as_str)
+                .map(clean_title)
+                .filter(|title| !title.is_empty()),
+            Platform::Instagram | Platform::Reddit | Platform::YouTube | Platform::Generic => None,
         }
     }
 
     fn finish(self) -> Result<Vec<ExtractedPresentation>, Refusal> {
-        let social = matches!(self.platform, Platform::Instagram | Platform::Facebook);
+        let social = matches!(
+            self.platform,
+            Platform::Instagram | Platform::Facebook | Platform::Reddit
+        );
         let mut presentations = self.presentations;
 
         // Loose media URLs from different posts must not become qualities of
@@ -900,6 +954,13 @@ fn variant_area(variant: &MediaVariant) -> u64 {
 }
 
 /// Reads the text Facebook shows with a post or video.
+fn reddit_post(object: &Map<String, Value>) -> bool {
+    object
+        .get("permalink")
+        .and_then(Value::as_str)
+        .is_some_and(|permalink| permalink.contains("/comments/"))
+}
+
 fn facebook_title(object: &Map<String, Value>) -> Option<String> {
     ["title", "message", "savable_description"]
         .iter()
@@ -1115,6 +1176,74 @@ mod tests {
             labels.sort();
             assert_eq!(labels, ["HD", "SD"]);
         }
+    }
+
+    #[test]
+    fn a_reddit_post_offers_its_playlist_named_after_the_post() {
+        let document = json!({
+            "kind": "t3",
+            "data": {
+                "id": "1abc",
+                "permalink": "/r/videos/comments/1abc/a_dog_on_a_skateboard/",
+                "title": "A dog on\na skateboard",
+                "preview": { "reddit_video_preview": {
+                    "hls_url": "https://v.redd.it/preview/HLSPlaylist.m3u8"
+                }},
+                "secure_media": { "reddit_video": {
+                    "fallback_url": "https://v.redd.it/xyz/CMAF_720.mp4",
+                    "dash_url": "https://v.redd.it/xyz/DASHPlaylist.mpd?a=1&amp;v=1",
+                    "hls_url": "https://v.redd.it/xyz/HLSPlaylist.m3u8?a=1&amp;v=1"
+                }},
+                "replies": [{ "id": "c1", "body": "nice" }]
+            }
+        });
+
+        let presentations = extract(
+            &page("https://www.reddit.com/r/videos/"),
+            &page("https://www.reddit.com/r/videos/"),
+            &document,
+        )
+        .expect("the post's video is found");
+
+        assert_eq!(presentations.len(), 1);
+        assert_eq!(
+            presentations[0].url().as_str(),
+            "https://v.redd.it/xyz/HLSPlaylist.m3u8?a=1&v=1"
+        );
+        assert_eq!(presentations[0].media_key(), Some("reddit:1abc"));
+        assert_eq!(presentations[0].title(), Some("A dog on a skateboard"));
+    }
+
+    #[test]
+    fn reddit_posts_in_a_feed_stay_apart() {
+        let post = |id: &str| {
+            json!({
+                "id": id,
+                "permalink": format!("/r/videos/comments/{id}/title/"),
+                "title": format!("Post {id}"),
+                "media": { "reddit_video": {
+                    "hls_url": format!("https://v.redd.it/{id}/HLSPlaylist.m3u8")
+                }}
+            })
+        };
+        let document = json!({ "children": [post("one"), post("two")] });
+
+        let presentations = extract(
+            &page("https://www.reddit.com/"),
+            &page("https://www.reddit.com/"),
+            &document,
+        )
+        .expect("both posts are found");
+
+        let mut keys = presentations
+            .iter()
+            .map(|presentation| presentation.media_key().map(str::to_owned))
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [Some("reddit:one".to_owned()), Some("reddit:two".to_owned())]
+        );
     }
 
     #[test]
